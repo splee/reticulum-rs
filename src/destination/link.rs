@@ -124,6 +124,10 @@ pub enum LinkEvent {
     Data(LinkPayload),
     /// Channel data received (for Channel message system)
     Channel(LinkPayload),
+    /// Request received (path, data, request_id)
+    Request(LinkPayload),
+    /// Response received (request_id, data)
+    Response(LinkPayload),
     /// Resource advertisement received (contains unpacked ResourceAdvertisement)
     ResourceAdvertisement(LinkPayload),
     /// Resource data part received
@@ -412,6 +416,26 @@ impl Link {
                     log::error!("link({}): can't decrypt channel data", self.id);
                 }
             }
+            PacketContext::Request => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): request {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::Request(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt request", self.id);
+                }
+            }
+            PacketContext::Response => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): response {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::Response(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt response", self.id);
+                }
+            }
             _ => {
                 log::trace!("link({}): unhandled packet context {:?}", self.id, packet.context);
             }
@@ -511,6 +535,68 @@ impl Link {
             destination: self.id,
             transport: None,
             context: PacketContext::Channel,
+            data: packet_data,
+        })
+    }
+
+    /// Create a request packet for sending requests to the remote destination.
+    /// Request data should be msgpack-encoded: [timestamp, path_hash, request_data]
+    pub fn request_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            log::warn!("link: can't create request packet for inactive link");
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::Request,
+            data: packet_data,
+        })
+    }
+
+    /// Create a response packet for sending responses back to the requester.
+    /// Response data should be msgpack-encoded: [request_id, response_data]
+    pub fn response_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            log::warn!("link: can't create response packet for inactive link");
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::Response,
             data: packet_data,
         })
     }

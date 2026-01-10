@@ -326,6 +326,12 @@ fn handle_link_event(
         LinkEvent::Channel(payload) => {
             log::debug!("Link {}: channel data {} bytes", link_id_hex, payload.len());
         }
+        LinkEvent::Request(payload) => {
+            log::debug!("Link {}: request {} bytes", link_id_hex, payload.len());
+        }
+        LinkEvent::Response(payload) => {
+            log::debug!("Link {}: response {} bytes", link_id_hex, payload.len());
+        }
         LinkEvent::Closed => {
             println!("LINK_CLOSED={}", link_id_hex);
             log::info!("Link {} closed", link_id_hex);

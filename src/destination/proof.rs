@@ -355,4 +355,105 @@ mod tests {
         let compressed = RequestResponse::compressed(b"data".to_vec());
         assert!(compressed.compress);
     }
+
+    #[test]
+    fn test_request_handler_allow_none() {
+        let registry = RequestHandlerRegistry::new();
+
+        registry
+            .register(
+                "/denied",
+                |_path, _data, _requester| Some(RequestResponse::new(b"should not see".to_vec())),
+                RequestPolicy::AllowNone,
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        // AllowNone policy should always deny
+        assert!(registry.handle_request("/denied", b"", None).is_none());
+        let any_hash = AddressHash::new_from_slice(&[1u8; 32]);
+        assert!(registry.handle_request("/denied", b"", Some(&any_hash)).is_none());
+    }
+
+    #[test]
+    fn test_request_handler_deregister() {
+        let registry = RequestHandlerRegistry::new();
+
+        registry
+            .register(
+                "/temp",
+                |_path, _data, _requester| Some(RequestResponse::new(b"temp".to_vec())),
+                RequestPolicy::AllowAll,
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        assert!(registry.has_handler("/temp"));
+        assert_eq!(registry.len(), 1);
+
+        // Deregister
+        let removed = registry.deregister("/temp");
+        assert!(removed.is_some());
+        assert!(!registry.has_handler("/temp"));
+        assert_eq!(registry.len(), 0);
+
+        // Deregister again should return None
+        assert!(registry.deregister("/temp").is_none());
+    }
+
+    #[test]
+    fn test_request_handler_paths() {
+        let registry = RequestHandlerRegistry::new();
+
+        registry
+            .register("/path1", |_, _, _| None, RequestPolicy::AllowAll, vec![], false)
+            .unwrap();
+        registry
+            .register("/path2", |_, _, _| None, RequestPolicy::AllowAll, vec![], false)
+            .unwrap();
+
+        let paths = registry.paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/path1".to_string()));
+        assert!(paths.contains(&"/path2".to_string()));
+    }
+
+    #[test]
+    fn test_request_handler_auto_compress() {
+        let registry = RequestHandlerRegistry::new();
+
+        registry
+            .register(
+                "/compress",
+                |_path, _data, _requester| Some(RequestResponse::new(b"data".to_vec())),
+                RequestPolicy::AllowAll,
+                vec![],
+                true, // auto_compress enabled
+            )
+            .unwrap();
+
+        let response = registry.handle_request("/compress", b"", None);
+        assert!(response.is_some());
+        assert!(response.unwrap().compress);
+    }
+
+    #[test]
+    fn test_request_handler_returns_none() {
+        let registry = RequestHandlerRegistry::new();
+
+        registry
+            .register(
+                "/nullable",
+                |_path, _data, _requester| None, // Handler returns None
+                RequestPolicy::AllowAll,
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        // Even though policy allows, handler returns None
+        assert!(registry.handle_request("/nullable", b"", None).is_none());
+    }
 }

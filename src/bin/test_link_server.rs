@@ -306,5 +306,13 @@ async fn handle_link_event(
             log::debug!("Link {}: channel data received ({}B)", link_id_hex, payload.len());
             println!("CHANNEL_DATA={}:{}", link_id_hex, payload.len());
         }
+        LinkEvent::Request(payload) => {
+            log::debug!("Link {}: request received ({}B)", link_id_hex, payload.len());
+            println!("REQUEST={}:{}", link_id_hex, payload.len());
+        }
+        LinkEvent::Response(payload) => {
+            log::debug!("Link {}: response received ({}B)", link_id_hex, payload.len());
+            println!("RESPONSE={}:{}", link_id_hex, payload.len());
+        }
     }
 }
