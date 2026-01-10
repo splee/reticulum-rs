@@ -1560,17 +1560,23 @@ impl ResourceAdvertisement {
     }
 }
 
-/// Compress data using bz2-compatible compression
+/// Compress data using bz2 compression (compatible with Python bz2 module)
 fn compress_bz2(data: &[u8]) -> Result<Vec<u8>, RnsError> {
-    // Using flate2 for now as a placeholder
-    // In production, we might want to use the bzip2 crate for true compatibility
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression;
     use std::io::Write;
 
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(data)
-        .map_err(|_| RnsError::InvalidArgument)?;
-    encoder.finish().map_err(|_| RnsError::InvalidArgument)
+        .map_err(|e| {
+            log::error!("bz2 compression failed: {:?}", e);
+            RnsError::InvalidArgument
+        })?;
+    encoder.finish().map_err(|e| {
+        log::error!("bz2 compression finalize failed: {:?}", e);
+        RnsError::InvalidArgument
+    })
 }
 
 /// Decompress bz2-compressed data
