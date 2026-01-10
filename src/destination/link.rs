@@ -1,11 +1,14 @@
 use std::{
     cmp::min,
+    collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use ed25519_dalek::{Signature, SigningKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use sha2::Digest;
+use tokio::sync::RwLock;
 use x25519_dalek::StaticSecret;
 
 use crate::{
@@ -16,6 +19,7 @@ use crate::{
     packet::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
     },
+    resource::{Resource, ResourceAdvertisement},
 };
 
 use super::DestinationDesc;
@@ -118,6 +122,20 @@ pub enum LinkHandleResult {
 pub enum LinkEvent {
     Activated,
     Data(LinkPayload),
+    /// Resource advertisement received (contains unpacked ResourceAdvertisement)
+    ResourceAdvertisement(LinkPayload),
+    /// Resource data part received
+    ResourceData(LinkPayload),
+    /// Resource request received
+    ResourceRequest(LinkPayload),
+    /// Resource hashmap update received
+    ResourceHashmapUpdate(LinkPayload),
+    /// Resource proof received
+    ResourceProof(LinkPayload),
+    /// Resource initiator cancel received
+    ResourceInitiatorCancel(LinkPayload),
+    /// Resource receiver cancel received
+    ResourceReceiverCancel(LinkPayload),
     Closed,
 }
 
@@ -127,6 +145,20 @@ pub struct LinkEventData {
     pub address_hash: AddressHash,
     pub event: LinkEvent,
 }
+
+/// Type alias for resource identification (truncated hash)
+pub type ResourceId = [u8; 16];
+
+/// Tracked outgoing resource with state
+pub struct TrackedResource {
+    /// The resource being transferred
+    pub resource: Arc<RwLock<Resource>>,
+    /// When the resource was registered
+    pub registered_at: Instant,
+}
+
+/// Maximum number of concurrent outgoing resources per link
+pub const MAX_OUTGOING_RESOURCES: usize = 16;
 
 pub struct Link {
     id: LinkId,
@@ -138,6 +170,14 @@ pub struct Link {
     request_time: Instant,
     rtt: Duration,
     event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
+    /// Outgoing resources tracked by their truncated hash
+    outgoing_resources: HashMap<ResourceId, TrackedResource>,
+    /// Incoming resources tracked by their truncated hash
+    incoming_resources: HashMap<ResourceId, TrackedResource>,
+    /// Last resource window size (for optimization)
+    last_resource_window: usize,
+    /// Last expected in-flight rate (bits per second)
+    last_resource_eifr: Option<f64>,
 }
 
 impl Link {
@@ -155,6 +195,10 @@ impl Link {
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             event_tx,
+            outgoing_resources: HashMap::new(),
+            incoming_resources: HashMap::new(),
+            last_resource_window: crate::resource::WINDOW_INITIAL,
+            last_resource_eifr: None,
         }
     }
 
@@ -186,6 +230,10 @@ impl Link {
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             event_tx,
+            outgoing_resources: HashMap::new(),
+            incoming_resources: HashMap::new(),
+            last_resource_window: crate::resource::WINDOW_INITIAL,
+            last_resource_eifr: None,
         };
 
         link.handshake(peer_identity);
@@ -281,7 +329,80 @@ impl Link {
                     return LinkHandleResult::None;
                 }
             }
-            _ => {}
+            // Resource packet types - decrypt and post event for higher-level handling
+            PacketContext::ResourceAdvrtisement => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource advertisement {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceAdvertisement(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource advertisement", self.id);
+                }
+            }
+            PacketContext::Resource => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource data {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceData(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource data", self.id);
+                }
+            }
+            PacketContext::ResourceRequest => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource request {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceRequest(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource request", self.id);
+                }
+            }
+            PacketContext::ResourceHashUpdate => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource hashmap update {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceHashmapUpdate(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource hashmap update", self.id);
+                }
+            }
+            PacketContext::ResourceProof => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource proof {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceProof(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource proof", self.id);
+                }
+            }
+            PacketContext::ResourceInitiatorCancel => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource initiator cancel {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceInitiatorCancel(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource initiator cancel", self.id);
+                }
+            }
+            PacketContext::ResourceReceiverCancel => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): resource receiver cancel {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceReceiverCancel(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt resource receiver cancel", self.id);
+                }
+            }
+            _ => {
+                log::trace!("link({}): unhandled packet context {:?}", self.id, packet.context);
+            }
         }
 
         LinkHandleResult::None
@@ -465,6 +586,402 @@ impl Link {
 
     pub fn id(&self) -> &LinkId {
         &self.id
+    }
+
+    /// Get round-trip time measurement
+    pub fn rtt(&self) -> Duration {
+        self.rtt
+    }
+
+    // ========================================================================
+    // Resource Management Methods
+    // ========================================================================
+
+    /// Register an outgoing resource for tracking and transfer.
+    /// Returns the resource ID if registered successfully, or error if limit reached.
+    pub fn register_outgoing_resource(&mut self, resource: Arc<RwLock<Resource>>) -> Result<ResourceId, RnsError> {
+        if self.outgoing_resources.len() >= MAX_OUTGOING_RESOURCES {
+            log::warn!("link({}): cannot register outgoing resource, limit reached", self.id);
+            return Err(RnsError::InvalidArgument);
+        }
+
+        // Get the truncated hash synchronously by blocking briefly
+        // In production, this should be refactored to be fully async
+        let resource_id = {
+            let resource_guard = futures::executor::block_on(resource.read());
+            *resource_guard.truncated_hash()
+        };
+
+        log::debug!(
+            "link({}): registering outgoing resource {}",
+            self.id,
+            hex::encode(&resource_id)
+        );
+
+        self.outgoing_resources.insert(
+            resource_id,
+            TrackedResource {
+                resource,
+                registered_at: Instant::now(),
+            },
+        );
+
+        Ok(resource_id)
+    }
+
+    /// Register an incoming resource for tracking during reception.
+    /// Returns the resource ID if registered successfully.
+    pub fn register_incoming_resource(&mut self, resource: Arc<RwLock<Resource>>) -> Result<ResourceId, RnsError> {
+        let resource_id = {
+            let resource_guard = futures::executor::block_on(resource.read());
+            *resource_guard.truncated_hash()
+        };
+
+        log::debug!(
+            "link({}): registering incoming resource {}",
+            self.id,
+            hex::encode(&resource_id)
+        );
+
+        self.incoming_resources.insert(
+            resource_id,
+            TrackedResource {
+                resource,
+                registered_at: Instant::now(),
+            },
+        );
+
+        Ok(resource_id)
+    }
+
+    /// Check if the link has a specific incoming resource already
+    pub fn has_incoming_resource(&self, resource_id: &ResourceId) -> bool {
+        self.incoming_resources.contains_key(resource_id)
+    }
+
+    /// Check if the link has a specific outgoing resource
+    pub fn has_outgoing_resource(&self, resource_id: &ResourceId) -> bool {
+        self.outgoing_resources.contains_key(resource_id)
+    }
+
+    /// Get an outgoing resource by ID
+    pub fn get_outgoing_resource(&self, resource_id: &ResourceId) -> Option<&TrackedResource> {
+        self.outgoing_resources.get(resource_id)
+    }
+
+    /// Get an incoming resource by ID
+    pub fn get_incoming_resource(&self, resource_id: &ResourceId) -> Option<&TrackedResource> {
+        self.incoming_resources.get(resource_id)
+    }
+
+    /// Cancel and remove an outgoing resource
+    pub fn cancel_outgoing_resource(&mut self, resource_id: &ResourceId) -> bool {
+        if let Some(tracked) = self.outgoing_resources.remove(resource_id) {
+            log::debug!(
+                "link({}): canceling outgoing resource {}",
+                self.id,
+                hex::encode(resource_id)
+            );
+            // Cancel the resource itself
+            let mut resource = futures::executor::block_on(tracked.resource.write());
+            resource.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel and remove an incoming resource
+    pub fn cancel_incoming_resource(&mut self, resource_id: &ResourceId) -> bool {
+        if let Some(tracked) = self.incoming_resources.remove(resource_id) {
+            log::debug!(
+                "link({}): canceling incoming resource {}",
+                self.id,
+                hex::encode(resource_id)
+            );
+            let mut resource = futures::executor::block_on(tracked.resource.write());
+            resource.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if the link is ready to accept a new outgoing resource.
+    /// The Python implementation allows only one outgoing resource at a time
+    /// for simplicity, but we support multiple with a limit.
+    pub fn ready_for_new_resource(&self) -> bool {
+        if self.status != LinkStatus::Active {
+            return false;
+        }
+        self.outgoing_resources.len() < MAX_OUTGOING_RESOURCES
+    }
+
+    /// Get the last resource window size used (for optimization)
+    pub fn get_last_resource_window(&self) -> usize {
+        self.last_resource_window
+    }
+
+    /// Get the last expected in-flight rate (bits per second)
+    pub fn get_last_resource_eifr(&self) -> Option<f64> {
+        self.last_resource_eifr
+    }
+
+    /// Called when a resource transfer completes to update optimization hints.
+    /// Updates the link's last_resource_window and last_resource_eifr for
+    /// future resource transfers on this link.
+    pub fn resource_concluded(&mut self, resource_id: &ResourceId, success: bool) {
+        // Check outgoing first
+        if let Some(tracked) = self.outgoing_resources.remove(resource_id) {
+            let resource = futures::executor::block_on(tracked.resource.read());
+            let progress = resource.progress();
+
+            if success {
+                // Update optimization hints from successful transfer
+                self.last_resource_window = resource.window();
+                if let Some(eifr) = progress.eifr {
+                    self.last_resource_eifr = Some(eifr);
+                }
+            }
+
+            log::debug!(
+                "link({}): outgoing resource {} concluded (success={})",
+                self.id,
+                hex::encode(resource_id),
+                success
+            );
+            return;
+        }
+
+        // Check incoming
+        if let Some(tracked) = self.incoming_resources.remove(resource_id) {
+            let resource = futures::executor::block_on(tracked.resource.read());
+            let progress = resource.progress();
+
+            if success {
+                self.last_resource_window = resource.window();
+                if let Some(eifr) = progress.eifr {
+                    self.last_resource_eifr = Some(eifr);
+                }
+            }
+
+            log::debug!(
+                "link({}): incoming resource {} concluded (success={})",
+                self.id,
+                hex::encode(resource_id),
+                success
+            );
+        }
+    }
+
+    /// Create a resource advertisement packet for sending over this link.
+    /// The advertisement data is encrypted using the link's derived key.
+    pub fn resource_advertisement_packet(
+        &self,
+        advertisement: &ResourceAdvertisement,
+        segment: usize,
+    ) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            log::warn!("link: cannot create resource advertisement on inactive link");
+            return Err(RnsError::InvalidArgument);
+        }
+
+        // Pack the advertisement into MessagePack format
+        let adv_data = advertisement.pack(segment)?;
+
+        // Create encrypted packet
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(&adv_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceAdvrtisement,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource data packet for sending a resource part.
+    pub fn resource_data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            log::warn!("link: cannot create resource data packet on inactive link");
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::Resource,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource request packet for requesting specific parts.
+    pub fn resource_request_packet(&self, request_data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(request_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceRequest,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource hashmap update packet.
+    pub fn resource_hashmap_update_packet(&self, hashmap_data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(hashmap_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceHashUpdate,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource proof packet.
+    pub fn resource_proof_packet(&self, proof_data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(proof_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceProof,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource cancel packet (initiator side).
+    pub fn resource_initiator_cancel_packet(&self, cancel_data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(cancel_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceInitiatorCancel,
+            data: packet_data,
+        })
+    }
+
+    /// Create a resource cancel packet (receiver side).
+    pub fn resource_receiver_cancel_packet(&self, cancel_data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(cancel_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::ResourceReceiverCancel,
+            data: packet_data,
+        })
+    }
+
+    /// Count of active outgoing resources
+    pub fn outgoing_resource_count(&self) -> usize {
+        self.outgoing_resources.len()
+    }
+
+    /// Count of active incoming resources
+    pub fn incoming_resource_count(&self) -> usize {
+        self.incoming_resources.len()
     }
 }
 

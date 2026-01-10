@@ -32,6 +32,11 @@ COPY --from=builder /app/target/release/rnid /usr/local/bin/
 COPY --from=builder /app/target/release/rnpath /usr/local/bin/
 COPY --from=builder /app/target/release/rnprobe /usr/local/bin/
 COPY --from=builder /app/target/release/rnstatus /usr/local/bin/
+# Test helper binaries
+COPY --from=builder /app/target/release/test_destination /usr/local/bin/
+COPY --from=builder /app/target/release/test_link_server /usr/local/bin/
+COPY --from=builder /app/target/release/test_link_client /usr/local/bin/
+COPY --from=builder /app/target/release/test_resource_server /usr/local/bin/
 
 # Create config directory
 RUN mkdir -p /root/.reticulum

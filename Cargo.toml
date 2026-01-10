@@ -42,6 +42,7 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.15"
+futures = "0.3"
 
 rmp = "0.8.14"
 rmpv = "1.0"
@@ -64,6 +65,9 @@ flate2 = "1.0"
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 ctrlc = "3.4"
+
+# Hex encoding (for test binaries)
+hex = "0.4"
 
 [features]
 default = ["alloc"]
@@ -128,3 +132,19 @@ path = "src/bin/rnid.rs"
 [[bin]]
 name = "rnprobe"
 path = "src/bin/rnprobe.rs"
+
+[[bin]]
+name = "test_destination"
+path = "src/bin/test_destination.rs"
+
+[[bin]]
+name = "test_link_server"
+path = "src/bin/test_link_server.rs"
+
+[[bin]]
+name = "test_link_client"
+path = "src/bin/test_link_client.rs"
+
+[[bin]]
+name = "test_resource_server"
+path = "src/bin/test_resource_server.rs"

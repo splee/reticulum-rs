@@ -26,6 +26,9 @@ RUN mkdir -p /root/.reticulum
 # Copy configuration (from reticulum-rust/docker/configs/)
 COPY reticulum-rust/docker/configs/python-hub.conf /root/.reticulum/config
 
+# Copy test helper scripts
+COPY reticulum-rust/tests/integration/helpers /app/helpers
+
 # Expose TCP interface port
 EXPOSE 4242
 

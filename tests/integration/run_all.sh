@@ -79,6 +79,11 @@ chmod +x "$SCRIPT_DIR"/*.sh
 run_test "Connectivity Test" "$SCRIPT_DIR/test_connectivity.sh"
 run_test "Identity Interop Test" "$SCRIPT_DIR/test_identity_interop.sh"
 run_test "Announce Test" "$SCRIPT_DIR/test_announce.sh"
+run_test "Link Test" "$SCRIPT_DIR/test_link.sh"
+run_test "Link Data Test" "$SCRIPT_DIR/test_link_data.sh"
+run_test "Resource Test" "$SCRIPT_DIR/test_resource.sh"
+run_test "Probe Test" "$SCRIPT_DIR/test_probe.sh"
+run_test "Path Test" "$SCRIPT_DIR/test_path.sh"
 
 # Print final summary
 echo ""

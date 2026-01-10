@@ -70,6 +70,14 @@ async fn main() {
                     std::str::from_utf8(payload.as_slice())
                         .map(str::to_string)
                         .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))),
+                // Resource events not handled in this example
+                LinkEvent::ResourceAdvertisement(_) |
+                LinkEvent::ResourceData(_) |
+                LinkEvent::ResourceRequest(_) |
+                LinkEvent::ResourceHashmapUpdate(_) |
+                LinkEvent::ResourceProof(_) |
+                LinkEvent::ResourceInitiatorCancel(_) |
+                LinkEvent::ResourceReceiverCancel(_) => {}
             }
         }
         transport
