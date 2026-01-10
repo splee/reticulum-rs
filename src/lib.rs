@@ -25,6 +25,9 @@ pub mod resource;
 pub mod channel;
 pub mod channel_buffer;
 
+// Phase 7: Discovery System
+pub mod discovery;
+
 // Internal modules
 mod utils;
 mod serde;
