@@ -18,6 +18,9 @@ pub mod logging;
 pub mod persistence;
 pub mod receipt;
 
+// Phase 3: Resource transfer module
+pub mod resource;
+
 // Internal modules
 mod utils;
 mod serde;
