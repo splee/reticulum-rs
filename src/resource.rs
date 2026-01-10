@@ -1345,15 +1345,31 @@ impl Resource {
 
     /// Generate proof data for a completed resource.
     /// Returns data to send in RESOURCE_PRF packet.
+    /// Format: hash (32 bytes) + full_hash(data + hash) (32 bytes) = 64 bytes
+    ///
+    /// Note: This requires original_data to be available. For incoming resources,
+    /// use generate_proof_with_data() after reconstructing the data from parts.
     pub fn generate_proof(&self) -> Vec<u8> {
+        let data = self
+            .original_data
+            .as_ref()
+            .expect("generate_proof requires original_data");
+        self.generate_proof_with_data(data)
+    }
+
+    /// Generate proof data using the provided data.
+    /// Used for incoming resources after reconstructing data from parts.
+    /// Format: hash (32 bytes) + full_hash(data + hash) (32 bytes) = 64 bytes
+    pub fn generate_proof_with_data(&self, data: &[u8]) -> Vec<u8> {
         let mut proof_data = Vec::new();
-        // Add resource hash (truncated)
-        proof_data.extend_from_slice(&self.truncated_hash);
-        // Add the expected proof hash
+        // Add full resource hash (32 bytes)
+        proof_data.extend_from_slice(&self.hash);
+
+        // Calculate proof: full_hash(data + hash)
         let proof_hash = Hash::new(
             Hash::generator()
+                .chain_update(data)
                 .chain_update(&self.hash)
-                .chain_update(&self.random_hash)
                 .finalize()
                 .into(),
         );
@@ -1921,8 +1937,8 @@ mod tests {
         // Generate proof
         let proof = resource.generate_proof();
 
-        // Verify proof length (16 byte truncated hash + 32 byte proof hash)
-        assert_eq!(proof.len(), 48);
+        // Verify proof length (32 byte hash + 32 byte proof hash)
+        assert_eq!(proof.len(), 64);
 
         // Verify the proof is valid
         assert!(resource.verify_proof(&proof));

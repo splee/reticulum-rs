@@ -1,10 +1,16 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, time::{Duration, Instant}};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     hash::{AddressHash, Hash},
     packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType},
 };
 
+/// Default path expiration time (30 minutes, matching Python)
+pub const PATH_EXPIRY_TIME: Duration = Duration::from_secs(30 * 60);
+
+/// Internal path entry stored in the path table
 pub struct PathEntry {
     pub timestamp: Instant,
     pub received_from: AddressHash,
@@ -13,27 +19,161 @@ pub struct PathEntry {
     pub packet_hash: Hash,
 }
 
+/// Path information for external display/queries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathInfo {
+    /// Destination address hash (hex string)
+    pub destination: String,
+    /// Next hop address hash (hex string)
+    pub next_hop: String,
+    /// Interface hash through which path was learned (hex string)
+    pub interface_hash: String,
+    /// Number of hops to destination
+    pub hops: u8,
+    /// Unix timestamp when path was learned
+    pub timestamp: f64,
+    /// Unix timestamp when path expires (None if no expiration)
+    pub expires: Option<f64>,
+}
+
 pub struct PathTable {
     map: HashMap<AddressHash, PathEntry>,
+    /// Track when each entry was created for expiration
+    created_at: Instant,
 }
 
 impl PathTable {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            created_at: Instant::now(),
         }
     }
 
+    /// Check if a path to destination exists
+    pub fn has_path(&self, destination: &AddressHash) -> bool {
+        if let Some(entry) = self.map.get(destination) {
+            // Check if path has expired
+            if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the number of hops to destination
+    pub fn hops_to(&self, destination: &AddressHash) -> Option<u8> {
+        self.map.get(destination).and_then(|entry| {
+            if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                None
+            } else {
+                Some(entry.hops)
+            }
+        })
+    }
+
+    /// Get all paths, optionally filtered by maximum hop count
+    pub fn get_paths(&self, max_hops: Option<u8>) -> Vec<PathInfo> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        self.map
+            .iter()
+            .filter(|(_, entry)| {
+                // Filter out expired paths
+                if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                    return false;
+                }
+                // Filter by max hops if specified
+                if let Some(max) = max_hops {
+                    if entry.hops > max {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(dest, entry)| {
+                // Calculate timestamps
+                let entry_timestamp = now - entry.timestamp.elapsed().as_secs_f64();
+                let expires_in = PATH_EXPIRY_TIME.saturating_sub(entry.timestamp.elapsed());
+                let expires_timestamp = now + expires_in.as_secs_f64();
+
+                PathInfo {
+                    destination: format!("{}", dest),
+                    next_hop: format!("{}", entry.received_from),
+                    interface_hash: format!("{}", entry.iface),
+                    hops: entry.hops,
+                    timestamp: entry_timestamp,
+                    expires: Some(expires_timestamp),
+                }
+            })
+            .collect()
+    }
+
+    /// Drop a specific path entry
+    /// Returns true if path was found and removed
+    pub fn drop_path(&mut self, destination: &AddressHash) -> bool {
+        self.map.remove(destination).is_some()
+    }
+
+    /// Drop all paths that go through a specific transport instance
+    /// Returns the number of paths dropped
+    pub fn drop_via(&mut self, transport_hash: &AddressHash) -> usize {
+        let before_count = self.map.len();
+        self.map.retain(|_, entry| entry.received_from != *transport_hash);
+        before_count - self.map.len()
+    }
+
+    /// Remove expired path entries
+    /// Returns the number of entries removed
+    pub fn cleanup_expired(&mut self) -> usize {
+        let before_count = self.map.len();
+        self.map.retain(|_, entry| entry.timestamp.elapsed() <= PATH_EXPIRY_TIME);
+        before_count - self.map.len()
+    }
+
+    /// Get the number of entries in the path table
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Check if the path table is empty
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
-        self.map.get(destination).map(|entry| (entry.received_from, entry.iface))
+        self.map.get(destination).and_then(|entry| {
+            if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                None
+            } else {
+                Some((entry.received_from, entry.iface))
+            }
+        })
     }
 
     pub fn next_hop_iface(&self, destination: &AddressHash) -> Option<AddressHash> {
-        self.map.get(destination).map(|entry| entry.iface)
+        self.map.get(destination).and_then(|entry| {
+            if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                None
+            } else {
+                Some(entry.iface)
+            }
+        })
     }
 
     pub fn next_hop(&self, destination: &AddressHash) -> Option<AddressHash> {
-        self.map.get(destination).map(|entry| entry.received_from)
+        self.map.get(destination).and_then(|entry| {
+            if entry.timestamp.elapsed() > PATH_EXPIRY_TIME {
+                None
+            } else {
+                Some(entry.received_from)
+            }
+        })
     }
 
     pub fn handle_announce(
@@ -77,8 +217,8 @@ impl PathTable {
         let lookup = lookup.unwrap_or(original_packet.destination);
 
         let entry = match self.map.get(&lookup) {
-            Some(entry) => entry,
-            None => return (*original_packet, None),
+            Some(entry) if entry.timestamp.elapsed() <= PATH_EXPIRY_TIME => entry,
+            _ => return (*original_packet, None),
         };
 
         (
@@ -123,8 +263,8 @@ impl PathTable {
         }
 
         let entry = match self.map.get(&original_packet.destination) {
-            Some(entry) => entry,
-            None => return (*original_packet, None),
+            Some(entry) if entry.timestamp.elapsed() <= PATH_EXPIRY_TIME => entry,
+            _ => return (*original_packet, None),
         };
 
         (
@@ -145,5 +285,86 @@ impl PathTable {
             },
             Some(entry.iface),
         )
+    }
+}
+
+impl Default for PathTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a zero AddressHash for testing
+    fn zero_address_hash() -> AddressHash {
+        AddressHash::new_from_slice(&[0u8; 16])
+    }
+
+    #[test]
+    fn test_has_path() {
+        let mut table = PathTable::new();
+        let dest = zero_address_hash();
+
+        assert!(!table.has_path(&dest));
+
+        // Add a path entry manually
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 1,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+        });
+
+        assert!(table.has_path(&dest));
+    }
+
+    #[test]
+    fn test_drop_path() {
+        let mut table = PathTable::new();
+        let dest = zero_address_hash();
+
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 1,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+        });
+
+        assert!(table.drop_path(&dest));
+        assert!(!table.has_path(&dest));
+        assert!(!table.drop_path(&dest)); // Second drop returns false
+    }
+
+    #[test]
+    fn test_get_paths_with_max_hops() {
+        let mut table = PathTable::new();
+
+        // Add entries with different hop counts
+        for i in 1..=5 {
+            let mut dest = [0u8; 16];
+            dest[0] = i;
+            let dest = AddressHash::new_from_slice(&dest);
+
+            table.map.insert(dest, PathEntry {
+                timestamp: Instant::now(),
+                received_from: zero_address_hash(),
+                hops: i,
+                iface: zero_address_hash(),
+                packet_hash: Hash::new_empty(),
+            });
+        }
+
+        // Get all paths
+        let all_paths = table.get_paths(None);
+        assert_eq!(all_paths.len(), 5);
+
+        // Get paths with max 3 hops
+        let filtered_paths = table.get_paths(Some(3));
+        assert_eq!(filtered_paths.len(), 3);
     }
 }

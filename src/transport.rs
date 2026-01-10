@@ -510,6 +510,75 @@ impl Transport {
         // direct access to handler for testing purposes
         self.handler.clone()
     }
+
+    // =========================================================================
+    // Path Table Query Methods (for rnpath CLI)
+    // =========================================================================
+
+    /// Check if a path to destination exists
+    pub async fn has_path(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.has_path(destination)
+    }
+
+    /// Get the number of hops to a destination
+    pub async fn hops_to(&self, destination: &AddressHash) -> Option<u8> {
+        self.handler.lock().await.path_table.hops_to(destination)
+    }
+
+    /// Get the next hop for a destination
+    pub async fn get_next_hop(&self, destination: &AddressHash) -> Option<AddressHash> {
+        self.handler.lock().await.path_table.next_hop(destination)
+    }
+
+    /// Get the interface hash for the next hop
+    pub async fn get_next_hop_iface(&self, destination: &AddressHash) -> Option<AddressHash> {
+        self.handler.lock().await.path_table.next_hop_iface(destination)
+    }
+
+    /// Get all paths in the path table, optionally filtered by max hops
+    pub async fn get_path_table(&self, max_hops: Option<u8>) -> Vec<path_table::PathInfo> {
+        self.handler.lock().await.path_table.get_paths(max_hops)
+    }
+
+    /// Drop a specific path from the path table
+    /// Returns true if the path existed and was removed
+    pub async fn drop_path(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.drop_path(destination)
+    }
+
+    /// Drop all paths that route through a specific transport instance
+    /// Returns the number of paths dropped
+    pub async fn drop_via(&self, transport_hash: &AddressHash) -> usize {
+        self.handler.lock().await.path_table.drop_via(transport_hash)
+    }
+
+    /// Get the number of entries in the path table
+    pub async fn path_table_size(&self) -> usize {
+        self.handler.lock().await.path_table.len()
+    }
+
+    // =========================================================================
+    // Announce Rate Query Methods (for rnpath CLI)
+    // =========================================================================
+
+    /// Get announce rate information for all tracked destinations
+    pub async fn get_rate_table(&self) -> Vec<announce_limits::RateInfo> {
+        self.handler.lock().await.announce_limits.get_rate_table()
+    }
+
+    /// Get announce rate information for a specific destination
+    pub async fn get_rate_info(&self, destination: &AddressHash) -> Option<announce_limits::RateInfo> {
+        self.handler.lock().await.announce_limits.get_rate_info(destination)
+    }
+
+    // =========================================================================
+    // Announce Queue Methods (for rnpath CLI)
+    // =========================================================================
+
+    /// Drop all queued announces from the announce table
+    pub async fn drop_announce_queues(&self) {
+        self.handler.lock().await.announce_table.clear();
+    }
 }
 
 impl Drop for Transport {
