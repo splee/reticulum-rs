@@ -21,6 +21,10 @@ pub mod receipt;
 // Phase 3: Resource transfer module
 pub mod resource;
 
+// Phase 4: Channel and Buffer modules
+pub mod channel;
+pub mod channel_buffer;
+
 // Internal modules
 mod utils;
 mod serde;
