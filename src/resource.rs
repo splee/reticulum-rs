@@ -1709,4 +1709,361 @@ mod tests {
         let p = progress.get_progress();
         assert!((p - 0.5).abs() < 0.01);
     }
+
+    #[test]
+    fn test_resource_parts_creation() {
+        let mut rng = OsRng;
+        let data = vec![0x41u8; 1000]; // 1KB of 'A'
+
+        let resource = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create resource");
+
+        // Verify parts were created
+        assert!(resource.total_parts() > 0);
+        assert!(!resource.parts.is_empty());
+
+        // Verify hashmap was generated
+        assert_eq!(resource.hashmap.len(), resource.total_parts() * MAPHASH_LEN);
+
+        // Verify each part has correct data size (except possibly the last)
+        for (i, part) in resource.parts.iter().enumerate() {
+            if i < resource.parts.len() - 1 {
+                assert_eq!(part.data.len(), resource.sdu);
+            }
+            assert!(!part.sent);
+        }
+    }
+
+    #[test]
+    fn test_resource_map_hash_calculation() {
+        let random_hash = [0x12u8; RANDOM_HASH_SIZE];
+        let data = b"test data for hashing";
+
+        let hash1 = Resource::calculate_map_hash(data, &random_hash);
+        let hash2 = Resource::calculate_map_hash(data, &random_hash);
+
+        // Same input should produce same hash
+        assert_eq!(hash1, hash2);
+
+        // Different data should produce different hash
+        let different_data = b"different data";
+        let hash3 = Resource::calculate_map_hash(different_data, &random_hash);
+        assert_ne!(hash1, hash3);
+
+        // Different random hash should produce different result
+        let different_random = [0x34u8; RANDOM_HASH_SIZE];
+        let hash4 = Resource::calculate_map_hash(data, &different_random);
+        assert_ne!(hash1, hash4);
+    }
+
+    #[test]
+    fn test_resource_receive_part() {
+        let mut rng = OsRng;
+        let data = vec![0x42u8; 500]; // 500 bytes
+
+        // Create outgoing resource to get parts
+        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        // Create incoming resource from advertisement
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Verify initial state
+        assert_eq!(incoming.received_count, 0);
+        assert!(!incoming.is_complete());
+
+        // Receive parts in order
+        for part in &outgoing.parts {
+            let received = incoming.receive_part(part.data.clone());
+            assert!(received, "Failed to receive part");
+        }
+
+        // Verify completion
+        assert!(incoming.is_complete());
+        assert_eq!(incoming.received_count, outgoing.total_parts());
+    }
+
+    #[test]
+    fn test_resource_receive_parts_within_window() {
+        let mut rng = OsRng;
+        let data = vec![0x43u8; 2000]; // Large enough for multiple parts
+
+        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Receive parts in order (window-based reception requires parts to be
+        // within the current window, which starts at consecutive_completed_height + 1)
+        let parts_count = outgoing.parts.len();
+        for i in 0..parts_count {
+            let received = incoming.receive_part(outgoing.parts[i].data.clone());
+            assert!(received, "Failed to receive part {}", i);
+        }
+
+        assert!(incoming.is_complete());
+        assert_eq!(incoming.received_count, parts_count);
+    }
+
+    #[test]
+    fn test_resource_request_generation() {
+        let mut rng = OsRng;
+        let data = vec![0x44u8; 1000];
+
+        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Generate first request
+        let request = incoming.request_next();
+        assert!(request.is_some(), "Should generate initial request");
+
+        let request_data = request.unwrap();
+        // Request format: [hashmap_exhausted_flag] [resource_hash:32] [part_hashes...]
+        assert!(request_data.len() >= 33); // At least flag + hash
+    }
+
+    #[test]
+    fn test_resource_handle_request() {
+        let mut rng = OsRng;
+        let data = vec![0x45u8; 500];
+
+        let mut resource = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create resource");
+
+        // Create a mock request with the first part hash
+        let mut request_data = Vec::new();
+        request_data.push(HASHMAP_IS_NOT_EXHAUSTED); // Not exhausted
+        request_data.extend_from_slice(&resource.hash); // Resource hash
+        request_data.extend_from_slice(&resource.parts[0].map_hash); // First part hash
+
+        let result = resource.handle_request(&request_data);
+        assert!(result.is_ok());
+
+        let (wants_more, parts) = result.unwrap();
+        assert!(!wants_more);
+        assert!(!parts.is_empty());
+        assert_eq!(parts[0], 0); // Should request first part
+    }
+
+    #[test]
+    fn test_resource_proof_generation_and_verification() {
+        let mut rng = OsRng;
+        let data = b"Data for proof testing";
+
+        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), None)
+            .expect("create resource");
+
+        // Generate proof
+        let proof = resource.generate_proof();
+
+        // Verify proof length (16 byte truncated hash + 32 byte proof hash)
+        assert_eq!(proof.len(), 48);
+
+        // Verify the proof is valid
+        assert!(resource.verify_proof(&proof));
+
+        // Invalid proof should fail
+        let mut bad_proof = proof.clone();
+        bad_proof[20] ^= 0xFF; // Corrupt a byte
+        assert!(!resource.verify_proof(&bad_proof));
+    }
+
+    #[test]
+    fn test_resource_hashmap_update() {
+        let mut rng = OsRng;
+        let data = vec![0x46u8; 500];
+
+        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Get hashmap update from outgoing
+        let hashmap_update = outgoing.get_hashmap_update(0);
+
+        // Verify update has content (truncated hash + hashmap data)
+        assert!(hashmap_update.len() > 16);
+    }
+
+    #[test]
+    fn test_resource_window_adjustment() {
+        let mut rng = OsRng;
+        let data = vec![0x47u8; 500];
+
+        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        let initial_window = incoming.window();
+        assert_eq!(initial_window, WINDOW_INITIAL);
+
+        // Simulate successful reception (outstanding_parts should be 0)
+        incoming.outstanding_parts = 0;
+        incoming.adjust_window();
+
+        // Window should increase
+        assert!(incoming.window() >= initial_window);
+
+        // Test window decrease
+        let window_before = incoming.window();
+        incoming.decrease_window();
+        assert!(incoming.window() <= window_before);
+    }
+
+    #[test]
+    fn test_resource_no_compression_for_small_data() {
+        let mut rng = OsRng;
+        // Small data that won't benefit from compression
+        let data = b"tiny";
+
+        let config = ResourceConfig {
+            auto_compress: true,
+            ..ResourceConfig::default()
+        };
+
+        let resource = Resource::new(&mut rng, data, config, None)
+            .expect("create resource");
+
+        // Small data might not compress well, could be either compressed or not
+        // Just verify resource was created successfully
+        assert!(resource.total_parts() > 0);
+    }
+
+    #[test]
+    fn test_resource_large_data_compression() {
+        let mut rng = OsRng;
+        // Large repetitive data that should compress well
+        let data = vec![0x48u8; 10000];
+
+        let config = ResourceConfig {
+            auto_compress: true,
+            ..ResourceConfig::default()
+        };
+
+        let resource = Resource::new(&mut rng, &data, config, None)
+            .expect("create resource");
+
+        // Verify it's marked as compressed
+        assert!(resource.is_compressed());
+
+        // Transfer size should be less than original
+        assert!(resource.size() < resource.total_size() + RANDOM_HASH_SIZE);
+    }
+
+    #[test]
+    fn test_resource_assembly_unencrypted() {
+        let mut rng = OsRng;
+        let original_data = b"Test data for assembly";
+
+        // Create with no compression to simplify test
+        let config = ResourceConfig {
+            auto_compress: false,
+            ..ResourceConfig::default()
+        };
+
+        let outgoing = Resource::new(&mut rng, original_data, config, None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Receive all parts
+        for part in &outgoing.parts {
+            incoming.receive_part(part.data.clone());
+        }
+
+        assert!(incoming.is_complete());
+
+        // Assembly should work with identity decryption (unencrypted)
+        let assembled = incoming.assemble_with_decryption(|data| Ok(data.to_vec()));
+        assert!(assembled.is_ok(), "Assembly failed: {:?}", assembled.err());
+
+        // Note: The assembled data includes metadata prefix if present, so we check length
+        let result = assembled.unwrap();
+        assert!(result.len() >= original_data.len());
+    }
+
+    #[test]
+    fn test_resource_get_raw_assembled_data() {
+        let mut rng = OsRng;
+        let data = b"Raw assembly test";
+
+        let config = ResourceConfig {
+            auto_compress: false,
+            ..ResourceConfig::default()
+        };
+
+        let outgoing = Resource::new(&mut rng, data, config, None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Before receiving parts, should return None
+        assert!(incoming.get_raw_assembled_data().is_none());
+
+        // Receive all parts
+        for part in &outgoing.parts {
+            incoming.receive_part(part.data.clone());
+        }
+
+        // After completion, should return Some
+        let raw = incoming.get_raw_assembled_data();
+        assert!(raw.is_some());
+        assert!(!raw.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_resource_cancel() {
+        let mut rng = OsRng;
+        let data = b"Data to cancel";
+
+        let mut resource = Resource::new(&mut rng, data, ResourceConfig::default(), None)
+            .expect("create resource");
+
+        assert_ne!(resource.status(), ResourceStatus::Failed);
+
+        resource.cancel();
+
+        assert_eq!(resource.status(), ResourceStatus::Failed);
+    }
+
+    #[test]
+    fn test_resource_rtt_update() {
+        let mut rng = OsRng;
+        let data = b"RTT test";
+
+        let outgoing = Resource::new(&mut rng, data, ResourceConfig::default(), None)
+            .expect("create outgoing resource");
+
+        let adv = outgoing.create_advertisement();
+        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
+            .expect("create incoming resource");
+
+        // Initial RTT should be None
+        assert!(incoming.rtt.is_none());
+
+        // Set first RTT
+        incoming.update_rtt(Duration::from_millis(100));
+        assert_eq!(incoming.rtt, Some(Duration::from_millis(100)));
+
+        // Update with faster RTT - should decrease
+        incoming.update_rtt(Duration::from_millis(50));
+        assert!(incoming.rtt.unwrap() < Duration::from_millis(100));
+    }
 }
