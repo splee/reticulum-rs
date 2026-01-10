@@ -2,6 +2,7 @@ pub mod group;
 pub mod link;
 pub mod link_map;
 pub mod link_stats;
+pub mod plain;
 pub mod proof;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
