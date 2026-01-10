@@ -34,12 +34,12 @@ def client_link_established(link):
 
 def resource_callback(resource):
     """Pre-flight check for incoming resource. Return True to accept."""
-    print(f"RESOURCE_OFFERED={resource.hash.hex()}:{resource.data_size}", flush=True)
+    print(f"RESOURCE_OFFERED={resource.hash.hex()}:{resource.total_size}", flush=True)
     return True
 
 def resource_started(resource):
     """Called when resource transfer begins."""
-    print(f"RESOURCE_STARTED={resource.hash.hex()}:{resource.data_size}", flush=True)
+    print(f"RESOURCE_STARTED={resource.hash.hex()}:{resource.total_size}", flush=True)
     resource.progress_callback = resource_progress
 
 def resource_progress(resource):

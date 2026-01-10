@@ -149,3 +149,7 @@ path = "src/bin/test_link_client.rs"
 [[bin]]
 name = "test_resource_server"
 path = "src/bin/test_resource_server.rs"
+
+[[bin]]
+name = "test_resource_client"
+path = "src/bin/test_resource_client.rs"

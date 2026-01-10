@@ -212,12 +212,48 @@ else
     fail "Rust did not receive resource advertisement (test 2)"
 fi
 
-# Resource data packets may or may not arrive depending on timing
-# (the receiver needs to send RESOURCE_REQ to get data)
-if grep -q "RESOURCE_DATA=" "$RUST_SERVER_OUTPUT2"; then
-    success "Rust received resource data packets"
+# Check for resource request being sent (this means we're participating in transfer)
+if grep -q "RESOURCE_REQUEST_SENT=" "$RUST_SERVER_OUTPUT2"; then
+    success "Rust sent resource request to Python"
 else
-    info "No resource data packets received (expected - full transfer not implemented)"
+    fail "Rust did not send resource request"
+fi
+
+# Check for resource parts being received
+if grep -q "RESOURCE_PART_RECEIVED=" "$RUST_SERVER_OUTPUT2"; then
+    success "Rust received resource data parts"
+    # Show part progress
+    grep "RESOURCE_PART_RECEIVED=" "$RUST_SERVER_OUTPUT2" | tail -3
+else
+    fail "Rust did not receive any resource data parts"
+fi
+
+# Check for resource completion
+if grep -q "RESOURCE_COMPLETE=" "$RUST_SERVER_OUTPUT2"; then
+    success "Rust completed resource transfer"
+    COMPLETE_LINE=$(grep "RESOURCE_COMPLETE=" "$RUST_SERVER_OUTPUT2" | head -1)
+    info "Resource complete: $COMPLETE_LINE"
+else
+    fail "Rust did not complete resource transfer"
+fi
+
+# Check for proof being sent
+if grep -q "RESOURCE_PROOF_SENT=" "$RUST_SERVER_OUTPUT2"; then
+    success "Rust sent resource proof to Python"
+else
+    fail "Rust did not send resource proof"
+fi
+
+# Check if Python received the proof and marked transfer complete
+if grep -q "RESOURCE_TRANSFER_COMPLETE=" "$PYTHON_CLIENT_OUTPUT2"; then
+    success "Python received proof and completed transfer"
+else
+    # May timeout before proof arrives - check if at least started
+    if grep -q "RESOURCE_STARTED=" "$PYTHON_CLIENT_OUTPUT2"; then
+        info "Python started transfer but completion status unclear"
+    else
+        fail "Python did not complete transfer"
+    fi
 fi
 
 # Clean up

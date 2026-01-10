@@ -398,6 +398,9 @@ pub struct Resource {
     /// Metadata bytes
     metadata: Option<Vec<u8>>,
 
+    /// Original uncompressed data (for outgoing resources, needed to verify proof)
+    original_data: Option<Vec<u8>>,
+
     /// Progress callback
     progress_callback: Option<ProgressCallback>,
     /// Completion callback
@@ -478,7 +481,10 @@ impl Resource {
 
         // In production, this would be encrypted using link.encrypt()
         // For now, we just mark it as encrypted
-        let encrypted = true;
+        // TODO: For now, don't encrypt at resource level.
+        // Full implementation requires passing link key to encrypt the data stream.
+        // Python encrypts the entire data stream with link.encrypt() before splitting into parts.
+        let encrypted = false;
 
         let size = final_data.len();
 
@@ -598,6 +604,7 @@ impl Resource {
             config,
             request_id: None,
             metadata: metadata_bytes,
+            original_data: Some(data.to_vec()),
             progress_callback: None,
             completion_callback: None,
             sdu,
@@ -661,6 +668,7 @@ impl Resource {
             config: ResourceConfig::default(),
             request_id: adv.request_id,
             metadata: None,
+            original_data: None, // Incoming resources don't have original data until assembled
             progress_callback: None,
             completion_callback: None,
             sdu,
@@ -1265,6 +1273,11 @@ impl Resource {
 
         let requested_hashes = &request_data[pad + hash_size..];
 
+        log::debug!(
+            "handle_request: wants_more_hashmap={}, pad={}, requested_hashes len={}",
+            wants_more_hashmap, pad, requested_hashes.len()
+        );
+
         // Define search scope based on receiver's state
         let search_start = self.receiver_min_consecutive_height;
         let search_end = search_start + ResourceAdvertisement::COLLISION_GUARD_SIZE;
@@ -1277,12 +1290,30 @@ impl Resource {
             let hash_end = hash_start + MAPHASH_LEN;
             let requested_hash = &requested_hashes[hash_start..hash_end];
 
+            log::debug!(
+                "handle_request: looking for hash {:?} in parts {}..{}",
+                requested_hash, search_start, search_end.min(self.parts.len())
+            );
+
             // Search for this hash in our parts
+            let mut found = false;
             for idx in search_start..search_end.min(self.parts.len()) {
+                log::trace!(
+                    "handle_request: part {} has hash {:?}",
+                    idx, &self.parts[idx].map_hash
+                );
                 if &self.parts[idx].map_hash == requested_hash {
                     parts_to_send.push(idx);
+                    found = true;
+                    log::debug!("handle_request: found match at part {}", idx);
                     break;
                 }
+            }
+            if !found {
+                log::warn!(
+                    "handle_request: no match found for requested hash {:?}",
+                    requested_hash
+                );
             }
         }
 
@@ -1331,26 +1362,52 @@ impl Resource {
     }
 
     /// Verify a proof from the receiver.
+    /// Python proof format: hash (32 bytes) + full_hash(data + hash) (32 bytes) = 64 bytes
     pub fn verify_proof(&self, proof_data: &[u8]) -> bool {
-        if proof_data.len() < 16 + 32 {
+        // Proof must be 64 bytes: 32 byte hash + 32 byte proof hash
+        if proof_data.len() != 64 {
+            log::debug!(
+                "verify_proof: invalid proof length {} (expected 64)",
+                proof_data.len()
+            );
             return false;
         }
 
-        // Verify the resource hash matches
-        if &proof_data[..16] != &self.truncated_hash {
+        // First 32 bytes should match our hash
+        if &proof_data[..32] != &self.hash {
+            log::debug!(
+                "verify_proof: hash mismatch, expected {:?}, got {:?}",
+                &self.hash[..16],
+                &proof_data[..16]
+            );
             return false;
         }
 
-        // Calculate expected proof
+        // For outgoing resources, we need original_data to verify
+        let Some(original_data) = &self.original_data else {
+            log::debug!("verify_proof: no original_data available");
+            return false;
+        };
+
+        // Calculate expected proof: full_hash(data + hash)
         let expected_proof = Hash::new(
             Hash::generator()
+                .chain_update(original_data)
                 .chain_update(&self.hash)
-                .chain_update(&self.random_hash)
                 .finalize()
                 .into(),
         );
 
-        &proof_data[16..48] == expected_proof.as_bytes()
+        if &proof_data[32..64] != expected_proof.as_bytes() {
+            log::debug!(
+                "verify_proof: proof hash mismatch, expected {:?}, got {:?}",
+                &expected_proof.as_bytes()[..16],
+                &proof_data[32..48]
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Get part data for sending (for outgoing resources).

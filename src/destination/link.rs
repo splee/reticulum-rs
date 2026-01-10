@@ -467,6 +467,19 @@ impl Link {
                     } else {
                         log::warn!("link({}): proof is not valid", self.id);
                     }
+                } else if self.status == LinkStatus::Active
+                    && packet.context == PacketContext::ResourceProof
+                {
+                    // Resource proof packets are not encrypted - pass through as-is
+                    log::trace!(
+                        "link({}): resource proof {}B (passthrough)",
+                        self.id,
+                        packet.data.len()
+                    );
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::ResourceProof(LinkPayload::new_from_slice(
+                        packet.data.as_slice(),
+                    )));
                 }
             }
             _ => {}
@@ -946,18 +959,22 @@ impl Link {
     }
 
     /// Create a resource data packet for sending a resource part.
+    /// Note: Resource data packets are NOT encrypted at the link level.
+    /// The resource handles its own encryption internally.
+    /// This matches Python's Packet.py line 201-204.
     pub fn resource_data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
         if self.status != LinkStatus::Active {
             log::warn!("link: cannot create resource data packet on inactive link");
             return Err(RnsError::InvalidArgument);
         }
 
+        // Resource packets are NOT encrypted at link level - pass through as-is
         let mut packet_data = PacketDataBuffer::new();
-        let cipher_text_len = {
-            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
-            cipher_text.len()
-        };
-        packet_data.resize(cipher_text_len);
+        if data.len() > packet_data.accuire_buf_max().len() {
+            return Err(RnsError::InvalidArgument);
+        }
+        packet_data.accuire_buf_max()[..data.len()].copy_from_slice(data);
+        packet_data.resize(data.len());
 
         Ok(Packet {
             header: Header {
