@@ -1,0 +1,118 @@
+#!/bin/bash
+# Run all integration tests for Python-Rust Reticulum interoperability
+#
+# Usage:
+#   ./tests/integration/run_all.sh          # Run all tests
+#   ./tests/integration/run_all.sh --keep   # Keep containers running after tests
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOCKER_DIR="$SCRIPT_DIR/../../docker"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+KEEP_CONTAINERS=false
+TOTAL_PASSED=0
+TOTAL_FAILED=0
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --keep)
+            KEEP_CONTAINERS=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+echo -e "${CYAN}"
+echo "========================================"
+echo "Python-Rust Reticulum Integration Tests"
+echo "========================================"
+echo -e "${NC}"
+
+# Build and start containers
+echo -e "${YELLOW}Building and starting containers...${NC}"
+cd "$DOCKER_DIR"
+docker compose up -d --build 2>&1 | grep -v "^$"
+
+# Wait for containers to be healthy
+echo -e "${YELLOW}Waiting for containers to be ready...${NC}"
+sleep 10
+
+# Check container status
+echo -e "${YELLOW}Container status:${NC}"
+docker compose ps
+
+# Run each test
+run_test() {
+    local test_name=$1
+    local test_script=$2
+
+    echo ""
+    echo -e "${CYAN}Running: $test_name${NC}"
+    echo "----------------------------------------"
+
+    if bash "$test_script"; then
+        ((TOTAL_PASSED++))
+        echo -e "${GREEN}$test_name: PASSED${NC}"
+    else
+        ((TOTAL_FAILED++))
+        echo -e "${RED}$test_name: FAILED${NC}"
+    fi
+}
+
+# Make test scripts executable
+chmod +x "$SCRIPT_DIR"/*.sh
+
+# Run tests
+run_test "Connectivity Test" "$SCRIPT_DIR/test_connectivity.sh"
+run_test "Identity Interop Test" "$SCRIPT_DIR/test_identity_interop.sh"
+run_test "Announce Test" "$SCRIPT_DIR/test_announce.sh"
+
+# Print final summary
+echo ""
+echo -e "${CYAN}========================================"
+echo "Final Test Summary"
+echo "========================================${NC}"
+echo -e "Total Passed: ${GREEN}${TOTAL_PASSED}${NC}"
+echo -e "Total Failed: ${RED}${TOTAL_FAILED}${NC}"
+echo "========================================"
+
+# Show container logs on failure
+if [ $TOTAL_FAILED -gt 0 ]; then
+    echo ""
+    echo -e "${YELLOW}Container logs (last 30 lines each):${NC}"
+    echo ""
+    echo "=== Python Hub ==="
+    docker logs reticulum-python-hub 2>&1 | tail -30
+    echo ""
+    echo "=== Rust Node ==="
+    docker logs reticulum-rust-node 2>&1 | tail -30
+fi
+
+# Cleanup
+if [ "$KEEP_CONTAINERS" = false ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping containers...${NC}"
+    docker compose down
+else
+    echo ""
+    echo -e "${YELLOW}Containers kept running (use 'docker compose down' to stop)${NC}"
+fi
+
+# Exit with appropriate code
+if [ $TOTAL_FAILED -gt 0 ]; then
+    exit 1
+fi
+exit 0

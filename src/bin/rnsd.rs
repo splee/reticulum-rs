@@ -3,13 +3,20 @@
 //! The main daemon process that manages the Reticulum network stack,
 //! interfaces, and routing.
 
+use std::fs;
+use std::io::{Read, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
-use reticulum::config::{Config, LogLevel, StoragePaths};
+use rand_core::OsRng;
+use reticulum::config::{LogLevel, ReticulumConfig, StoragePaths};
+use reticulum::identity::PrivateIdentity;
+use reticulum::iface::tcp_client::TcpClient;
+use reticulum::iface::tcp_server::TcpServer;
 use reticulum::logging;
+use reticulum::transport::{Transport, TransportConfig};
 
 /// Reticulum Network Stack Daemon
 #[derive(Parser, Debug)]
@@ -18,8 +25,8 @@ use reticulum::logging;
 #[command(version)]
 #[command(about = "Reticulum Network Stack Daemon", long_about = None)]
 struct Args {
-    /// Path to configuration file
-    #[arg(short, long, value_name = "FILE")]
+    /// Path to configuration directory
+    #[arg(short, long, value_name = "DIR")]
     config: Option<PathBuf>,
 
     /// Increase verbosity (can be repeated)
@@ -69,40 +76,19 @@ fn main() {
     log::info!("Reticulum Network Stack Daemon starting...");
 
     // Load configuration
-    let config = if let Some(config_path) = &args.config {
-        match Config::from_file(config_path) {
-            Ok(cfg) => {
-                log::info!("Loaded configuration from {:?}", config_path);
-                cfg
-            }
-            Err(e) => {
-                log::error!("Failed to load configuration: {}", e);
-                std::process::exit(1);
-            }
+    let config = match ReticulumConfig::load(args.config.clone()) {
+        Ok(cfg) => {
+            log::info!("Loaded configuration from {:?}", cfg.paths.config_dir);
+            cfg
         }
-    } else {
-        // Look for default config locations
-        let storage = StoragePaths::default_config_dir();
-        let default_path = storage.join("config");
-        if default_path.exists() {
-            match Config::from_file(&default_path) {
-                Ok(cfg) => {
-                    log::info!("Loaded configuration from {:?}", default_path);
-                    cfg
-                }
-                Err(e) => {
-                    log::warn!("Failed to load default config: {}", e);
-                    log::info!("Using default configuration");
-                    Config::default()
-                }
-            }
-        } else {
-            log::info!("No configuration file found, using defaults");
-            Config::default()
+        Err(e) => {
+            log::error!("Failed to load configuration: {}", e);
+            std::process::exit(1);
         }
     };
 
-    log::debug!("Configuration: {:?}", config);
+    log::debug!("Configuration loaded: transport={}, share_instance={}",
+        config.enable_transport, config.share_instance);
 
     // Set up shutdown handler
     let running = Arc::new(AtomicBool::new(true));
@@ -126,26 +112,199 @@ fn main() {
     log::info!("Reticulum Network Stack Daemon stopped");
 }
 
-fn run_daemon(config: &Config, running: Arc<AtomicBool>) {
+/// Load or create the daemon identity
+fn load_or_create_identity(paths: &StoragePaths) -> PrivateIdentity {
+    let identity_file = paths.identity_path.join("daemon_identity");
+
+    if identity_file.exists() {
+        log::info!("Loading existing identity from {:?}", identity_file);
+        match fs::File::open(&identity_file) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                if file.read_to_string(&mut contents).is_ok() {
+                    if let Ok(identity) = PrivateIdentity::new_from_hex_string(contents.trim()) {
+                        let public = identity.as_identity();
+                        log::info!("Identity loaded: {}", format_hash(public.address_hash.as_slice()));
+                        return identity;
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to load identity: {}", e);
+            }
+        }
+    }
+
+    // Create new identity
+    log::info!("Creating new daemon identity...");
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let public = identity.as_identity();
+    log::info!("New identity created: {}", format_hash(public.address_hash.as_slice()));
+
+    // Save identity
+    if let Some(parent) = identity_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = fs::File::create(&identity_file) {
+        let hex = identity.to_hex_string();
+        let _ = file.write_all(hex.as_bytes());
+        log::debug!("Identity saved to {:?}", identity_file);
+    }
+
+    identity
+}
+
+fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
     // Create tokio runtime
     let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
     rt.block_on(async {
+        // Load or create identity
+        let identity = load_or_create_identity(&config.paths);
+
+        // Create transport
+        let transport = Transport::new(TransportConfig::new(
+            "rnsd",
+            &identity,
+            config.enable_transport,
+        ));
+
+        log::info!("Transport initialized");
+
+        // Spawn interfaces from configuration
+        let interface_configs = config.interface_configs();
+        log::info!("Found {} interface configuration(s)", interface_configs.len());
+
+        for iface_config in interface_configs {
+            if !iface_config.enabled {
+                log::debug!("Interface '{}' is disabled, skipping", iface_config.name);
+                continue;
+            }
+
+            log::info!("Starting interface: {} (type: {})",
+                iface_config.name, iface_config.interface_type);
+
+            match iface_config.interface_type.as_str() {
+                "TCPServerInterface" | "tcp_server" => {
+                    let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
+                    let listen_port = iface_config.listen_port.unwrap_or(4242);
+                    let addr = format!("{}:{}", listen_ip, listen_port);
+
+                    log::info!("  TCP Server listening on {}", addr);
+
+                    transport.iface_manager().lock().await.spawn(
+                        TcpServer::new(&addr, transport.iface_manager()),
+                        TcpServer::spawn,
+                    );
+                }
+                "TCPClientInterface" | "tcp_client" => {
+                    if let (Some(host), Some(port)) =
+                        (&iface_config.target_host, iface_config.target_port)
+                    {
+                        let addr = format!("{}:{}", host, port);
+
+                        log::info!("  TCP Client connecting to {}", addr);
+
+                        transport.iface_manager().lock().await.spawn(
+                            TcpClient::new(&addr),
+                            TcpClient::spawn,
+                        );
+                    } else {
+                        log::warn!("  TCP Client '{}' missing target_host or target_port",
+                            iface_config.name);
+                    }
+                }
+                other => {
+                    log::warn!("  Unknown interface type '{}' for '{}'",
+                        other, iface_config.name);
+                }
+            }
+        }
+
         log::info!("Daemon started, press Ctrl-C to stop");
 
+        // Subscribe to incoming packets for logging
+        let mut rx = transport.iface_rx();
+
         // Main loop
-        while running.load(Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        loop {
+            tokio::select! {
+                // Check if shutdown requested
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                // Handle incoming packets
+                Ok(msg) = rx.recv() => {
+                    log::debug!("Received packet: {} bytes from {}",
+                        msg.packet.data.len(),
+                        format_hash(msg.address.as_slice()));
+                }
+            }
         }
+
+        log::info!("Shutting down transport...");
     });
 }
 
-fn run_interactive(_config: &Config, running: Arc<AtomicBool>) {
+fn run_interactive(config: &ReticulumConfig, running: Arc<AtomicBool>) {
     println!("Reticulum Network Stack Daemon - Interactive Mode");
     println!("Type 'help' for available commands, 'quit' to exit");
     println!();
 
-    use std::io::{self, BufRead, Write};
+    // Start daemon in background
+    let config_clone = config.clone();
+    let running_clone = running.clone();
+
+    let _daemon_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        rt.block_on(async {
+            let identity = load_or_create_identity(&config_clone.paths);
+            let transport = Transport::new(TransportConfig::new(
+                "rnsd",
+                &identity,
+                config_clone.enable_transport,
+            ));
+
+            // Spawn interfaces
+            for iface_config in config_clone.interface_configs() {
+                if !iface_config.enabled {
+                    continue;
+                }
+                match iface_config.interface_type.as_str() {
+                    "TCPServerInterface" | "tcp_server" => {
+                        let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
+                        let listen_port = iface_config.listen_port.unwrap_or(4242);
+                        let addr = format!("{}:{}", listen_ip, listen_port);
+                        transport.iface_manager().lock().await.spawn(
+                            TcpServer::new(&addr, transport.iface_manager()),
+                            TcpServer::spawn,
+                        );
+                    }
+                    "TCPClientInterface" | "tcp_client" => {
+                        if let (Some(host), Some(port)) =
+                            (&iface_config.target_host, iface_config.target_port)
+                        {
+                            let addr = format!("{}:{}", host, port);
+                            transport.iface_manager().lock().await.spawn(
+                                TcpClient::new(&addr),
+                                TcpClient::spawn,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            while running_clone.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+    });
+
+    use std::io::{self, BufRead, Write as IoWriteTrait};
 
     while running.load(Ordering::SeqCst) {
         print!("rns> ");
@@ -168,15 +327,22 @@ fn run_interactive(_config: &Config, running: Arc<AtomicBool>) {
                     }
                     "status" => {
                         println!("Status: Running");
-                        println!("Interfaces: 0");
-                        println!("Paths: 0");
-                        println!("Links: 0");
+                        println!("Interfaces: {}", config.interface_configs().len());
+                        println!("Transport enabled: {}", config.enable_transport);
                     }
                     "paths" => {
                         println!("Path table is empty");
                     }
                     "ifaces" => {
-                        println!("No interfaces configured");
+                        let ifaces = config.interface_configs();
+                        if ifaces.is_empty() {
+                            println!("No interfaces configured");
+                        } else {
+                            for iface in ifaces {
+                                let status = if iface.enabled { "enabled" } else { "disabled" };
+                                println!("  {} ({}) - {}", iface.name, iface.interface_type, status);
+                            }
+                        }
                     }
                     "quit" | "exit" => {
                         running.store(false, Ordering::SeqCst);
@@ -193,6 +359,16 @@ fn run_interactive(_config: &Config, running: Arc<AtomicBool>) {
             }
         }
     }
+}
+
+fn format_hash(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2 + 2);
+    hex.push('/');
+    for byte in bytes.iter().take(8) {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    hex.push_str(".../");
+    hex
 }
 
 fn print_example_config() {
@@ -212,48 +388,23 @@ shared_instance_port = 37428
 # Panic on unparseable interfaces
 panic_on_interface_error = false
 
-# Log level: CRITICAL, ERROR, WARNING, INFO, DEBUG, VERBOSE
-loglevel = INFO
+[logging]
+loglevel = 4
 
 [interfaces]
 
 # Example TCP Server Interface
-[[interfaces.tcp_server]]
-name = "TCP Server"
-enabled = true
-listen_ip = "0.0.0.0"
-listen_port = 4242
-# Optional IFAC
-# ifac_size = 16
-# ifac_netname = "my_network"
+  [[TCP Server]]
+    type = TCPServerInterface
+    interface_enabled = true
+    listen_ip = 0.0.0.0
+    listen_port = 4242
 
 # Example TCP Client Interface
-[[interfaces.tcp_client]]
-name = "TCP Client"
-enabled = false
-target_host = "192.168.1.100"
-target_port = 4242
-# reconnect = true
-# max_reconnects = 0
-
-# Example UDP Interface
-[[interfaces.udp]]
-name = "UDP Interface"
-enabled = false
-listen_ip = "0.0.0.0"
-listen_port = 4243
-forward_ip = "255.255.255.255"
-forward_port = 4243
-# broadcast = true
-
-# Example Serial Interface (for RNode, TNCs, etc.)
-[[interfaces.serial]]
-name = "Serial"
-enabled = false
-port = "/dev/ttyUSB0"
-speed = 115200
-# databits = 8
-# parity = "none"
-# stopbits = 1
+  [[TCP Client]]
+    type = TCPClientInterface
+    interface_enabled = false
+    target_host = 192.168.1.100
+    target_port = 4242
 "#);
 }
