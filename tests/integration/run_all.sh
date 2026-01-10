@@ -82,6 +82,7 @@ run_test "Announce Test" "$SCRIPT_DIR/test_announce.sh"
 run_test "Link Test" "$SCRIPT_DIR/test_link.sh"
 run_test "Link Data Test" "$SCRIPT_DIR/test_link_data.sh"
 run_test "Resource Test" "$SCRIPT_DIR/test_resource.sh"
+run_test "Resource Rust→Python Test" "$SCRIPT_DIR/test_resource_rust_to_python.sh"
 run_test "Probe Test" "$SCRIPT_DIR/test_probe.sh"
 run_test "Path Test" "$SCRIPT_DIR/test_path.sh"
 
