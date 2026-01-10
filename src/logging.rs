@@ -61,6 +61,31 @@ lazy_static::lazy_static! {
     static ref LOGGER: RwLock<LoggerState> = RwLock::new(LoggerState::default());
 }
 
+/// Initialize the logging system with default settings (Info level, stdout)
+pub fn init_default() {
+    // Use env_logger for simple default initialization
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+}
+
+/// Initialize the logging system with a specific level
+pub fn init_with_level(level: LogLevel) {
+    let log_level = match level {
+        LogLevel::Critical => log::LevelFilter::Error,
+        LogLevel::Error => log::LevelFilter::Error,
+        LogLevel::Warning => log::LevelFilter::Warn,
+        LogLevel::Notice => log::LevelFilter::Info,
+        LogLevel::Info => log::LevelFilter::Info,
+        LogLevel::Debug => log::LevelFilter::Debug,
+        LogLevel::Verbose => log::LevelFilter::Debug,
+        LogLevel::Extreme => log::LevelFilter::Trace,
+    };
+    let _ = env_logger::builder()
+        .filter_level(log_level)
+        .try_init();
+}
+
 /// Initialize the logging system
 pub fn init(level: LogLevel, destination: LogDestination) -> io::Result<()> {
     let mut logger = LOGGER.write().map_err(|_| {

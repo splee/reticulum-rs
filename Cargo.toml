@@ -61,6 +61,10 @@ rmp-serde = "1.1"
 # Compression
 flate2 = "1.0"
 
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
+
 [features]
 default = ["alloc"]
 alloc = []
@@ -104,3 +108,23 @@ path = "examples/kaonic_mesh.rs"
 [[example]]
 name = "multihop"
 path = "examples/multihop.rs"
+
+[[bin]]
+name = "rnsd"
+path = "src/bin/rnsd.rs"
+
+[[bin]]
+name = "rnstatus"
+path = "src/bin/rnstatus.rs"
+
+[[bin]]
+name = "rnpath"
+path = "src/bin/rnpath.rs"
+
+[[bin]]
+name = "rnid"
+path = "src/bin/rnid.rs"
+
+[[bin]]
+name = "rnprobe"
+path = "src/bin/rnprobe.rs"
