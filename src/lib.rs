@@ -28,6 +28,9 @@ pub mod channel_buffer;
 // Phase 7: Discovery System
 pub mod discovery;
 
+// Phase 9: Testing Infrastructure
+pub mod testing;
+
 // Internal modules
 mod utils;
 mod serde;
