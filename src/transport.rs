@@ -540,6 +540,21 @@ impl TransportHandler {
     async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {
         let mut allow_duplicate = false;
 
+        // Certain packet contexts are exempt from duplicate filtering.
+        // These packets may be legitimately repeated (e.g., keepalives are identical,
+        // resource packets need retransmission, channels may resend data).
+        match packet.context {
+            PacketContext::KeepAlive
+            | PacketContext::ResourceRequest
+            | PacketContext::ResourceProof
+            | PacketContext::Resource
+            | PacketContext::CacheRequest
+            | PacketContext::Channel => {
+                return true;
+            }
+            _ => {}
+        }
+
         match packet.header.packet_type {
             PacketType::Announce => {
                 return true;
