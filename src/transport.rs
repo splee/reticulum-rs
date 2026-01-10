@@ -26,6 +26,7 @@ use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
 
+use crate::error::RnsError;
 use crate::hash::AddressHash;
 use crate::identity::PrivateIdentity;
 
@@ -346,12 +347,85 @@ impl Transport {
         }
     }
 
+    /// Send a resource request packet on an incoming link by link ID.
+    pub async fn send_resource_request(&self, link_id: &AddressHash, request_data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.in_links.get(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_request_packet(request_data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send a resource proof packet on an incoming link by link ID.
+    pub async fn send_resource_proof(&self, link_id: &AddressHash, proof_data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.in_links.get(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_proof_packet(proof_data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send a resource data packet on an outgoing link by link ID (for sender side).
+    pub async fn send_resource_data(&self, link_id: &AddressHash, data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.out_links.get(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_data_packet(data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send a resource hashmap update packet on an outgoing link by link ID (for sender side).
+    pub async fn send_resource_hashmap_update(&self, link_id: &AddressHash, hashmap_data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.out_links.get(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_hashmap_update_packet(hashmap_data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
         self.handler.lock().await.out_links.get(link_id).cloned()
     }
 
     pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
         self.handler.lock().await.in_links.get(link_id).cloned()
+    }
+
+    /// Decrypt data using an incoming link's key.
+    /// This is used for decrypting resource data that was encrypted at the resource level.
+    pub async fn decrypt_with_in_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
+        if let Some(link) = self.find_in_link(link_id).await {
+            let link = link.lock().await;
+            let mut buffer = vec![0u8; data.len() + 64]; // Add padding for decryption overhead
+            let decrypted = link.decrypt(data, &mut buffer)?;
+            Ok(decrypted.to_vec())
+        } else {
+            Err(RnsError::InvalidArgument)
+        }
     }
 
     pub async fn link(&self, destination: DestinationDesc) -> Arc<Mutex<Link>> {

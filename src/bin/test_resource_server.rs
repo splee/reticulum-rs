@@ -1,27 +1,32 @@
-//! Test helper: Resource server that accepts incoming links and logs resource events
+//! Test helper: Resource server that accepts incoming links and completes resource transfers
 //!
 //! This binary creates a destination, announces it, and listens for incoming links.
-//! When resource advertisements are received, it logs them but doesn't complete the transfer.
-//! This tests the resource event infrastructure.
+//! When resource advertisements are received, it responds with requests and completes
+//! the full transfer protocol.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use rand_core::OsRng;
-use reticulum::destination::link::{LinkEvent, LinkEventData};
+use reticulum::destination::link::{LinkEvent, LinkEventData, LinkId};
 use reticulum::destination::DestinationName;
+#[allow(unused_imports)]
+use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::resource::ResourceAdvertisement;
+use reticulum::resource::{Resource, ResourceAdvertisement};
+use reticulum::packet::PACKET_MDU;
 use reticulum::transport::{Transport, TransportConfig};
+use tokio::sync::RwLock;
 
 /// Test resource server for integration testing
 #[derive(Parser, Debug)]
 #[command(name = "test_resource_server")]
-#[command(about = "Listen for incoming Reticulum resources for testing")]
+#[command(about = "Listen for incoming Reticulum resources and complete transfers")]
 struct Args {
     /// Application name for destination
     #[arg(short, long, default_value = "test_app")]
@@ -58,6 +63,12 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+}
+
+/// Tracked incoming resource with its link
+struct TrackedIncomingResource {
+    resource: Resource,
+    link_id: LinkId,
 }
 
 fn main() {
@@ -148,9 +159,13 @@ fn main() {
         // Subscribe to incoming link events
         let mut link_events = transport.in_link_events();
 
-        // Track resources and links
+        // Track incoming resources by their truncated hash
+        let incoming_resources: Arc<RwLock<HashMap<[u8; 16], TrackedIncomingResource>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Track statistics
         let mut link_count = 0u32;
-        let mut resource_adv_count = 0u32;
+        let mut resource_complete_count = 0u32;
 
         // Set up timeout if specified
         let timeout = if args.timeout > 0 {
@@ -177,7 +192,7 @@ fn main() {
             }
 
             // Check if we've reached resource limit
-            if args.resource_count > 0 && resource_adv_count >= args.resource_count {
+            if args.resource_count > 0 && resource_complete_count >= args.resource_count {
                 log::info!("Reached resource limit ({}), exiting", args.resource_count);
                 println!("STATUS=RESOURCE_LIMIT_REACHED");
                 break;
@@ -186,11 +201,15 @@ fn main() {
             tokio::select! {
                 // Handle link events
                 Ok(event) = link_events.recv() => {
-                    handle_link_event(
+                    let completed = handle_link_event(
+                        &transport,
                         &event,
+                        &incoming_resources,
                         &mut link_count,
-                        &mut resource_adv_count,
-                    );
+                    ).await;
+                    if completed {
+                        resource_complete_count += 1;
+                    }
                 }
                 // Send periodic announces
                 _ = tokio::time::sleep_until(next_announce) => {
@@ -210,22 +229,24 @@ fn main() {
         }
 
         println!("TOTAL_LINKS={}", link_count);
-        println!("TOTAL_RESOURCE_ADVERTISEMENTS={}", resource_adv_count);
+        println!("TOTAL_RESOURCES_COMPLETE={}", resource_complete_count);
         println!("STATUS=SHUTDOWN");
         log::info!(
-            "Resource server complete: {} links, {} resource advertisements",
+            "Resource server complete: {} links, {} resources completed",
             link_count,
-            resource_adv_count
+            resource_complete_count
         );
     });
 }
 
-fn handle_link_event(
+async fn handle_link_event(
+    transport: &Transport,
     event: &LinkEventData,
+    incoming_resources: &Arc<RwLock<HashMap<[u8; 16], TrackedIncomingResource>>>,
     link_count: &mut u32,
-    resource_adv_count: &mut u32,
-) {
-    let link_id_hex = hex::encode(event.id.as_slice());
+) -> bool {
+    let link_id = event.id;
+    let link_id_hex = hex::encode(link_id.as_slice());
 
     match &event.event {
         LinkEvent::Activated => {
@@ -243,14 +264,13 @@ fn handle_link_event(
             );
         }
         LinkEvent::ResourceAdvertisement(payload) => {
-            *resource_adv_count += 1;
             log::info!(
                 "Link {}: resource advertisement {} bytes",
                 link_id_hex,
                 payload.len()
             );
 
-            // Try to parse the advertisement
+            // Parse the advertisement
             match ResourceAdvertisement::unpack(payload.as_slice()) {
                 Ok(adv) => {
                     println!(
@@ -267,6 +287,55 @@ fn handle_link_event(
                         adv.data_size,
                         adv.num_parts
                     );
+
+                    // Create an incoming resource from the advertisement
+                    // SDU is PACKET_MDU minus some overhead for headers
+                    let sdu = PACKET_MDU - 64;
+
+                    // Debug: Log hashmap and random_hash info
+                    log::debug!(
+                        "Advertisement: hashmap {} bytes ({} entries), random_hash {:?}",
+                        adv.hashmap.len(),
+                        adv.hashmap.len() / 4,
+                        &adv.random_hash
+                    );
+
+                    match Resource::from_advertisement(&adv, sdu) {
+                        Ok(mut resource) => {
+                            let truncated_hash = *resource.truncated_hash();
+
+                            // Request the first batch of parts
+                            if let Some(request_data) = resource.request_next() {
+                                log::info!(
+                                    "Sending resource request ({} bytes) for hash {}",
+                                    request_data.len(),
+                                    hex::encode(&truncated_hash)
+                                );
+
+                                if transport.send_resource_request(&link_id, &request_data).await {
+                                    println!(
+                                        "RESOURCE_REQUEST_SENT={}:{}",
+                                        link_id_hex,
+                                        hex::encode(&truncated_hash)
+                                    );
+
+                                    // Store the resource for tracking
+                                    incoming_resources.write().await.insert(
+                                        truncated_hash,
+                                        TrackedIncomingResource {
+                                            resource,
+                                            link_id,
+                                        },
+                                    );
+                                } else {
+                                    log::error!("Failed to send resource request");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create resource from advertisement: {:?}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -280,16 +349,185 @@ fn handle_link_event(
             }
         }
         LinkEvent::ResourceData(payload) => {
-            log::debug!(
+            log::info!(
                 "Link {}: resource data {} bytes",
                 link_id_hex,
                 payload.len()
             );
-            println!(
-                "RESOURCE_DATA={}:{}",
+
+            // Try to find the resource this data belongs to and add the part
+            let mut resources = incoming_resources.write().await;
+            log::debug!("Have {} tracked resources", resources.len());
+
+            // We need to check all resources to find which one this part belongs to
+            let mut completed_hash: Option<[u8; 16]> = None;
+            let mut needs_more_request: Option<([u8; 16], Vec<u8>)> = None;
+
+            for (hash, tracked) in resources.iter_mut() {
+                log::debug!(
+                    "Trying resource {} (link {:?} vs {:?})",
+                    hex::encode(hash),
+                    tracked.link_id.as_slice(),
+                    link_id.as_slice()
+                );
+                if tracked.link_id == link_id {
+                    log::debug!("Calling receive_part on resource {}", hex::encode(hash));
+                    if tracked.resource.receive_part(payload.as_slice().to_vec()) {
+                        log::debug!(
+                            "Received part for resource {}, progress: {}/{}",
+                            hex::encode(hash),
+                            tracked.resource.progress().processed_parts,
+                            tracked.resource.progress().total_parts
+                        );
+
+                        println!(
+                            "RESOURCE_PART_RECEIVED={}:{}:{}/{}",
+                            link_id_hex,
+                            hex::encode(hash),
+                            tracked.resource.progress().processed_parts,
+                            tracked.resource.progress().total_parts
+                        );
+
+                        // Check if complete
+                        if tracked.resource.is_complete() {
+                            completed_hash = Some(*hash);
+                        } else {
+                            // Request more parts if needed
+                            if let Some(request_data) = tracked.resource.request_next() {
+                                needs_more_request = Some((*hash, request_data));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Handle completion
+            if let Some(hash) = completed_hash {
+                if let Some(tracked) = resources.remove(&hash) {
+                    let mut resource = tracked.resource;
+
+                    // Get raw assembled data
+                    let raw_data_opt = resource.get_raw_assembled_data();
+                    if raw_data_opt.is_none() {
+                        log::error!("Failed to get raw assembled data for resource {}", hex::encode(&hash));
+                        println!(
+                            "RESOURCE_ASSEMBLY_ERROR={}:{}:NoRawData",
+                            link_id_hex,
+                            hex::encode(&hash)
+                        );
+                    } else {
+                        let raw_data = raw_data_opt.unwrap();
+                        let raw_data_len = raw_data.len();
+
+                        // Decrypt the assembled data using the link's key
+                        let decrypted_result = if resource.is_encrypted() {
+                            transport.decrypt_with_in_link(&link_id, &raw_data).await
+                        } else {
+                            Ok(raw_data)
+                        };
+                        match decrypted_result {
+                            Ok(decrypted_data) => {
+                                log::debug!(
+                                    "Decrypted {} bytes from {} raw bytes, first 20: {:?}",
+                                    decrypted_data.len(),
+                                    raw_data_len,
+                                    &decrypted_data[..std::cmp::min(20, decrypted_data.len())]
+                                );
+                                // Finalize assembly with decrypted data
+                                match resource.finalize_assembly(decrypted_data) {
+                                    Ok(data) => {
+                                        log::info!(
+                                            "Resource {} complete! Received {} bytes",
+                                            hex::encode(&hash),
+                                            data.len()
+                                        );
+                                        println!(
+                                            "RESOURCE_COMPLETE={}:{}:{}",
+                                            link_id_hex,
+                                            hex::encode(&hash),
+                                            data.len()
+                                        );
+
+                                        // Send proof
+                                        let proof_data = resource.generate_proof();
+                                        if transport.send_resource_proof(&link_id, &proof_data).await {
+                                            println!(
+                                                "RESOURCE_PROOF_SENT={}:{}",
+                                                link_id_hex,
+                                                hex::encode(&hash)
+                                            );
+                                        }
+                                        return true;
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to assemble resource {}: {:?}", hex::encode(&hash), e);
+                                        println!(
+                                            "RESOURCE_ASSEMBLY_ERROR={}:{}:{:?}",
+                                            link_id_hex,
+                                            hex::encode(&hash),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to decrypt resource {}: {:?}", hex::encode(&hash), e);
+                                println!(
+                                    "RESOURCE_ASSEMBLY_ERROR={}:{}:DecryptFailed:{:?}",
+                                    link_id_hex,
+                                    hex::encode(&hash),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Send request for more parts if needed
+            if let Some((hash, request_data)) = needs_more_request {
+                log::debug!(
+                    "Requesting more parts for resource {}",
+                    hex::encode(&hash)
+                );
+                transport.send_resource_request(&link_id, &request_data).await;
+            }
+        }
+        LinkEvent::ResourceHashmapUpdate(payload) => {
+            log::debug!(
+                "Link {}: resource hashmap update {} bytes",
                 link_id_hex,
                 payload.len()
             );
+
+            // The hashmap update contains: [resource_hash:16][hashmap_data...]
+            if payload.len() < 16 {
+                log::error!("Hashmap update too short");
+                return false;
+            }
+
+            let mut resource_hash = [0u8; 16];
+            resource_hash.copy_from_slice(&payload.as_slice()[..16]);
+            let hashmap_data = &payload.as_slice()[16..];
+
+            let mut resources = incoming_resources.write().await;
+            if let Some(tracked) = resources.get_mut(&resource_hash) {
+                // Update the hashmap (segment 0 for now, can be improved)
+                tracked.resource.update_hashmap(0, hashmap_data);
+
+                println!(
+                    "RESOURCE_HASHMAP_UPDATED={}:{}:{}",
+                    link_id_hex,
+                    hex::encode(&resource_hash),
+                    hashmap_data.len()
+                );
+
+                // Request more parts now that we have more hashmap
+                if let Some(request_data) = tracked.resource.request_next() {
+                    transport.send_resource_request(&link_id, &request_data).await;
+                }
+            }
         }
         LinkEvent::ResourceRequest(payload) => {
             log::debug!(
@@ -299,13 +537,6 @@ fn handle_link_event(
             );
             println!(
                 "RESOURCE_REQUEST={}:{}",
-                link_id_hex,
-                payload.len()
-            );
-        }
-        LinkEvent::ResourceHashmapUpdate(payload) => {
-            log::debug!(
-                "Link {}: resource hashmap update {} bytes",
                 link_id_hex,
                 payload.len()
             );
@@ -335,6 +566,12 @@ fn handle_link_event(
         LinkEvent::Closed => {
             println!("LINK_CLOSED={}", link_id_hex);
             log::info!("Link {} closed", link_id_hex);
+
+            // Clean up any resources associated with this link
+            let mut resources = incoming_resources.write().await;
+            resources.retain(|_, tracked| tracked.link_id != link_id);
         }
     }
+
+    false
 }

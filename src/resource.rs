@@ -613,6 +613,10 @@ impl Resource {
         let flags = adv.flags;
         let total_parts = adv.num_parts;
 
+        // Copy hashmap from advertisement and calculate height
+        let hashmap = adv.hashmap.clone();
+        let hashmap_height = hashmap.len() / MAPHASH_LEN;
+
         Ok(Self {
             status: RwLock::new(ResourceStatus::Transferring),
             hash: adv.hash,
@@ -629,7 +633,7 @@ impl Resource {
             total_size: adv.data_size,
             flags,
             parts: Vec::new(),
-            hashmap: Vec::new(),
+            hashmap,
             total_parts,
             sent_parts: 0,
             received_parts: vec![None; total_parts],
@@ -660,16 +664,17 @@ impl Resource {
             progress_callback: None,
             completion_callback: None,
             sdu,
-            hashmap_height: 0,
+            hashmap_height,
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
             receiver_min_consecutive_height: 0,
         })
     }
 
-    /// Calculate the map hash for a part
+    /// Calculate the map hash for a part.
+    /// Python: full_hash(data + random_hash)[:MAPHASH_LEN]
     fn calculate_map_hash(data: &[u8], random_hash: &[u8; RANDOM_HASH_SIZE]) -> [u8; MAPHASH_LEN] {
-        let hash = Hash::new(
+        let full_hash = Hash::new(
             Hash::generator()
                 .chain_update(data)
                 .chain_update(random_hash)
@@ -677,7 +682,7 @@ impl Resource {
                 .into(),
         );
         let mut result = [0u8; MAPHASH_LEN];
-        result.copy_from_slice(&hash.as_bytes()[..MAPHASH_LEN]);
+        result.copy_from_slice(&full_hash.as_bytes()[..MAPHASH_LEN]);
         result
     }
 
@@ -841,9 +846,25 @@ impl Resource {
     pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
         let map_hash = Self::calculate_map_hash(&data, &self.random_hash);
 
+        log::debug!(
+            "receive_part: data {} bytes, first 20: {:?}, calculated map_hash {:?}",
+            data.len(),
+            &data[..data.len().min(20)],
+            &map_hash
+        );
+        log::debug!(
+            "receive_part: random_hash {:?}, hashmap {} bytes, hashmap_height {}, consecutive_completed_height {}",
+            &self.random_hash,
+            self.hashmap.len(),
+            self.hashmap_height,
+            self.consecutive_completed_height
+        );
+
         // Search for matching hash in window
         let start = (self.consecutive_completed_height + 1) as usize;
         let end = (start + self.window).min(self.total_parts);
+
+        log::debug!("receive_part: searching from {} to {}", start, end);
 
         for i in start..end {
             let hash_start = i * MAPHASH_LEN;
@@ -851,6 +872,11 @@ impl Resource {
 
             if hash_end <= self.hashmap.len() {
                 let expected_hash = &self.hashmap[hash_start..hash_end];
+                log::debug!(
+                    "receive_part: part {}, expected_hash {:?}",
+                    i,
+                    expected_hash
+                );
                 if expected_hash == map_hash {
                     if self.received_parts[i].is_none() {
                         self.received_parts[i] = Some(data);
@@ -891,8 +917,15 @@ impl Resource {
         self.received_count == self.total_parts
     }
 
-    /// Assemble received parts into final data
-    pub fn assemble(&mut self) -> Result<Vec<u8>, RnsError> {
+    /// Assemble received parts into final data.
+    ///
+    /// The `decrypt_fn` is called to decrypt the assembled data stream if the resource
+    /// is encrypted. It should accept the encrypted data and return the decrypted data.
+    /// This is typically `link.decrypt()` from the Link that received the resource.
+    pub fn assemble_with_decryption<F>(&mut self, decrypt_fn: F) -> Result<Vec<u8>, RnsError>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, RnsError>,
+    {
         if !self.is_complete() {
             return Err(RnsError::InvalidArgument);
         }
@@ -907,10 +940,14 @@ impl Resource {
             }
         }
 
-        // In production, decrypt here using link.decrypt()
-        let decrypted = stream;
+        // Decrypt if resource is encrypted
+        let decrypted = if self.flags.encrypted {
+            decrypt_fn(&stream)?
+        } else {
+            stream
+        };
 
-        // Strip off random hash
+        // Strip off random hash (which was prepended to the data before encryption)
         if decrypted.len() < RANDOM_HASH_SIZE {
             self.set_status(ResourceStatus::Corrupt);
             return Err(RnsError::InvalidArgument);
@@ -924,7 +961,7 @@ impl Resource {
             data.to_vec()
         };
 
-        // Verify hash
+        // Verify hash: Hash(uncompressed_data + random_hash)
         let calculated_hash = Hash::new(
             Hash::generator()
                 .chain_update(&final_data)
@@ -934,6 +971,87 @@ impl Resource {
         );
 
         if calculated_hash.as_bytes() != &self.hash {
+            log::error!(
+                "Resource hash mismatch: expected {}, calculated {}",
+                hex::encode(&self.hash),
+                hex::encode(calculated_hash.as_bytes())
+            );
+            self.set_status(ResourceStatus::Corrupt);
+            return Err(RnsError::IncorrectHash);
+        }
+
+        self.set_status(ResourceStatus::Complete);
+
+        // Trigger completion callback
+        if let Some(ref callback) = self.completion_callback {
+            callback(self, true);
+        }
+
+        Ok(final_data)
+    }
+
+    /// Assemble received parts into final data (for unencrypted resources).
+    /// Use `assemble_with_decryption` for encrypted resources.
+    pub fn assemble(&mut self) -> Result<Vec<u8>, RnsError> {
+        self.assemble_with_decryption(|data| Ok(data.to_vec()))
+    }
+
+    /// Get the raw assembled data (encrypted) without decryption.
+    /// This is useful when you need to handle decryption externally (e.g., in an async context).
+    /// Returns None if resource is not complete.
+    pub fn get_raw_assembled_data(&self) -> Option<Vec<u8>> {
+        if !self.is_complete() {
+            return None;
+        }
+
+        let mut stream = Vec::with_capacity(self.size);
+        for part in &self.received_parts {
+            if let Some(data) = part {
+                stream.extend_from_slice(data);
+            }
+        }
+        Some(stream)
+    }
+
+    /// Finalize assembly with pre-decrypted data.
+    /// Call this after decrypting the raw assembled data externally.
+    /// The decrypted_data should be the result of decrypting `get_raw_assembled_data()`.
+    pub fn finalize_assembly(&mut self, decrypted_data: Vec<u8>) -> Result<Vec<u8>, RnsError> {
+        if !self.is_complete() {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        self.set_status(ResourceStatus::Assembling);
+
+        // Strip off random hash (which was prepended to the data before encryption)
+        if decrypted_data.len() < RANDOM_HASH_SIZE {
+            self.set_status(ResourceStatus::Corrupt);
+            return Err(RnsError::InvalidArgument);
+        }
+        let data = &decrypted_data[RANDOM_HASH_SIZE..];
+
+        // Decompress if needed
+        let final_data = if self.flags.compressed {
+            decompress_bz2(data)?
+        } else {
+            data.to_vec()
+        };
+
+        // Verify hash: Hash(uncompressed_data + random_hash)
+        let calculated_hash = Hash::new(
+            Hash::generator()
+                .chain_update(&final_data)
+                .chain_update(&self.random_hash)
+                .finalize()
+                .into(),
+        );
+
+        if calculated_hash.as_bytes() != &self.hash {
+            log::error!(
+                "Resource hash mismatch: expected {}, calculated {}",
+                hex::encode(&self.hash),
+                hex::encode(calculated_hash.as_bytes())
+            );
             self.set_status(ResourceStatus::Corrupt);
             return Err(RnsError::IncorrectHash);
         }
@@ -1042,6 +1160,202 @@ impl Resource {
                 }
             }
         }
+    }
+
+    /// Generate a request for the next batch of parts (for incoming resources).
+    /// Returns the request data bytes to be sent in a RESOURCE_REQ packet.
+    /// Format: [hashmap_exhausted_flag] [last_map_hash if exhausted] [resource_hash:16] [part_hashes...]
+    pub fn request_next(&mut self) -> Option<Vec<u8>> {
+        if self.status() == ResourceStatus::Failed || self.status() == ResourceStatus::Complete {
+            return None;
+        }
+
+        if self.waiting_for_hmu {
+            return None;
+        }
+
+        self.outstanding_parts = 0;
+        let mut hashmap_exhausted = HASHMAP_IS_NOT_EXHAUSTED;
+        let mut requested_hashes: Vec<u8> = Vec::new();
+
+        let search_start = (self.consecutive_completed_height + 1) as usize;
+        let search_size = self.window;
+        let mut i = 0;
+        let mut pn = search_start;
+
+        // Iterate through parts we need
+        for idx in search_start..(search_start + search_size).min(self.total_parts) {
+            // Check if we already have this part
+            if self.received_parts.get(idx).map(|p| p.is_none()).unwrap_or(true) {
+                // Get the hash for this part from the hashmap
+                let hash_start = pn * MAPHASH_LEN;
+                let hash_end = hash_start + MAPHASH_LEN;
+
+                if hash_end <= self.hashmap.len() && hash_end <= self.hashmap_height * MAPHASH_LEN {
+                    // We have the hash, request this part
+                    requested_hashes.extend_from_slice(&self.hashmap[hash_start..hash_end]);
+                    self.outstanding_parts += 1;
+                    i += 1;
+                } else {
+                    // Need more hashmap entries
+                    hashmap_exhausted = HASHMAP_IS_EXHAUSTED;
+                }
+            }
+            pn += 1;
+
+            if i >= self.window || hashmap_exhausted == HASHMAP_IS_EXHAUSTED {
+                break;
+            }
+        }
+
+        // Build the request data
+        let mut request_data = Vec::new();
+        request_data.push(hashmap_exhausted);
+
+        if hashmap_exhausted == HASHMAP_IS_EXHAUSTED {
+            // Add the last map hash we have
+            if self.hashmap_height > 0 {
+                let last_hash_start = (self.hashmap_height - 1) * MAPHASH_LEN;
+                let last_hash_end = last_hash_start + MAPHASH_LEN;
+                if last_hash_end <= self.hashmap.len() {
+                    request_data.extend_from_slice(&self.hashmap[last_hash_start..last_hash_end]);
+                } else {
+                    // No hashmap yet, send zeros
+                    request_data.extend_from_slice(&[0u8; MAPHASH_LEN]);
+                }
+            } else {
+                request_data.extend_from_slice(&[0u8; MAPHASH_LEN]);
+            }
+            self.waiting_for_hmu = true;
+        }
+
+        // Add resource hash (full 32 bytes, as Python expects)
+        request_data.extend_from_slice(&self.hash);
+
+        // Add requested part hashes
+        request_data.extend_from_slice(&requested_hashes);
+
+        if !requested_hashes.is_empty() || hashmap_exhausted == HASHMAP_IS_EXHAUSTED {
+            self.set_status(ResourceStatus::Transferring);
+            Some(request_data)
+        } else {
+            None
+        }
+    }
+
+    /// Handle an incoming resource request (for outgoing resources).
+    /// Returns a list of part indices that should be sent.
+    pub fn handle_request(&mut self, request_data: &[u8]) -> Result<(bool, Vec<usize>), RnsError> {
+        if request_data.is_empty() {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let wants_more_hashmap = request_data[0] == HASHMAP_IS_EXHAUSTED;
+        let pad = if wants_more_hashmap {
+            1 + MAPHASH_LEN
+        } else {
+            1
+        };
+
+        // Skip past the header and resource hash (full 32 bytes)
+        let hash_size = 32; // Full hash size as Python expects
+        if request_data.len() < pad + hash_size {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let requested_hashes = &request_data[pad + hash_size..];
+
+        // Define search scope based on receiver's state
+        let search_start = self.receiver_min_consecutive_height;
+        let search_end = search_start + ResourceAdvertisement::COLLISION_GUARD_SIZE;
+
+        let mut parts_to_send = Vec::new();
+
+        // Parse requested hashes and find matching parts
+        for i in 0..(requested_hashes.len() / MAPHASH_LEN) {
+            let hash_start = i * MAPHASH_LEN;
+            let hash_end = hash_start + MAPHASH_LEN;
+            let requested_hash = &requested_hashes[hash_start..hash_end];
+
+            // Search for this hash in our parts
+            for idx in search_start..search_end.min(self.parts.len()) {
+                if &self.parts[idx].map_hash == requested_hash {
+                    parts_to_send.push(idx);
+                    break;
+                }
+            }
+        }
+
+        // Update status
+        if self.status() != ResourceStatus::Transferring {
+            self.set_status(ResourceStatus::Transferring);
+        }
+        self.retries_left = MAX_RETRIES;
+
+        Ok((wants_more_hashmap, parts_to_send))
+    }
+
+    /// Get hashmap data for a hashmap update packet.
+    /// Returns data to send in RESOURCE_HMU packet.
+    pub fn get_hashmap_update(&self, segment: usize) -> Vec<u8> {
+        let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
+        let hashmap_start = segment * seg_len * MAPHASH_LEN;
+        let hashmap_end = ((segment + 1) * seg_len * MAPHASH_LEN).min(self.hashmap.len());
+
+        let mut update_data = Vec::new();
+        // Add resource hash (truncated)
+        update_data.extend_from_slice(&self.truncated_hash);
+        // Add hashmap segment
+        if hashmap_start < self.hashmap.len() {
+            update_data.extend_from_slice(&self.hashmap[hashmap_start..hashmap_end]);
+        }
+        update_data
+    }
+
+    /// Generate proof data for a completed resource.
+    /// Returns data to send in RESOURCE_PRF packet.
+    pub fn generate_proof(&self) -> Vec<u8> {
+        let mut proof_data = Vec::new();
+        // Add resource hash (truncated)
+        proof_data.extend_from_slice(&self.truncated_hash);
+        // Add the expected proof hash
+        let proof_hash = Hash::new(
+            Hash::generator()
+                .chain_update(&self.hash)
+                .chain_update(&self.random_hash)
+                .finalize()
+                .into(),
+        );
+        proof_data.extend_from_slice(proof_hash.as_bytes());
+        proof_data
+    }
+
+    /// Verify a proof from the receiver.
+    pub fn verify_proof(&self, proof_data: &[u8]) -> bool {
+        if proof_data.len() < 16 + 32 {
+            return false;
+        }
+
+        // Verify the resource hash matches
+        if &proof_data[..16] != &self.truncated_hash {
+            return false;
+        }
+
+        // Calculate expected proof
+        let expected_proof = Hash::new(
+            Hash::generator()
+                .chain_update(&self.hash)
+                .chain_update(&self.random_hash)
+                .finalize()
+                .into(),
+        );
+
+        &proof_data[16..48] == expected_proof.as_bytes()
+    }
+
+    /// Get part data for sending (for outgoing resources).
+    pub fn get_part_data(&self, index: usize) -> Option<&[u8]> {
+        self.parts.get(index).map(|p| p.data.as_slice())
     }
 }
 
@@ -1261,13 +1575,17 @@ fn compress_bz2(data: &[u8]) -> Result<Vec<u8>, RnsError> {
 
 /// Decompress bz2-compressed data
 fn decompress_bz2(data: &[u8]) -> Result<Vec<u8>, RnsError> {
+    use bzip2::read::BzDecoder;
     use std::io::Read;
 
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
+    let mut decoder = BzDecoder::new(data);
     let mut result = Vec::new();
     decoder
         .read_to_end(&mut result)
-        .map_err(|_| RnsError::InvalidArgument)?;
+        .map_err(|e| {
+            log::error!("bz2 decompression failed: {:?}", e);
+            RnsError::InvalidArgument
+        })?;
     Ok(result)
 }
 

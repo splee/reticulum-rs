@@ -61,6 +61,7 @@ rmp-serde = "1.1"
 
 # Compression
 flate2 = "1.0"
+bzip2 = "0.4"
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }

@@ -347,14 +347,12 @@ impl Link {
                 }
             }
             PacketContext::Resource => {
-                let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    log::trace!("link({}): resource data {}B", self.id, plain_text.len());
-                    self.request_time = Instant::now();
-                    self.post_event(LinkEvent::ResourceData(LinkPayload::new_from_slice(plain_text)));
-                } else {
-                    log::error!("link({}): can't decrypt resource data", self.id);
-                }
+                // Resource data packets are NOT encrypted at the link level.
+                // The resource handles its own encryption at the data stream level.
+                // We pass the data through as-is (already resource-encrypted).
+                log::trace!("link({}): resource data {}B (passthrough)", self.id, packet.data.len());
+                self.request_time = Instant::now();
+                self.post_event(LinkEvent::ResourceData(LinkPayload::new_from_slice(packet.data.as_slice())));
             }
             PacketContext::ResourceRequest => {
                 let mut buffer = [0u8; PACKET_MDU];
@@ -377,14 +375,11 @@ impl Link {
                 }
             }
             PacketContext::ResourceProof => {
-                let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    log::trace!("link({}): resource proof {}B", self.id, plain_text.len());
-                    self.request_time = Instant::now();
-                    self.post_event(LinkEvent::ResourceProof(LinkPayload::new_from_slice(plain_text)));
-                } else {
-                    log::error!("link({}): can't decrypt resource proof", self.id);
-                }
+                // Resource proof packets are NOT encrypted at the link level.
+                // We pass the data through as-is.
+                log::trace!("link({}): resource proof {}B (passthrough)", self.id, packet.data.len());
+                self.request_time = Instant::now();
+                self.post_event(LinkEvent::ResourceProof(LinkPayload::new_from_slice(packet.data.as_slice())));
             }
             PacketContext::ResourceInitiatorCancel => {
                 let mut buffer = [0u8; PACKET_MDU];
