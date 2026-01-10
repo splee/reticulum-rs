@@ -47,6 +47,7 @@ futures = "0.3"
 rmp = "0.8.14"
 rmpv = "1.0"
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
 
 # Logging
 log = "0.4.27"
@@ -153,3 +154,11 @@ path = "src/bin/test_resource_server.rs"
 [[bin]]
 name = "test_resource_client"
 path = "src/bin/test_resource_client.rs"
+
+[[bin]]
+name = "rnx"
+path = "src/bin/rnx.rs"
+
+[[bin]]
+name = "rncp"
+path = "src/bin/rncp.rs"
