@@ -1,7 +1,8 @@
 # Rust Reticulum Docker Image
 # For integration testing with Python implementation
 
-FROM rust:latest AS builder
+# Use rust:bookworm to match the runtime glibc version (debian:bookworm-slim)
+FROM rust:bookworm AS builder
 
 # Install protoc for tonic-build
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
@@ -32,6 +33,8 @@ COPY --from=builder /app/target/release/rnid /usr/local/bin/
 COPY --from=builder /app/target/release/rnpath /usr/local/bin/
 COPY --from=builder /app/target/release/rnprobe /usr/local/bin/
 COPY --from=builder /app/target/release/rnstatus /usr/local/bin/
+COPY --from=builder /app/target/release/rncp /usr/local/bin/
+COPY --from=builder /app/target/release/rnx /usr/local/bin/
 # Test helper binaries
 COPY --from=builder /app/target/release/test_destination /usr/local/bin/
 COPY --from=builder /app/target/release/test_link_server /usr/local/bin/

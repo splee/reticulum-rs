@@ -458,16 +458,21 @@ impl Resource {
         let total_size = uncompressed_size;
 
         // Try compression if enabled and data is small enough
-        let (processed_data, compressed) =
+        // Keep uncompressed_data for hash calculation
+        let (processed_data, compressed, uncompressed_data) =
             if config.auto_compress && uncompressed_size <= config.auto_compress_limit {
                 match compress_bz2(&full_data) {
                     Ok(compressed_data) if compressed_data.len() < uncompressed_size => {
-                        (compressed_data, true)
+                        (compressed_data, true, full_data)
                     }
-                    _ => (full_data, false),
+                    _ => {
+                        let data_for_hash = full_data.clone();
+                        (full_data, false, data_for_hash)
+                    }
                 }
             } else {
-                (full_data, false)
+                let data_for_hash = full_data.clone();
+                (full_data, false, data_for_hash)
             };
 
         // Generate random hash
@@ -489,9 +494,12 @@ impl Resource {
         let size = final_data.len();
 
         // Calculate hashes
+        // NOTE: Python hashes the uncompressed (metadata + data) + random_hash
+        // The processed_data before random_hash prefix may be compressed,
+        // but for hash we use the uncompressed data
         let hash = Hash::new(
             Hash::generator()
-                .chain_update(data)
+                .chain_update(&uncompressed_data)  // Includes metadata, uncompressed
                 .chain_update(&random_hash)
                 .finalize()
                 .into(),
@@ -505,9 +513,10 @@ impl Resource {
 
         let original_hash = *hash.as_bytes();
 
+        // Expected proof is Hash(uncompressed_data + hash)
         let expected_proof = Hash::new(
             Hash::generator()
-                .chain_update(data)
+                .chain_update(&uncompressed_data)  // Includes metadata, uncompressed
                 .chain_update(hash.as_bytes())
                 .finalize()
                 .into(),
