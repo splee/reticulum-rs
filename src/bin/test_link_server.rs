@@ -302,5 +302,9 @@ async fn handle_link_event(
         LinkEvent::ResourceReceiverCancel(_) => {
             log::debug!("Link {}: resource receiver cancel received", link_id_hex);
         }
+        LinkEvent::Channel(payload) => {
+            log::debug!("Link {}: channel data received ({}B)", link_id_hex, payload.len());
+            println!("CHANNEL_DATA={}:{}", link_id_hex, payload.len());
+        }
     }
 }

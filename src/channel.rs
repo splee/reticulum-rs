@@ -691,4 +691,94 @@ mod tests {
         assert!(window::MAX >= window::MAX_MEDIUM);
         assert!(window::MAX >= window::MAX_FAST);
     }
+
+    #[test]
+    fn test_receive_message() {
+        let channel = Channel::new(500, Duration::from_millis(100));
+
+        // Register the message type
+        channel
+            .register_message_type(0x0001, || Box::new(TestMessage::new(&[])))
+            .expect("register type");
+
+        // Add a message handler to verify reception
+        let received = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let received_clone = received.clone();
+        channel.add_message_handler(Arc::new(move |_msg| {
+            *received_clone.lock().unwrap() = true;
+            true
+        }));
+
+        // Create a raw message packet (same format as Envelope::pack produces)
+        // Header: msgtype (2) + sequence (2) + length (2) = 6 bytes
+        let msg_data = b"Test receive";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0x0001u16.to_be_bytes()); // msg_type
+        raw.extend_from_slice(&0u16.to_be_bytes()); // sequence 0
+        raw.extend_from_slice(&(msg_data.len() as u16).to_be_bytes()); // length
+        raw.extend_from_slice(msg_data);
+
+        // Receive the message
+        channel.receive(&raw).expect("receive");
+
+        // Verify handler was called
+        assert!(*received.lock().unwrap());
+    }
+
+    #[test]
+    fn test_channel_shutdown() {
+        let channel = Channel::new(500, Duration::from_millis(100));
+
+        let msg = TestMessage::new(b"Test message");
+        channel.send(&msg).expect("send");
+
+        assert_eq!(channel.pending_tx_count(), 1);
+
+        // Shutdown should clear everything
+        channel.shutdown();
+
+        assert_eq!(channel.pending_tx_count(), 0);
+        assert!(!channel.is_ready_to_send());
+    }
+
+    #[test]
+    fn test_timeout_handling() {
+        let channel = Channel::new(500, Duration::from_millis(100));
+
+        let msg = TestMessage::new(b"Test message");
+        let envelope_id = channel.send(&msg).expect("send");
+
+        // First timeout should allow retry
+        assert!(channel.mark_timeout(envelope_id).expect("timeout 1"));
+        assert!(channel.mark_timeout(envelope_id).expect("timeout 2"));
+        assert!(channel.mark_timeout(envelope_id).expect("timeout 3"));
+        assert!(channel.mark_timeout(envelope_id).expect("timeout 4"));
+
+        // 5th timeout (max_tries=5) should fail
+        assert!(!channel.mark_timeout(envelope_id).expect("timeout 5"));
+    }
+
+    #[test]
+    fn test_channel_mdu() {
+        // Channel MDU should account for envelope header overhead (6 bytes)
+        let link_mdu = 500;
+        let channel = Channel::new(link_mdu, Duration::from_millis(100));
+
+        assert_eq!(channel.mdu(), link_mdu - 6);
+    }
+
+    #[test]
+    fn test_get_send_data() {
+        let channel = Channel::new(500, Duration::from_millis(100));
+
+        let msg = TestMessage::new(b"Test data");
+        let envelope_id = channel.send(&msg).expect("send");
+
+        // Should be able to retrieve the packed data
+        let data = channel.get_send_data(envelope_id).expect("get data");
+        assert!(!data.is_empty());
+
+        // Data should contain the message
+        assert!(data.len() > 6); // Header + message data
+    }
 }

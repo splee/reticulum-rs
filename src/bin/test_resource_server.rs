@@ -323,6 +323,9 @@ fn handle_link_event(
         LinkEvent::ResourceReceiverCancel(_) => {
             log::debug!("Link {}: resource receiver cancel", link_id_hex);
         }
+        LinkEvent::Channel(payload) => {
+            log::debug!("Link {}: channel data {} bytes", link_id_hex, payload.len());
+        }
         LinkEvent::Closed => {
             println!("LINK_CLOSED={}", link_id_hex);
             log::info!("Link {} closed", link_id_hex);

@@ -122,6 +122,8 @@ pub enum LinkHandleResult {
 pub enum LinkEvent {
     Activated,
     Data(LinkPayload),
+    /// Channel data received (for Channel message system)
+    Channel(LinkPayload),
     /// Resource advertisement received (contains unpacked ResourceAdvertisement)
     ResourceAdvertisement(LinkPayload),
     /// Resource data part received
@@ -400,6 +402,16 @@ impl Link {
                     log::error!("link({}): can't decrypt resource receiver cancel", self.id);
                 }
             }
+            PacketContext::Channel => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): channel data {}B", self.id, plain_text.len());
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::Channel(LinkPayload::new_from_slice(plain_text)));
+                } else {
+                    log::error!("link({}): can't decrypt channel data", self.id);
+                }
+            }
             _ => {
                 log::trace!("link({}): unhandled packet context {:?}", self.id, packet.context);
             }
@@ -468,6 +480,37 @@ impl Link {
             destination: self.id,
             transport: None,
             context: PacketContext::None,
+            data: packet_data,
+        })
+    }
+
+    /// Create a channel data packet for sending Channel messages over the link.
+    /// Channel messages provide reliable, sequenced message delivery.
+    pub fn channel_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active {
+            log::warn!("link: can't create channel packet for inactive link");
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::Channel,
             data: packet_data,
         })
     }
@@ -591,6 +634,16 @@ impl Link {
     /// Get round-trip time measurement
     pub fn rtt(&self) -> Duration {
         self.rtt
+    }
+
+    /// Get the maximum data unit size for this link.
+    /// This is the maximum payload size that can be sent in a single packet.
+    pub fn mdu(&self) -> usize {
+        // Link MDU is determined by the underlying transport
+        // For now, use the standard PACKET_MDU minus encryption overhead
+        // AES-256-CBC: 16-byte IV + padding (up to 16 bytes) + HMAC (32 bytes)
+        // Total overhead is approximately 64 bytes max
+        PACKET_MDU.saturating_sub(64)
     }
 
     // ========================================================================

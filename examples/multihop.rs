@@ -131,14 +131,15 @@ async fn main() {
                             LinkEvent::Closed => {
                                 log::info!("Link closed");
                             },
-                            // Resource events not handled in this example
+                            // Resource and channel events not handled in this example
                             LinkEvent::ResourceAdvertisement(_) |
                             LinkEvent::ResourceData(_) |
                             LinkEvent::ResourceRequest(_) |
                             LinkEvent::ResourceHashmapUpdate(_) |
                             LinkEvent::ResourceProof(_) |
                             LinkEvent::ResourceInitiatorCancel(_) |
-                            LinkEvent::ResourceReceiverCancel(_) => {}
+                            LinkEvent::ResourceReceiverCancel(_) |
+                            LinkEvent::Channel(_) => {}
                         },
                         Err(error) => {
                             log::info!("Link error: {}", error);
