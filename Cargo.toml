@@ -50,6 +50,13 @@ serde = { version = "1.0.219", features = ["derive"] }
 log = "0.4.27"
 env_logger = "0.10"
 
+# Configuration and paths
+dirs = "5.0"
+lazy_static = "1.4"
+
+# Serialization for persistence
+rmp-serde = "1.1"
+
 [features]
 default = ["alloc"]
 alloc = []

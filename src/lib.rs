@@ -1,6 +1,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+// Core modules
 pub mod buffer;
 pub mod crypt;
 pub mod destination;
@@ -11,5 +12,12 @@ pub mod iface;
 pub mod packet;
 pub mod transport;
 
+// Phase 1: Core infrastructure modules
+pub mod config;
+pub mod logging;
+pub mod persistence;
+pub mod receipt;
+
+// Internal modules
 mod utils;
 mod serde;
