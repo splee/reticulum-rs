@@ -2,6 +2,11 @@
 //!
 //! GROUP destinations use symmetric encryption with a pre-shared key,
 //! allowing multiple parties to communicate using the same key.
+//!
+//! The key format is compatible with Python Reticulum's Token class:
+//! - 64 bytes total for AES-256-CBC mode
+//! - First 32 bytes: signing key (HMAC-SHA256)
+//! - Last 32 bytes: encryption key (AES-256)
 
 use rand_core::CryptoRngCore;
 use sha2::Digest;
@@ -10,40 +15,45 @@ use crate::crypt::fernet::{Fernet, PlainText, Token};
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 
-/// Length of the group key in bytes (256 bits for AES-256)
-pub const GROUP_KEY_LENGTH: usize = 32;
+/// Length of the group key in bytes (64 bytes for AES-256-CBC mode)
+/// This matches Python's Token.generate_key() for AES_256_CBC
+pub const GROUP_KEY_LENGTH: usize = 64;
+
+/// Length of each half of the key (32 bytes each for signing and encryption)
+const GROUP_KEY_HALF: usize = GROUP_KEY_LENGTH / 2;
 
 /// A symmetric key for GROUP destinations
+/// Compatible with Python Reticulum's Token class (AES-256-CBC mode)
 #[derive(Clone)]
 pub struct GroupKey {
-    /// Encryption key (first half of derived key)
-    encryption_key: [u8; GROUP_KEY_LENGTH / 2],
-    /// Authentication key (second half of derived key)
-    authentication_key: [u8; GROUP_KEY_LENGTH / 2],
+    /// Signing key (first half - 32 bytes for HMAC-SHA256)
+    signing_key: [u8; GROUP_KEY_HALF],
+    /// Encryption key (second half - 32 bytes for AES-256)
+    encryption_key: [u8; GROUP_KEY_HALF],
     /// Full key bytes for storage
     full_key: [u8; GROUP_KEY_LENGTH],
 }
 
 impl GroupKey {
-    /// Generate a new random group key
+    /// Generate a new random group key (64 bytes for AES-256-CBC)
     pub fn generate<R: CryptoRngCore>(mut rng: R) -> Self {
         let mut full_key = [0u8; GROUP_KEY_LENGTH];
         rng.fill_bytes(&mut full_key);
 
-        let mut encryption_key = [0u8; GROUP_KEY_LENGTH / 2];
-        let mut authentication_key = [0u8; GROUP_KEY_LENGTH / 2];
+        let mut signing_key = [0u8; GROUP_KEY_HALF];
+        let mut encryption_key = [0u8; GROUP_KEY_HALF];
 
-        encryption_key.copy_from_slice(&full_key[..GROUP_KEY_LENGTH / 2]);
-        authentication_key.copy_from_slice(&full_key[GROUP_KEY_LENGTH / 2..]);
+        signing_key.copy_from_slice(&full_key[..GROUP_KEY_HALF]);
+        encryption_key.copy_from_slice(&full_key[GROUP_KEY_HALF..]);
 
         Self {
+            signing_key,
             encryption_key,
-            authentication_key,
             full_key,
         }
     }
 
-    /// Create a group key from bytes
+    /// Create a group key from bytes (expects 64 bytes for AES-256-CBC)
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RnsError> {
         if bytes.len() != GROUP_KEY_LENGTH {
             return Err(RnsError::InvalidArgument);
@@ -52,20 +62,20 @@ impl GroupKey {
         let mut full_key = [0u8; GROUP_KEY_LENGTH];
         full_key.copy_from_slice(bytes);
 
-        let mut encryption_key = [0u8; GROUP_KEY_LENGTH / 2];
-        let mut authentication_key = [0u8; GROUP_KEY_LENGTH / 2];
+        let mut signing_key = [0u8; GROUP_KEY_HALF];
+        let mut encryption_key = [0u8; GROUP_KEY_HALF];
 
-        encryption_key.copy_from_slice(&full_key[..GROUP_KEY_LENGTH / 2]);
-        authentication_key.copy_from_slice(&full_key[GROUP_KEY_LENGTH / 2..]);
+        signing_key.copy_from_slice(&full_key[..GROUP_KEY_HALF]);
+        encryption_key.copy_from_slice(&full_key[GROUP_KEY_HALF..]);
 
         Ok(Self {
+            signing_key,
             encryption_key,
-            authentication_key,
             full_key,
         })
     }
 
-    /// Get the key as bytes
+    /// Get the key as bytes (64 bytes)
     pub fn as_bytes(&self) -> &[u8; GROUP_KEY_LENGTH] {
         &self.full_key
     }
@@ -77,7 +87,7 @@ impl GroupKey {
         plaintext: &[u8],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
-        let fernet = Fernet::new_from_slices(&self.encryption_key, &self.authentication_key, rng);
+        let fernet = Fernet::new_from_slices(&self.signing_key, &self.encryption_key, rng);
 
         let token = fernet.encrypt(PlainText::from(plaintext), out_buf)?;
         Ok(token.as_bytes())
@@ -90,7 +100,7 @@ impl GroupKey {
         ciphertext: &[u8],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
-        let fernet = Fernet::new_from_slices(&self.encryption_key, &self.authentication_key, rng);
+        let fernet = Fernet::new_from_slices(&self.signing_key, &self.encryption_key, rng);
 
         let token = Token::from(ciphertext);
         let verified_token = fernet.verify(token)?;
