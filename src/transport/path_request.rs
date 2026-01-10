@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::hash::{AddressHash, Hash};
+use crate::hash::AddressHash;
 use crate::error::RnsError;
 
 /// Default path request timeout

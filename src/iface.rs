@@ -1,4 +1,6 @@
+pub mod auto_interface;
 pub mod hdlc;
+pub mod serial;
 
 pub mod kaonic;
 pub mod tcp_client;
