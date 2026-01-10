@@ -48,6 +48,12 @@ mod link_table;
 mod packet_cache;
 mod path_table;
 
+// Phase 5: Transport enhancements
+pub mod blackhole;
+pub mod path_request;
+pub mod reverse_table;
+pub mod tunnel;
+
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
