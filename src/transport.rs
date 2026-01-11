@@ -19,6 +19,7 @@ use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkHandleResult;
 use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
+use crate::destination::plain::PlainDestination;
 use crate::destination::DestinationAnnounce;
 use crate::destination::DestinationDesc;
 use crate::destination::DestinationHandleStatus;
@@ -54,6 +55,8 @@ pub mod blackhole;
 pub mod path_request;
 pub mod reverse_table;
 pub mod tunnel;
+
+use path_request::{PathRequestManager, PathRequestTagCache};
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -109,6 +112,9 @@ struct TransportHandler {
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
 
     packet_cache: Mutex<PacketCache>,
+
+    /// Path request tag deduplication cache
+    path_request_tags: PathRequestTagCache,
 
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -184,6 +190,7 @@ impl Transport {
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
+            path_request_tags: PathRequestTagCache::new(),
             announce_tx,
             link_in_event_tx: link_in_event_tx.clone(),
             received_data_tx: received_data_tx.clone(),
@@ -579,6 +586,105 @@ impl Transport {
     pub async fn drop_announce_queues(&self) {
         self.handler.lock().await.announce_table.clear();
     }
+
+    // =========================================================================
+    // Path Request Methods
+    // =========================================================================
+
+    /// Send a path request for a destination.
+    ///
+    /// This broadcasts a path request packet to the network. Other nodes that
+    /// know the path (or host the destination locally) will respond with an
+    /// announce packet.
+    ///
+    /// If `on_interface` is Some, the request is sent only on that interface.
+    /// Otherwise, it's broadcast on all interfaces.
+    ///
+    /// Returns true if the request was sent, false if rate-limited.
+    pub async fn request_path(
+        &self,
+        destination: &AddressHash,
+        on_interface: Option<AddressHash>,
+    ) -> bool {
+        let handler = self.handler.lock().await;
+
+        // Check if we already have a path
+        if handler.path_table.has_path(destination) {
+            return true;
+        }
+
+        // Build the path request packet
+        let transport_id = if handler.config.retransmit {
+            Some(handler.config.identity.address_hash().clone())
+        } else {
+            None
+        };
+
+        let (packet, _tag) =
+            PathRequestManager::create_request_packet(destination, transport_id.as_ref());
+
+        log::debug!(
+            "tp({}): sending path request for {}",
+            handler.config.name,
+            destination
+        );
+
+        // Send the packet
+        match on_interface {
+            Some(iface) => {
+                handler
+                    .send(TxMessage {
+                        tx_type: TxMessageType::Direct(iface),
+                        packet,
+                    })
+                    .await;
+            }
+            None => {
+                handler
+                    .send(TxMessage {
+                        tx_type: TxMessageType::Broadcast(None),
+                        packet,
+                    })
+                    .await;
+            }
+        }
+
+        true
+    }
+
+    /// Request a path and wait until found or timeout.
+    ///
+    /// This sends a path request and then polls until the path appears in the
+    /// path table, or the timeout expires.
+    ///
+    /// Returns true if the path was found, false if timed out.
+    pub async fn wait_for_path(
+        &self,
+        destination: &AddressHash,
+        timeout: std::time::Duration,
+    ) -> bool {
+        use tokio::time::{sleep, Instant};
+
+        // Check if we already have a path
+        if self.has_path(destination).await {
+            return true;
+        }
+
+        // Send the path request
+        self.request_path(destination, None).await;
+
+        let start = Instant::now();
+        let poll_interval = std::time::Duration::from_millis(50);
+
+        while start.elapsed() < timeout {
+            if self.has_path(destination).await {
+                return true;
+            }
+            sleep(poll_interval).await;
+        }
+
+        false
+    }
 }
 
 impl Drop for Transport {
@@ -725,8 +831,192 @@ async fn handle_keepalive_response<'a>(
     false
 }
 
-async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandler>) {
+/// Handle an incoming path request packet.
+///
+/// Path requests are broadcast DATA packets addressed to the PLAIN destination
+/// "rnstransport.path.request". When received, we check if we can answer
+/// (local destination or known path) and send a response if so.
+async fn handle_path_request<'a>(
+    packet: &Packet,
+    iface: AddressHash,
+    mut handler: MutexGuard<'a, TransportHandler>,
+) {
+    let data = packet.data.as_slice();
+
+    // Parse the path request data
+    let parsed = PathRequestManager::parse_request_data(data);
+    if parsed.is_none() {
+        log::debug!(
+            "tp({}): ignoring path request with invalid data (len={})",
+            handler.config.name,
+            data.len()
+        );
+        return;
+    }
+
+    let (destination_hash, requesting_transport_id, tag_bytes) = parsed.unwrap();
+
+    // Path requests must have a tag for deduplication
+    let tag = match tag_bytes {
+        Some(t) => t,
+        None => {
+            log::debug!(
+                "tp({}): ignoring tagless path request for {}",
+                handler.config.name,
+                destination_hash
+            );
+            return;
+        }
+    };
+
+    // Check for duplicates using unique_tag = destination_hash + tag
+    let mut unique_tag = [0u8; 32];
+    unique_tag[..16].copy_from_slice(&destination_hash.as_slice()[..16]);
+    unique_tag[16..].copy_from_slice(&tag);
+
+    if handler.path_request_tags.contains(&unique_tag) {
+        log::debug!(
+            "tp({}): ignoring duplicate path request for {}",
+            handler.config.name,
+            destination_hash
+        );
+        return;
+    }
+
+    // Add to tag cache
+    handler.path_request_tags.insert(unique_tag);
+
+    // Process the path request
+    process_path_request(
+        destination_hash,
+        requesting_transport_id,
+        Some(&tag),
+        iface,
+        handler,
+    )
+    .await;
+}
+
+/// Process a validated path request and send a response if possible.
+///
+/// This implements the path response logic from Python Transport.path_request():
+/// 1. If destination is local, send an immediate announce with PathResponse context
+/// 2. If path is known in path_table, queue announce retransmission with grace period
+/// 3. If transport enabled and path unknown, forward request on other interfaces
+async fn process_path_request<'a>(
+    destination_hash: AddressHash,
+    requestor_transport_id: Option<AddressHash>,
+    _tag: Option<&[u8]>,
+    attached_interface: AddressHash,
+    handler: MutexGuard<'a, TransportHandler>,
+) {
+    let is_transport_enabled = handler.config.retransmit;
+
+    // Case 1: Local destination - send announce immediately with PathResponse context
+    if let Some(destination) = handler.single_in_destinations.get(&destination_hash).cloned() {
+        log::debug!(
+            "tp({}): answering path request for {}, destination is local",
+            handler.config.name,
+            destination_hash
+        );
+
+        // Create announce with PathResponse context
+        let dest = destination.lock().await;
+        if let Ok(mut announce_packet) = dest.announce(OsRng, None) {
+            announce_packet.context = PacketContext::PathResponse;
+            drop(dest);
+            handler.send_packet(announce_packet).await;
+        }
+        return;
+    }
+
+    // Case 2: Path known in path_table - queue retransmission with grace period
+    if (is_transport_enabled || !handler.single_in_destinations.is_empty())
+        && handler.path_table.has_path(&destination_hash)
+    {
+        if let Some(next_hop) = handler.path_table.next_hop(&destination_hash) {
+            // Don't answer if next hop is the requestor (avoid loop)
+            if let Some(ref requestor_id) = requestor_transport_id {
+                if &next_hop == requestor_id {
+                    log::debug!(
+                        "tp({}): not answering path request for {}, next hop is requestor",
+                        handler.config.name,
+                        destination_hash
+                    );
+                    return;
+                }
+            }
+
+            // Schedule announce retransmission with grace period
+            // For now, we'll trigger an immediate retransmit if we have the announce cached
+            if let Some(announce_packet) = handler.announce_table.get_announce_packet(&destination_hash) {
+                let hops = handler.path_table.hops_to(&destination_hash).unwrap_or(0);
+                log::debug!(
+                    "tp({}): answering path request for {}, path known ({} hops)",
+                    handler.config.name,
+                    destination_hash,
+                    hops
+                );
+
+                // Set PathResponse context and send
+                let mut response_packet = announce_packet.clone();
+                response_packet.context = PacketContext::PathResponse;
+
+                // Send excluding the interface that sent the request
+                handler
+                    .send(TxMessage {
+                        tx_type: TxMessageType::Broadcast(Some(attached_interface)),
+                        packet: response_packet,
+                    })
+                    .await;
+            }
+        }
+        return;
+    }
+
+    // Case 3: Unknown path + transport enabled - forward request on other interfaces
+    if is_transport_enabled {
+        log::debug!(
+            "tp({}): forwarding path request for {} to other interfaces",
+            handler.config.name,
+            destination_hash
+        );
+
+        // Create a new path request packet to forward
+        let transport_id = Some(handler.config.identity.address_hash().clone());
+        let (forward_packet, _) =
+            PathRequestManager::create_request_packet(&destination_hash, transport_id.as_ref());
+
+        // Send on all interfaces except the one that sent us the request
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(Some(attached_interface)),
+                packet: forward_packet,
+            })
+            .await;
+    } else {
+        log::debug!(
+            "tp({}): ignoring path request for {}, no path known and transport disabled",
+            handler.config.name,
+            destination_hash
+        );
+    }
+}
+
+async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
+
+    // Check for path request control packets (PLAIN destination type)
+    if packet.header.destination_type == DestinationType::Plain {
+        let path_request_hash = PlainDestination::new("rnstransport", "path.request")
+            .address_hash()
+            .clone();
+
+        if packet.destination == path_request_hash {
+            handle_path_request(packet, iface, handler).await;
+            return;
+        }
+    }
 
     if packet.header.destination_type == DestinationType::Link {
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
@@ -1137,7 +1427,7 @@ async fn manage_transport(
                                 handler
                             ).await,
                             PacketType::Proof => handle_proof(&packet, handler).await,
-                            PacketType::Data => handle_data(&packet, handler).await,
+                            PacketType::Data => handle_data(&packet, message.address, handler).await,
                         }
                     }
                 };

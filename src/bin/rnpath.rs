@@ -400,6 +400,9 @@ async fn handle_path_request(args: &Args, config: &ReticulumConfig) -> i32 {
         return display_path_result(&transport, &dest_hash, args).await;
     }
 
+    // Send a path request to the network
+    transport.request_path(&dest_hash, None).await;
+
     // Spinner animation characters (matching Python)
     let spinner = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
     let mut spinner_idx = 0;

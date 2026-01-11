@@ -95,6 +95,13 @@ impl AnnounceTable {
         self.map.remove(destination);
     }
 
+    /// Get the cached announce packet for a destination, if available.
+    ///
+    /// Used for path responses to retrieve the announce to retransmit.
+    pub fn get_announce_packet(&self, destination: &AddressHash) -> Option<&Packet> {
+        self.map.get(destination).map(|entry| &entry.packet)
+    }
+
     pub fn new_packet(
         &mut self,
         dest_hash: &AddressHash,
