@@ -449,8 +449,9 @@ async fn handle_link_event(
                                             data.len()
                                         );
 
-                                        // Send proof
-                                        let proof_data = resource.generate_proof();
+                                        // Send proof using the assembled data
+                                        // (incoming resources don't have original_data set)
+                                        let proof_data = resource.generate_proof_with_data(&data);
                                         if transport.send_resource_proof(&link_id, &proof_data).await {
                                             println!(
                                                 "RESOURCE_PROOF_SENT={}:{}",
