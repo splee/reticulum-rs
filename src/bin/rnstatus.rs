@@ -14,7 +14,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use reticulum::config::{LogLevel, ReticulumConfig};
+use reticulum::ipc::addr::ListenerAddr;
 use reticulum::logging;
+use reticulum::rpc::RpcClient;
 
 /// Interface mode constants matching Python implementation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,23 +635,52 @@ fn show_discovered_interfaces(args: &Args, _config: &ReticulumConfig) {
     println!();
 }
 
-/// Try to connect to shared instance and get stats
+/// Try to connect to shared instance and get stats via RPC
 fn get_shared_instance_stats(config: &ReticulumConfig) -> Result<NetworkStats, String> {
-    // Try to connect to shared instance via RPC
-    // For now, we'll use a simplified approach - attempt TCP connection to shared instance port
-    use std::net::TcpStream;
+    // Create RPC client with appropriate address for this platform
+    let socket_dir = config.paths.config_dir.join("sockets");
+    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
 
-    let addr = format!("127.0.0.1:{}", config.shared_instance_port);
+    let client = RpcClient::new(rpc_addr);
 
-    let _stream = TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        std::time::Duration::from_secs(2),
-    )
-    .map_err(|e| format!("Failed to connect to shared instance: {}", e))?;
+    // Use tokio runtime to make async RPC call
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create runtime: {}", e))?;
 
-    // The Python implementation uses multiprocessing.connection which has its own protocol
-    // For now, we'll return an error and fall back to standalone mode
-    Err("Shared instance RPC protocol not yet implemented".to_string())
+    rt.block_on(async {
+        // First check if daemon is running
+        if !client.is_daemon_running().await {
+            return Err("No daemon running".to_string());
+        }
+
+        // Get interface stats from daemon
+        let iface_stats = client
+            .get_interface_stats()
+            .await
+            .map_err(|e| format!("Failed to get interface stats: {}", e))?;
+
+        // Convert RPC interface stats to our local format
+        let interfaces: Vec<InterfaceStats> = iface_stats
+            .into_iter()
+            .map(|s| InterfaceStats {
+                name: s.name.clone(),
+                short_name: s.name.clone(),
+                hash: String::new(),
+                interface_type: s.interface_type,
+                rxb: s.rx_bytes,
+                txb: s.tx_bytes,
+                status: s.online,
+                mode: InterfaceMode::Full as u8,
+                bitrate: s.bitrate,
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(NetworkStats {
+            interfaces,
+            ..Default::default()
+        })
+    })
 }
 
 /// Get stats in standalone mode (no shared instance)
@@ -674,10 +705,26 @@ fn get_standalone_stats(config: &ReticulumConfig) -> NetworkStats {
     stats
 }
 
-/// Get link count from shared instance
-fn get_link_count(_config: &ReticulumConfig) -> Result<u32, String> {
-    // Would query shared instance for link count
-    Err("Link count not available in standalone mode".to_string())
+/// Get link count from shared instance via RPC
+fn get_link_count(config: &ReticulumConfig) -> Result<u32, String> {
+    // Create RPC client with appropriate address for this platform
+    let socket_dir = config.paths.config_dir.join("sockets");
+    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
+
+    let client = RpcClient::new(rpc_addr);
+
+    // Use tokio runtime to make async RPC call
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    rt.block_on(async {
+        let count = client
+            .get_link_count()
+            .await
+            .map_err(|e| format!("Failed to get link count: {}", e))?;
+
+        Ok(count as u32)
+    })
 }
 
 /// Display the network statistics

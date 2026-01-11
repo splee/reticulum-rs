@@ -15,8 +15,12 @@ use reticulum::config::{LogLevel, ReticulumConfig, StoragePaths};
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
+use reticulum::ipc::addr::ListenerAddr;
+use reticulum::ipc::LocalServerInterface;
 use reticulum::logging;
+use reticulum::rpc::RpcServer;
 use reticulum::transport::{Transport, TransportConfig};
+use tokio_util::sync::CancellationToken;
 
 /// Reticulum Network Stack Daemon
 #[derive(Parser, Debug)]
@@ -169,8 +173,49 @@ fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
             &identity,
             config.enable_transport,
         ));
+        let transport = Arc::new(transport);
 
         log::info!("Transport initialized");
+
+        // Create cancellation token for shutdown
+        let cancel = CancellationToken::new();
+
+        // Start shared instance services if enabled
+        if config.share_instance {
+            log::info!("Shared instance enabled, starting IPC services...");
+
+            // Get socket directory for filesystem sockets (macOS/BSD)
+            let socket_dir = config.paths.config_dir.join("sockets");
+            if let Err(e) = std::fs::create_dir_all(&socket_dir) {
+                log::warn!("Failed to create socket directory: {}", e);
+            }
+
+            // Start LocalServerInterface for transport IPC
+            let local_addr = ListenerAddr::default_transport(
+                "default",
+                &socket_dir,
+                config.shared_instance_port,
+            );
+            log::info!("Starting LocalServerInterface on {}", local_addr.display());
+
+            transport.iface_manager().lock().await.spawn(
+                LocalServerInterface::new(local_addr, transport.iface_manager()),
+                LocalServerInterface::spawn,
+            );
+
+            // Start RPC server for management queries
+            let rpc_addr = ListenerAddr::default_rpc(
+                "default",
+                &socket_dir,
+                config.control_port,
+            );
+            log::info!("Starting RPC server on {}", rpc_addr.display());
+
+            let rpc_server = RpcServer::new(rpc_addr, transport.clone(), cancel.clone());
+            tokio::spawn(async move {
+                rpc_server.run().await;
+            });
+        }
 
         // Spawn interfaces from configuration
         let interface_configs = config.interface_configs();
@@ -246,6 +291,7 @@ fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
         }
 
         log::info!("Shutting down transport...");
+        cancel.cancel();
     });
 }
 

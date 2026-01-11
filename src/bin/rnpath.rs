@@ -15,7 +15,9 @@ use serde::Serialize;
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
+use reticulum::ipc::addr::ListenerAddr;
 use reticulum::logging;
+use reticulum::rpc::RpcClient;
 use reticulum::transport::{Transport, TransportConfig};
 use reticulum::transport::blackhole::BlackholeManager;
 
@@ -208,12 +210,47 @@ async fn create_transport(_config: &ReticulumConfig) -> Transport {
     Transport::new(transport_config)
 }
 
+/// Create an RPC client for daemon communication
+fn create_rpc_client(config: &ReticulumConfig) -> RpcClient {
+    let socket_dir = config.paths.config_dir.join("sockets");
+    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
+    RpcClient::new(rpc_addr)
+}
+
+/// Check if a daemon is running
+async fn is_daemon_running(config: &ReticulumConfig) -> bool {
+    let client = create_rpc_client(config);
+    client.is_daemon_running().await
+}
+
 /// Handle path table display (-t)
 async fn handle_path_table(args: &Args, config: &ReticulumConfig) -> i32 {
-    let transport = create_transport(config).await;
+    // Try RPC first if daemon is running
+    let client = create_rpc_client(config);
+    let rpc_paths = client
+        .get_path_table(args.max_hops.map(|h| h as u32))
+        .await
+        .ok();
 
-    // Get path table
-    let paths = transport.get_path_table(args.max_hops).await;
+    // Convert RPC paths to internal format or fall back to transport
+    let paths = if let Some(rpc_paths) = rpc_paths {
+        // Convert from RPC format
+        rpc_paths
+            .into_iter()
+            .map(|p| reticulum::transport::path_table::PathInfo {
+                destination: p.destination_hash,
+                next_hop: p.via.unwrap_or_default(),
+                hops: p.hops as u8,
+                timestamp: 0.0,
+                expires: Some(p.expires),
+                interface_hash: p.interface,
+            })
+            .collect()
+    } else {
+        // Fall back to local transport
+        let transport = create_transport(config).await;
+        transport.get_path_table(args.max_hops).await
+    };
 
     // Filter by destination if provided
     let paths: Vec<_> = if let Some(ref dest_str) = args.destination {
@@ -516,9 +553,20 @@ async fn handle_drop_path(args: &Args, config: &ReticulumConfig) -> i32 {
         }
     };
 
-    let transport = create_transport(config).await;
+    // Try RPC first if daemon is running
+    let client = create_rpc_client(config);
+    let rpc_result = client.drop_path(dest_hash.as_slice()).await;
 
-    if transport.drop_path(&dest_hash).await {
+    let success = match rpc_result {
+        Ok(()) => true,
+        Err(_) => {
+            // Fall back to local transport
+            let transport = create_transport(config).await;
+            transport.drop_path(&dest_hash).await
+        }
+    };
+
+    if success {
         if !args.json {
             println!("Dropped path to {}", pretty_hash(&dest_hash));
         }
@@ -553,16 +601,26 @@ async fn handle_drop_via(args: &Args, config: &ReticulumConfig) -> i32 {
         }
     };
 
-    let transport = create_transport(config).await;
+    // Try RPC first if daemon is running
+    let client = create_rpc_client(config);
+    let rpc_result = client.drop_all_via(transport_hash.as_slice()).await;
 
-    let count = transport.drop_via(&transport_hash).await;
-
-    if !args.json {
-        let path_word = if count == 1 { "path" } else { "paths" };
+    if rpc_result.is_err() {
+        // Fall back to local transport
+        let transport = create_transport(config).await;
+        let count = transport.drop_via(&transport_hash).await;
+        if !args.json {
+            let path_word = if count == 1 { "path" } else { "paths" };
+            println!(
+                "Dropped {} {} via {}",
+                count,
+                path_word,
+                pretty_hash(&transport_hash)
+            );
+        }
+    } else if !args.json {
         println!(
-            "Dropped {} {} via {}",
-            count,
-            path_word,
+            "Dropped paths via {} (via daemon)",
             pretty_hash(&transport_hash)
         );
     }
@@ -572,8 +630,14 @@ async fn handle_drop_via(args: &Args, config: &ReticulumConfig) -> i32 {
 
 /// Handle drop announces (-D)
 async fn handle_drop_announces(args: &Args, config: &ReticulumConfig) -> i32 {
-    let transport = create_transport(config).await;
+    // Try RPC first if daemon is running
+    let client = create_rpc_client(config);
+    if client.is_daemon_running().await {
+        // RPC doesn't have a dedicated drop_announce_queues method yet,
+        // so we fall back to local transport
+    }
 
+    let transport = create_transport(config).await;
     transport.drop_announce_queues().await;
 
     if !args.json {

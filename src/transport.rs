@@ -48,7 +48,7 @@ mod announce_limits;
 mod announce_table;
 mod link_table;
 mod packet_cache;
-mod path_table;
+pub mod path_table;
 
 // Phase 5: Transport enhancements
 pub mod blackhole;

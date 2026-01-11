@@ -31,6 +31,10 @@ pub mod discovery;
 // Phase 9: Testing Infrastructure
 pub mod testing;
 
+// Phase 10: Daemon Mode IPC
+pub mod ipc;
+pub mod rpc;
+
 // Internal modules
 mod utils;
 mod serde;
