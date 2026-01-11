@@ -6,6 +6,7 @@ use packet_cache::PacketCache;
 use path_table::PathTable;
 use rand_core::OsRng;
 use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +30,7 @@ use crate::destination::SingleOutputDestination;
 
 use crate::error::RnsError;
 use crate::hash::AddressHash;
-use crate::identity::PrivateIdentity;
+use crate::identity::{Identity, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceRxReceiver;
@@ -43,6 +44,7 @@ use crate::packet::Packet;
 use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
+use crate::receipt::{PacketReceipt, ReceiptManager};
 
 mod announce_limits;
 mod announce_table;
@@ -115,6 +117,9 @@ struct TransportHandler {
 
     /// Path request tag deduplication cache
     path_request_tags: PathRequestTagCache,
+
+    /// Receipt manager for tracking packet proofs
+    receipt_manager: ReceiptManager,
 
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -191,6 +196,7 @@ impl Transport {
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             path_request_tags: PathRequestTagCache::new(),
+            receipt_manager: ReceiptManager::new(1024),
             announce_tx,
             link_in_event_tx: link_in_event_tx.clone(),
             received_data_tx: received_data_tx.clone(),
@@ -248,6 +254,32 @@ impl Transport {
 
     pub async fn send_packet(&self, packet: Packet) {
         self.handler.lock().await.send_packet(packet).await;
+    }
+
+    /// Send a packet and track it for proof receipt.
+    ///
+    /// Returns a receipt that can be polled for delivery status.
+    /// The destination_hash is used to look up the destination's identity
+    /// when validating the proof.
+    pub async fn send_packet_with_receipt(
+        &self,
+        packet: Packet,
+        destination_hash: AddressHash,
+        hops: u8,
+    ) -> Arc<StdMutex<PacketReceipt>> {
+        let hash = packet.hash().to_bytes();
+        let dest_truncated: [u8; 16] = {
+            let slice = destination_hash.as_slice();
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&slice[..16]);
+            arr
+        };
+
+        let receipt = PacketReceipt::new_with_destination(hash, dest_truncated, hops, None);
+        let receipt = self.handler.lock().await.receipt_manager.add(receipt);
+
+        self.send_packet(packet).await;
+        receipt
     }
 
     pub async fn send_announce(
@@ -542,6 +574,19 @@ impl Transport {
         self.handler.lock().await.path_table.next_hop_iface(destination)
     }
 
+    /// Recall a destination's identity from the announce cache.
+    ///
+    /// Returns the Identity if an announce from this destination has been received
+    /// and cached. This is used to create packets for the destination and to validate
+    /// proofs.
+    pub async fn recall_identity(&self, destination: &AddressHash) -> Option<Identity> {
+        let handler = self.handler.lock().await;
+        handler
+            .single_out_destinations
+            .get(destination)
+            .map(|dest| dest.blocking_lock().identity.clone())
+    }
+
     /// Get all paths in the path table, optionally filtered by max hops
     pub async fn get_path_table(&self, max_hops: Option<u8>) -> Vec<path_table::PathInfo> {
         self.handler.lock().await.path_table.get_paths(max_hops)
@@ -765,6 +810,7 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         packet.destination
     );
 
+    // Handle link proofs
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
         match link.handle_packet(packet) {
@@ -773,6 +819,40 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
                 handler.send_packet(rtt_packet).await;
             }
             _ => {}
+        }
+    }
+
+    // Handle packet proofs (for receipts)
+    // The proof packet's destination is the truncated hash of the proved packet
+    if packet.context != PacketContext::LinkRequestProof {
+        let truncated_hash: [u8; 16] = {
+            let slice = packet.destination.as_slice();
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&slice[..16]);
+            arr
+        };
+
+        if let Some(receipt) = handler.receipt_manager.get(&truncated_hash) {
+            // Get the destination identity for proof validation
+            if let Ok(mut receipt_guard) = receipt.lock() {
+                if let Some(dest_hash) = receipt_guard.destination_hash() {
+                    // Look up the destination's identity
+                    let dest_hash_arr = AddressHash::new_from_slice(dest_hash);
+                    if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
+                        let dest_lock = dest.blocking_lock();
+                        let identity = &dest_lock.identity;
+                        let proof_data = packet.data.as_slice();
+
+                        if receipt_guard.validate_proof(proof_data, identity) {
+                            log::debug!(
+                                "tp({}): validated proof for packet {}",
+                                handler.config.name,
+                                packet.destination
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

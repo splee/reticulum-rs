@@ -99,6 +99,8 @@ pub struct PacketReceipt {
     hash: [u8; HASH_LENGTH],
     /// Truncated hash for addressing
     truncated_hash: [u8; 16],
+    /// Destination hash (for identity lookup during proof validation)
+    destination_hash: Option<[u8; 16]>,
     /// When the packet was sent
     sent_at: Instant,
     /// Unix timestamp when sent
@@ -148,6 +150,7 @@ impl PacketReceipt {
         Self {
             hash: packet_hash,
             truncated_hash,
+            destination_hash: None,
             sent_at: Instant::now(),
             sent_timestamp: now,
             proved: false,
@@ -158,6 +161,23 @@ impl PacketReceipt {
             metrics: None,
             proof_data: None,
         }
+    }
+
+    /// Create a new packet receipt with destination hash for proof validation
+    pub fn new_with_destination(
+        packet_hash: [u8; HASH_LENGTH],
+        destination_hash: [u8; 16],
+        hops: u8,
+        rtt: Option<f64>,
+    ) -> Self {
+        let mut receipt = Self::new(packet_hash, hops, false, rtt);
+        receipt.destination_hash = Some(destination_hash);
+        receipt
+    }
+
+    /// Get the destination hash (if set)
+    pub fn destination_hash(&self) -> Option<&[u8; 16]> {
+        self.destination_hash.as_ref()
     }
 
     /// Get the packet hash
