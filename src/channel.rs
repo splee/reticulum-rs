@@ -95,8 +95,11 @@ impl Default for MessageState {
     }
 }
 
-/// Trait for messages that can be sent over a channel
-pub trait MessageBase: Send + Sync + std::fmt::Debug {
+/// Trait for messages that can be sent over a channel.
+///
+/// Messages must be Send + Sync for use across threads, Debug for logging,
+/// and Any for downcasting in message handlers.
+pub trait MessageBase: Send + Sync + std::fmt::Debug + std::any::Any {
     /// Get the message type ID (must be unique per channel, < 0xf000)
     fn msg_type(&self) -> u16;
 
@@ -105,6 +108,9 @@ pub trait MessageBase: Send + Sync + std::fmt::Debug {
 
     /// Unpack the message from bytes
     fn unpack(&mut self, raw: &[u8]) -> Result<(), RnsError>;
+
+    /// Get a reference to self as Any for downcasting in message handlers.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Factory function type for creating messages from their type
@@ -622,6 +628,10 @@ mod tests {
         fn unpack(&mut self, raw: &[u8]) -> Result<(), RnsError> {
             self.data = raw.to_vec();
             Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

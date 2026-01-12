@@ -103,6 +103,10 @@ impl MessageBase for StreamDataMessage {
 
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Compress data using deflate
