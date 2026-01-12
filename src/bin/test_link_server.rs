@@ -314,5 +314,9 @@ async fn handle_link_event(
             log::debug!("Link {}: response received ({}B)", link_id_hex, payload.len());
             println!("RESPONSE={}:{}", link_id_hex, payload.len());
         }
+        LinkEvent::Identified(identity) => {
+            log::info!("Link {}: remote identified as {}", link_id_hex, identity.address_hash);
+            println!("IDENTIFIED={}:{}", link_id_hex, hex::encode(identity.address_hash.as_slice()));
+        }
     }
 }

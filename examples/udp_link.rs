@@ -70,7 +70,7 @@ async fn main() {
                     std::str::from_utf8(payload.as_slice())
                         .map(str::to_string)
                         .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))),
-                // Resource, channel, and request/response events not handled in this example
+                // Resource, channel, identity, and request/response events not handled in this example
                 LinkEvent::ResourceAdvertisement(_) |
                 LinkEvent::ResourceData(_) |
                 LinkEvent::ResourceRequest(_) |
@@ -80,7 +80,8 @@ async fn main() {
                 LinkEvent::ResourceReceiverCancel(_) |
                 LinkEvent::Channel(_) |
                 LinkEvent::Request(_) |
-                LinkEvent::Response(_) => {}
+                LinkEvent::Response(_) |
+                LinkEvent::Identified(_) => {}
             }
         }
         transport

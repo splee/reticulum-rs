@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     hash::{AddressHash, Hash},
-    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType},
+    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType},
 };
 
 /// Default path expiration time (30 minutes, matching Python)
@@ -221,24 +221,50 @@ impl PathTable {
             _ => return (*original_packet, None),
         };
 
-        (
-            Packet {
-                header: Header {
-                    ifac_flag: IfacFlag::Authenticated,
-                    header_type: HeaderType::Type2,
-                    propagation_type: original_packet.header.propagation_type,
-                    destination_type: original_packet.header.destination_type,
-                    packet_type: original_packet.header.packet_type,
-                    hops: original_packet.header.hops + 1,
+        // When hops == 1, the next hop IS the destination, so we strip the transport
+        // header and use HEADER_1 format. This matches Python's behavior where
+        // remaining_hops == 1 triggers stripping transport headers.
+        if entry.hops == 1 {
+            (
+                Packet {
+                    header: Header {
+                        ifac_flag: IfacFlag::Authenticated,
+                        header_type: HeaderType::Type1,
+                        propagation_type: original_packet.header.propagation_type,
+                        destination_type: original_packet.header.destination_type,
+                        packet_type: original_packet.header.packet_type,
+                        hops: original_packet.header.hops + 1,
+                    },
+                    ifac: None,
+                    destination: original_packet.destination,
+                    transport: None, // No transport header for last hop
+                    context: original_packet.context,
+                    data: original_packet.data,
                 },
-                ifac: None,
-                destination: original_packet.destination,
-                transport: Some(entry.received_from),
-                context: original_packet.context,
-                data: original_packet.data,
-            },
-            Some(entry.iface),
-        )
+                Some(entry.iface),
+            )
+        } else {
+            (
+                Packet {
+                    header: Header {
+                        ifac_flag: IfacFlag::Authenticated,
+                        header_type: HeaderType::Type2,
+                        // Type2 packets must use Transport propagation type for Python compatibility
+                        // Python expects bit 4 = 1 (transport_type=TRANSPORT) for routed packets
+                        propagation_type: PropagationType::Transport,
+                        destination_type: original_packet.header.destination_type,
+                        packet_type: original_packet.header.packet_type,
+                        hops: original_packet.header.hops + 1,
+                    },
+                    ifac: None,
+                    destination: original_packet.destination,
+                    transport: Some(entry.received_from),
+                    context: original_packet.context,
+                    data: original_packet.data,
+                },
+                Some(entry.iface),
+            )
+        }
     }
 
     pub fn refresh(&mut self, destination: &AddressHash) {
@@ -247,7 +273,7 @@ impl PathTable {
         }
     }
 
-    pub fn handle_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
+    pub fn handle_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         if original_packet.header.header_type == HeaderType::Type2 {
             return (*original_packet, None);
         }
@@ -267,24 +293,33 @@ impl PathTable {
             _ => return (*original_packet, None),
         };
 
-        (
-            Packet {
-                header: Header {
-                    ifac_flag: IfacFlag::Authenticated,
-                    header_type: HeaderType::Type2,
-                    propagation_type: original_packet.header.propagation_type,
-                    destination_type: original_packet.header.destination_type,
-                    packet_type: original_packet.header.packet_type,
-                    hops: original_packet.header.hops,
+        // When hops == 1, the next hop IS the destination, so we keep HEADER_1 format
+        // without transport header. This matches Python's behavior.
+        if entry.hops == 1 {
+            // Keep the original packet format (HEADER_1) since destination is direct
+            (*original_packet, Some(entry.iface))
+        } else {
+            (
+                Packet {
+                    header: Header {
+                        ifac_flag: IfacFlag::Authenticated,
+                        header_type: HeaderType::Type2,
+                        // Type2 packets must use Transport propagation type for Python compatibility
+                        // Python expects bit 4 = 1 (transport_type=TRANSPORT) for routed packets
+                        propagation_type: PropagationType::Transport,
+                        destination_type: original_packet.header.destination_type,
+                        packet_type: original_packet.header.packet_type,
+                        hops: original_packet.header.hops,
+                    },
+                    ifac: original_packet.ifac,
+                    destination: original_packet.destination,
+                    transport: Some(entry.received_from),
+                    context: original_packet.context,
+                    data: original_packet.data,
                 },
-                ifac: original_packet.ifac,
-                destination: original_packet.destination,
-                transport: Some(entry.received_from),
-                context: original_packet.context,
-                data: original_packet.data,
-            },
-            Some(entry.iface),
-        )
+                Some(entry.iface),
+            )
+        }
     }
 }
 

@@ -142,6 +142,8 @@ pub enum LinkEvent {
     ResourceInitiatorCancel(LinkPayload),
     /// Resource receiver cancel received
     ResourceReceiverCancel(LinkPayload),
+    /// Remote peer has identified themselves with their identity
+    Identified(Identity),
     Closed,
 }
 
@@ -184,9 +186,16 @@ pub struct Link {
     last_resource_window: usize,
     /// Last expected in-flight rate (bits per second)
     last_resource_eifr: Option<f64>,
+    /// Whether this link was initiated by us (client) or received (server).
+    initiator: bool,
+    /// The remote peer's identity, if they have identified themselves.
+    /// This is set when the link initiator calls identify() and the server
+    /// validates the identity proof.
+    remote_identity: Option<Identity>,
 }
 
 impl Link {
+    /// Create a new outgoing link (we are the initiator).
     pub fn new(
         destination: DestinationDesc,
         event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
@@ -205,9 +214,12 @@ impl Link {
             incoming_resources: HashMap::new(),
             last_resource_window: crate::resource::WINDOW_INITIAL,
             last_resource_eifr: None,
+            initiator: true,
+            remote_identity: None,
         }
     }
 
+    /// Create a link from an incoming request (we are the server/destination).
     pub fn new_from_request(
         packet: &Packet,
         signing_key: SigningKey,
@@ -240,6 +252,8 @@ impl Link {
             incoming_resources: HashMap::new(),
             last_resource_window: crate::resource::WINDOW_INITIAL,
             last_resource_eifr: None,
+            initiator: false,
+            remote_identity: None,
         };
 
         link.handshake(peer_identity);
@@ -429,6 +443,56 @@ impl Link {
                     self.post_event(LinkEvent::Response(LinkPayload::new_from_slice(plain_text)));
                 } else {
                     log::error!("link({}): can't decrypt response", self.id);
+                }
+            }
+            PacketContext::LinkIdentify => {
+                // Link identification proof from the remote initiator.
+                // Only the server (non-initiator) should receive this.
+                if self.initiator {
+                    log::warn!("link({}): received LinkIdentify but we are the initiator", self.id);
+                    return LinkHandleResult::None;
+                }
+
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    // Proof format: [public_key (32 bytes) | verifying_key (32 bytes) | signature (64 bytes)]
+                    const EXPECTED_LEN: usize = PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH;
+                    if plain_text.len() < EXPECTED_LEN {
+                        log::warn!("link({}): LinkIdentify packet too short: {} bytes", self.id, plain_text.len());
+                        return LinkHandleResult::None;
+                    }
+
+                    let public_key = &plain_text[..PUBLIC_KEY_LENGTH];
+                    let verifying_key = &plain_text[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2];
+                    let signature_bytes = &plain_text[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH];
+
+                    // Reconstruct the identity from the provided keys
+                    let identity = Identity::new_from_slices(public_key, verifying_key);
+
+                    // Verify the signature: signed_data = link_id + public_key + verifying_key
+                    let mut signed_data = Vec::with_capacity(ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH * 2);
+                    signed_data.extend_from_slice(self.id.as_slice());
+                    signed_data.extend_from_slice(public_key);
+                    signed_data.extend_from_slice(verifying_key);
+
+                    let signature = match Signature::from_slice(signature_bytes) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            log::warn!("link({}): LinkIdentify invalid signature format", self.id);
+                            return LinkHandleResult::None;
+                        }
+                    };
+
+                    if identity.verify(&signed_data, &signature).is_ok() {
+                        log::info!("link({}): remote peer identified as {}", self.id, identity.address_hash);
+                        self.remote_identity = Some(identity.clone());
+                        self.request_time = Instant::now();
+                        self.post_event(LinkEvent::Identified(identity));
+                    } else {
+                        log::warn!("link({}): LinkIdentify signature verification failed", self.id);
+                    }
+                } else {
+                    log::error!("link({}): can't decrypt LinkIdentify packet", self.id);
                 }
             }
             _ => {
@@ -728,6 +792,99 @@ impl Link {
     /// Get round-trip time measurement
     pub fn rtt(&self) -> Duration {
         self.rtt
+    }
+
+    /// Whether this link was initiated by us (client) or received from remote (server).
+    pub fn is_initiator(&self) -> bool {
+        self.initiator
+    }
+
+    /// Get the remote peer's identity, if they have identified themselves.
+    /// This is set when the remote link initiator calls identify() and the
+    /// proof is validated.
+    pub fn remote_identity(&self) -> Option<&Identity> {
+        self.remote_identity.as_ref()
+    }
+
+    /// Get the truncated hash of the remote identity (16 bytes), if identified.
+    /// This is commonly used for ACL checks.
+    pub fn remote_identity_hash(&self) -> Option<[u8; 16]> {
+        self.remote_identity.as_ref().map(|id| {
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&id.address_hash.as_slice()[..16]);
+            hash
+        })
+    }
+
+    /// Identify ourselves to the remote destination over this link.
+    ///
+    /// This sends an identity proof packet that allows the remote side to
+    /// verify who we are. This is used for access control on remote services.
+    ///
+    /// # Arguments
+    /// * `identity` - The identity to identify as (must be a PrivateIdentity to sign)
+    ///
+    /// # Returns
+    /// A packet to send, or an error if the link is not active or we are not the initiator.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let packet = link.identify(&my_identity)?;
+    /// transport.send(packet).await;
+    /// ```
+    pub fn identify(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
+        // Only the initiator (client) can identify
+        if !self.initiator {
+            log::warn!("link({}): cannot identify, we are not the initiator", self.id);
+            return Err(RnsError::InvalidArgument);
+        }
+
+        if self.status != LinkStatus::Active {
+            log::warn!("link({}): cannot identify on inactive link", self.id);
+            return Err(RnsError::InvalidArgument);
+        }
+
+        // Create the signed data: link_id + public_key + verifying_key
+        let pub_identity = identity.as_identity();
+        let public_key = pub_identity.public_key.as_bytes();
+        let verifying_key = pub_identity.verifying_key.as_bytes();
+
+        let mut signed_data = Vec::with_capacity(ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH * 2);
+        signed_data.extend_from_slice(self.id.as_slice());
+        signed_data.extend_from_slice(public_key);
+        signed_data.extend_from_slice(verifying_key);
+
+        // Sign the data
+        let signature = identity.sign(&signed_data);
+
+        // Create proof data: public_key + verifying_key + signature
+        let mut proof_data = Vec::with_capacity(PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH);
+        proof_data.extend_from_slice(public_key);
+        proof_data.extend_from_slice(verifying_key);
+        proof_data.extend_from_slice(&signature.to_bytes());
+
+        // Encrypt and create the packet
+        let mut packet_data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(&proof_data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        packet_data.resize(cipher_text_len);
+
+        log::debug!("link({}): identifying as {}", self.id, pub_identity.address_hash);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::LinkIdentify,
+            data: packet_data,
+        })
     }
 
     /// Get the maximum data unit size for this link.

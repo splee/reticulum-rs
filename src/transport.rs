@@ -45,6 +45,7 @@ use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::receipt::{PacketReceipt, ReceiptManager};
+use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
 
 mod announce_limits;
 mod announce_table;
@@ -55,6 +56,7 @@ pub mod path_table;
 // Phase 5: Transport enhancements
 pub mod blackhole;
 pub mod path_request;
+pub mod remote_management;
 pub mod reverse_table;
 pub mod tunnel;
 
@@ -139,12 +141,12 @@ pub struct Transport {
 }
 
 impl TransportConfig {
-    pub fn new<T: Into<String>>(name: T, identity: &PrivateIdentity, broadcast: bool) -> Self {
+    pub fn new<T: Into<String>>(name: T, identity: &PrivateIdentity, enable_transport: bool) -> Self {
         Self {
             name: name.into(),
             identity: identity.clone(),
-            broadcast,
-            retransmit: false,
+            broadcast: enable_transport,
+            retransmit: enable_transport,
         }
     }
 
@@ -250,6 +252,220 @@ impl Transport {
 
     pub async fn recv_announces(&self) -> broadcast::Receiver<AnnounceEvent> {
         self.handler.lock().await.announce_tx.subscribe()
+    }
+
+    /// Start a discovery handler to process interface announcements.
+    ///
+    /// This spawns a background task that listens for announcements and
+    /// stores discovered interface information.
+    ///
+    /// # Arguments
+    /// * `storage_path` - Base path for storing discovered interfaces
+    /// * `required_value` - Optional required stamp value (default: 14)
+    /// * `cancel` - Cancellation token for graceful shutdown
+    pub async fn start_discovery_handler(
+        &self,
+        storage_path: std::path::PathBuf,
+        required_value: Option<u8>,
+        cancel: CancellationToken,
+    ) {
+        let required_value = required_value.unwrap_or(DEFAULT_DISCOVERY_STAMP_VALUE);
+
+        // Create storage
+        let storage = match InterfaceDiscoveryStorage::new(&storage_path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to create discovery storage: {}", e);
+                return;
+            }
+        };
+
+        // Create handler with storage
+        let handler = PythonDiscoveryHandler::new(required_value)
+            .with_storage(storage);
+
+        // Subscribe to announces
+        let mut announce_rx = self.handler.lock().await.announce_tx.subscribe();
+
+        // Spawn background task
+        tokio::spawn(async move {
+            log::info!("Discovery handler started (required stamp value: {})", required_value);
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        log::info!("Discovery handler shutting down");
+                        break;
+                    }
+
+                    result = announce_rx.recv() => {
+                        match result {
+                            Ok(event) => {
+                                // Get destination info
+                                let dest = event.destination.lock().await;
+                                let dest_hash = dest.identity.address_hash.as_slice();
+                                // Use first 16 bytes of address hash as identity hash
+                                let identity_hash = &dest_hash[..16];
+
+                                // Try to process as discovery announce
+                                // The handler will validate the format and stamp
+                                let app_data = event.app_data.as_slice();
+                                let hops = 0u8; // TODO: Get actual hop count from announce
+
+                                if let Some(info) = handler.handle_announce(
+                                    dest_hash,
+                                    identity_hash,
+                                    app_data,
+                                    hops,
+                                ) {
+                                    log::debug!(
+                                        "Discovered interface: {} ({}) from {}",
+                                        info.name,
+                                        info.interface_type,
+                                        info.network_id
+                                    );
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("Discovery handler lagged {} announces", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                log::info!("Announce channel closed, discovery handler exiting");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start the remote management service for this transport.
+    ///
+    /// This creates a destination that allows authorized clients to query
+    /// transport status over links. The destination aspect is
+    /// `rnstransport.remote.management`.
+    ///
+    /// # Arguments
+    /// * `identity` - The transport's identity for the management destination
+    /// * `config` - Configuration for access control
+    /// * `cancel` - Cancellation token for graceful shutdown
+    ///
+    /// # Returns
+    /// The destination hash for the management service, so clients can connect.
+    pub async fn start_remote_management(
+        &self,
+        identity: &PrivateIdentity,
+        config: remote_management::RemoteManagementConfig,
+        cancel: CancellationToken,
+    ) -> AddressHash {
+        use crate::destination::link::{LinkEvent, LinkStatus};
+
+        let service = remote_management::RemoteManagementService::new(identity, config);
+        let dest_hash = service.destination_hash().await;
+
+        // Register the destination with transport
+        {
+            let mut handler = self.handler.lock().await;
+            handler.single_in_destinations.insert(
+                dest_hash,
+                service.destination.clone(),
+            );
+        }
+
+        log::info!(
+            "Remote management service started at {}",
+            dest_hash
+        );
+
+        // Subscribe to link events for the management destination
+        let mut link_events = self.in_link_events();
+        let transport = self.handler.clone();
+
+        // Spawn handler task
+        tokio::spawn(async move {
+            log::debug!("Remote management event handler started");
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        log::info!("Remote management service shutting down");
+                        break;
+                    }
+
+                    result = link_events.recv() => {
+                        match result {
+                            Ok(event) => {
+                                // Only handle events for our destination
+                                if event.address_hash != dest_hash {
+                                    continue;
+                                }
+
+                                match &event.event {
+                                    LinkEvent::Activated => {
+                                        log::debug!("remote_management: link {} activated", event.id);
+                                    }
+                                    LinkEvent::Identified(identity) => {
+                                        log::info!(
+                                            "remote_management: client {} identified on link {}",
+                                            identity.address_hash,
+                                            event.id
+                                        );
+                                    }
+                                    LinkEvent::Request(payload) => {
+                                        // Get the remote identity from the link
+                                        let remote_identity_hash = {
+                                            let handler = transport.lock().await;
+                                            if let Some(link) = handler.in_links.get(&event.id) {
+                                                let link = link.lock().await;
+                                                link.remote_identity_hash()
+                                            } else {
+                                                None
+                                            }
+                                        };
+
+                                        // Process the request
+                                        if let Some(response) = service.process_request(
+                                            payload.as_slice(),
+                                            event.id.as_slice(),
+                                            remote_identity_hash.as_ref(),
+                                        ) {
+                                            // Send the response back on the link
+                                            let handler = transport.lock().await;
+                                            if let Some(link) = handler.in_links.get(&event.id) {
+                                                let link = link.lock().await;
+                                                if link.status() == LinkStatus::Active {
+                                                    if let Ok(packet) = link.response_packet(&response) {
+                                                        handler.send_packet(packet).await;
+                                                        log::debug!(
+                                                            "remote_management: sent response on link {}",
+                                                            event.id
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LinkEvent::Closed => {
+                                        log::debug!("remote_management: link {} closed", event.id);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("remote_management: lagged {} events", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                log::info!("remote_management: event channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        dest_hash
     }
 
     pub async fn send_packet(&self, packet: Packet) {
@@ -581,10 +797,11 @@ impl Transport {
     /// proofs.
     pub async fn recall_identity(&self, destination: &AddressHash) -> Option<Identity> {
         let handler = self.handler.lock().await;
-        handler
-            .single_out_destinations
-            .get(destination)
-            .map(|dest| dest.blocking_lock().identity.clone())
+        if let Some(dest) = handler.single_out_destinations.get(destination) {
+            Some(dest.lock().await.identity.clone())
+        } else {
+            None
+        }
     }
 
     /// Get all paths in the path table, optionally filtered by max hops
@@ -740,9 +957,23 @@ impl Drop for Transport {
 
 impl TransportHandler {
     async fn send_packet(&self, packet: Packet) {
-        let message = TxMessage {
-            tx_type: TxMessageType::Broadcast(None),
-            packet,
+        // Check if destination needs routing through path_table
+        // This adds HEADER_2 routing for remote destinations (hops > 1)
+        // and keeps HEADER_1 for directly reachable destinations (hops == 1)
+        let (routed_packet, maybe_iface) = self.path_table.handle_packet(&packet);
+
+        let message = if let Some(iface) = maybe_iface {
+            // Destination found in path_table - send to specific interface
+            TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: routed_packet,
+            }
+        } else {
+            // No path found or local destination - broadcast
+            TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet: routed_packet,
+            }
         };
 
         self.send(message).await;

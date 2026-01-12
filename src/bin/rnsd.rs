@@ -12,6 +12,7 @@ use std::sync::Arc;
 use clap::Parser;
 use rand_core::OsRng;
 use reticulum::config::{LogLevel, ReticulumConfig, StoragePaths};
+use reticulum::destination::request::AllowPolicy;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
@@ -19,6 +20,7 @@ use reticulum::ipc::addr::ListenerAddr;
 use reticulum::ipc::LocalServerInterface;
 use reticulum::logging;
 use reticulum::rpc::RpcServer;
+use reticulum::transport::remote_management::RemoteManagementConfig;
 use reticulum::transport::{Transport, TransportConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +54,14 @@ struct Args {
     /// Print example configuration
     #[arg(long)]
     exampleconfig: bool,
+
+    /// Enable remote management interface
+    #[arg(long)]
+    enable_remote_management: bool,
+
+    /// Identity hashes allowed for remote management (can be repeated)
+    #[arg(long = "remote-management-allowed", value_name = "HASH")]
+    remote_management_allowed: Vec<String>,
 }
 
 fn main() {
@@ -107,16 +117,18 @@ fn main() {
     // Run the daemon
     if args.interactive {
         log::info!("Running in interactive mode");
-        run_interactive(&config, running);
+        run_interactive(&config, &args, running);
     } else {
         log::info!("Running in daemon mode");
-        run_daemon(&config, running);
+        run_daemon(&config, &args, running);
     }
 
     log::info!("Reticulum Network Stack Daemon stopped");
 }
 
-/// Load or create the daemon identity
+/// Load or create the daemon identity.
+///
+/// Uses binary format (64 bytes) which is compatible with Python.
 fn load_or_create_identity(paths: &StoragePaths) -> PrivateIdentity {
     let identity_file = paths.identity_path.join("daemon_identity");
 
@@ -124,9 +136,9 @@ fn load_or_create_identity(paths: &StoragePaths) -> PrivateIdentity {
         log::info!("Loading existing identity from {:?}", identity_file);
         match fs::File::open(&identity_file) {
             Ok(mut file) => {
-                let mut contents = String::new();
-                if file.read_to_string(&mut contents).is_ok() {
-                    if let Ok(identity) = PrivateIdentity::new_from_hex_string(contents.trim()) {
+                let mut bytes = Vec::new();
+                if file.read_to_end(&mut bytes).is_ok() && bytes.len() == 64 {
+                    if let Ok(identity) = PrivateIdentity::new_from_bytes(&bytes) {
                         let public = identity.as_identity();
                         log::info!("Identity loaded: {}", format_hash(public.address_hash.as_slice()));
                         return identity;
@@ -145,21 +157,21 @@ fn load_or_create_identity(paths: &StoragePaths) -> PrivateIdentity {
     let public = identity.as_identity();
     log::info!("New identity created: {}", format_hash(public.address_hash.as_slice()));
 
-    // Save identity
+    // Save identity in binary format (Python-compatible)
     if let Some(parent) = identity_file.parent() {
         let _ = fs::create_dir_all(parent);
     }
 
     if let Ok(mut file) = fs::File::create(&identity_file) {
-        let hex = identity.to_hex_string();
-        let _ = file.write_all(hex.as_bytes());
+        let bytes = identity.to_bytes();
+        let _ = file.write_all(&bytes);
         log::debug!("Identity saved to {:?}", identity_file);
     }
 
     identity
 }
 
-fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
+fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
     // Create tokio runtime
     let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
@@ -177,8 +189,26 @@ fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
 
         log::info!("Transport initialized");
 
+        // Output full transport identity hash for scripting/testing purposes
+        let transport_hash = hex::encode(identity.address_hash().as_slice());
+        log::info!("TRANSPORT_HASH={}", transport_hash);
+
         // Create cancellation token for shutdown
         let cancel = CancellationToken::new();
+
+        // Start remote management if enabled
+        if args.enable_remote_management {
+            let mgmt_config = create_remote_management_config(&args.remote_management_allowed);
+            log::info!("Starting remote management service...");
+            let dest_hash = transport.start_remote_management(
+                &identity,
+                mgmt_config,
+                cancel.clone(),
+            ).await;
+            log::info!("Remote management destination: {}", format_hash(dest_hash.as_slice()));
+            // Output full remote management destination hash for scripting/testing
+            log::info!("REMOTE_MGMT_DEST={}", hex::encode(dest_hash.as_slice()));
+        }
 
         // Start shared instance services if enabled
         if config.share_instance {
@@ -216,6 +246,14 @@ fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
                 rpc_server.run().await;
             });
         }
+
+        // Start discovery handler for interface announcements
+        log::info!("Starting interface discovery handler...");
+        transport.start_discovery_handler(
+            config.paths.storage_path.clone(),
+            None, // Use default required stamp value (14)
+            cancel.clone(),
+        ).await;
 
         // Spawn interfaces from configuration
         let interface_configs = config.interface_configs();
@@ -295,7 +333,7 @@ fn run_daemon(config: &ReticulumConfig, running: Arc<AtomicBool>) {
     });
 }
 
-fn run_interactive(config: &ReticulumConfig, running: Arc<AtomicBool>) {
+fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBool>) {
     println!("Reticulum Network Stack Daemon - Interactive Mode");
     println!("Type 'help' for available commands, 'quit' to exit");
     println!();
@@ -415,6 +453,50 @@ fn format_hash(bytes: &[u8]) -> String {
     }
     hex.push_str(".../");
     hex
+}
+
+/// Create remote management configuration from CLI arguments.
+fn create_remote_management_config(allowed_hashes: &[String]) -> RemoteManagementConfig {
+    if allowed_hashes.is_empty() {
+        // If no allowed list specified, allow all identified peers
+        log::info!("Remote management: allowing all identified peers");
+        RemoteManagementConfig::allow_all()
+    } else {
+        // Parse hex strings to identity hashes
+        let mut identities = Vec::new();
+        for hash_str in allowed_hashes {
+            match parse_identity_hash(hash_str) {
+                Ok(hash) => {
+                    log::info!("Remote management: allowing identity {}", hash_str);
+                    identities.push(hash);
+                }
+                Err(e) => {
+                    log::warn!("Invalid identity hash '{}': {}", hash_str, e);
+                }
+            }
+        }
+        if identities.is_empty() {
+            log::warn!("No valid identity hashes, allowing all identified peers");
+            RemoteManagementConfig::allow_all()
+        } else {
+            RemoteManagementConfig {
+                enabled: true,
+                allow_policy: AllowPolicy::AllowList(identities),
+            }
+        }
+    }
+}
+
+/// Parse a hex string to a 16-byte identity hash.
+fn parse_identity_hash(hex_str: &str) -> Result<[u8; 16], String> {
+    let hex_str = hex_str.trim();
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {}", e))?;
+    if bytes.len() != 16 {
+        return Err(format!("expected 16 bytes, got {}", bytes.len()));
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&bytes);
+    Ok(hash)
 }
 
 fn print_example_config() {

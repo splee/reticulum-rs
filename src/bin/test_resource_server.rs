@@ -564,6 +564,10 @@ async fn handle_link_event(
         LinkEvent::Response(payload) => {
             log::debug!("Link {}: response {} bytes", link_id_hex, payload.len());
         }
+        LinkEvent::Identified(identity) => {
+            log::info!("Link {}: remote identified as {}", link_id_hex, identity.address_hash);
+            println!("IDENTIFIED={}:{}", link_id_hex, hex::encode(identity.address_hash.as_slice()));
+        }
         LinkEvent::Closed => {
             println!("LINK_CLOSED={}", link_id_hex);
             log::info!("Link {} closed", link_id_hex);

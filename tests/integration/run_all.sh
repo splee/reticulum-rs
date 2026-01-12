@@ -85,6 +85,8 @@ run_test "Resource Test" "$SCRIPT_DIR/test_resource.sh"
 run_test "Resource Rust→Python Test" "$SCRIPT_DIR/test_resource_rust_to_python.sh"
 run_test "Probe Test" "$SCRIPT_DIR/test_probe.sh"
 run_test "Path Test" "$SCRIPT_DIR/test_path.sh"
+run_test "Remote Status Test" "$SCRIPT_DIR/test_remote_status.sh"
+run_test "Remote Status (Rust Server) Test" "$SCRIPT_DIR/test_remote_status_rust.sh"
 
 # Print final summary
 echo ""

@@ -4,19 +4,30 @@
 //! to a running Reticulum instance (or initializes its own) to display network
 //! status information.
 
-use std::io::{self, Write as IoWrite};
+use std::fs;
+use std::io::{self, Read as IoRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest as Sha2Digest};
 
 use reticulum::config::{LogLevel, ReticulumConfig};
-use reticulum::ipc::addr::ListenerAddr;
+use reticulum::destination::{DestinationName, SingleOutputDestination};
+use reticulum::destination::link::{LinkEvent, LinkStatus};
+use reticulum::destination::request::RequestRouter;
+use reticulum::hash::{AddressHash, Hash};
+use reticulum::identity::PrivateIdentity;
+use reticulum::iface::tcp_client::TcpClient;
+use reticulum::ipc::addr::{IpcListener, ListenerAddr};
+use reticulum::ipc::{LocalClientInterface, LocalServerInterface};
 use reticulum::logging;
 use reticulum::rpc::RpcClient;
+use reticulum::transport::{Transport, TransportConfig};
 
 /// Interface mode constants matching Python implementation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,13 +461,23 @@ fn run_monitor_mode(args: &Args, config: &ReticulumConfig, running: Arc<AtomicBo
 }
 
 /// Show status from local/shared Reticulum instance
+///
+/// Requires a running rnsd daemon to query. This matches Python behavior where
+/// rnstatus sets `require_shared_instance=True` and fails if no daemon is available.
 fn show_local_status(args: &Args, config: &ReticulumConfig) {
-    // Try to connect to shared instance first
+    // Try to connect to shared instance - require it to be running
     let stats = match get_shared_instance_stats(config) {
         Ok(stats) => stats,
         Err(_) => {
-            // Fall back to standalone status
-            get_standalone_stats(config)
+            // Match Python behavior: fail if no shared instance available
+            if args.json {
+                output_json_error("no_shared_instance", "No shared RNS instance available to get status from");
+            } else {
+                println!();
+                println!("No shared RNS instance available to get status from");
+                println!();
+            }
+            std::process::exit(1);
         }
     };
 
@@ -471,41 +492,716 @@ fn show_local_status(args: &Args, config: &ReticulumConfig) {
 }
 
 /// Show status from remote transport instance
-fn show_remote_status(args: &Args, _config: &ReticulumConfig) {
-    let remote_hash = args.remote.as_ref().unwrap();
+fn show_remote_status(args: &Args, config: &ReticulumConfig) {
+    let transport_hash_str = args.remote.as_ref().unwrap();
 
-    if args.json {
-        let mut error_obj = serde_json::Map::new();
-        error_obj.insert(
-            "error".to_string(),
-            serde_json::Value::String("not_implemented".to_string()),
-        );
-        error_obj.insert(
-            "message".to_string(),
-            serde_json::Value::String("Remote status queries not yet fully implemented".to_string()),
-        );
-        error_obj.insert(
-            "destination".to_string(),
-            serde_json::Value::String(remote_hash.clone()),
-        );
-        println!("{}", serde_json::to_string_pretty(&error_obj).unwrap());
+    // Create a tokio runtime for async operations
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create runtime: {}", e);
+            std::process::exit(20);
+        }
+    };
+
+    let exit_code = rt.block_on(async {
+        show_remote_status_async(args, config, transport_hash_str).await
+    });
+
+    std::process::exit(exit_code);
+}
+
+/// Async implementation of remote status query.
+async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transport_hash_str: &str) -> i32 {
+    let timeout_duration = Duration::from_secs_f64(args.timeout);
+
+    // Parse the transport identity hash
+    let transport_identity_hash = match parse_transport_hash(transport_hash_str) {
+        Ok(hash) => hash,
+        Err(e) => {
+            if args.json {
+                output_json_error("invalid_hash", &e);
+            } else {
+                eprintln!("Error: {}", e);
+            }
+            return 1;
+        }
+    };
+
+    // Load management identity if specified
+    let management_identity = if let Some(ref identity_path) = args.identity {
+        match load_identity(identity_path) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                if args.json {
+                    output_json_error("identity_error", &e);
+                } else {
+                    eprintln!("Error loading identity: {}", e);
+                }
+                return 2;
+            }
+        }
     } else {
-        eprintln!("Remote status queries require establishing a link to the remote transport instance.");
-        eprintln!("Destination: {}", remote_hash);
-        eprintln!();
-        eprintln!("This feature requires:");
-        eprintln!("  - Path to the remote transport instance");
-        eprintln!("  - Valid management identity (-i flag)");
-        eprintln!();
-        eprintln!("Remote status queries will be available in a future version.");
+        // Create an ephemeral identity for connection
+        Some(PrivateIdentity::new_from_rand(OsRng))
+    };
+
+    // Compute the management destination hash
+    let mgmt_dest_hash = compute_management_destination_hash(&transport_identity_hash);
+
+    if !args.json {
+        println!("Querying remote transport <{}>", transport_hash_str);
+        println!("Management destination: <{}>", hex::encode(mgmt_dest_hash.as_slice()));
+        println!();
     }
-    std::process::exit(12);
+
+    // Create transport and interfaces
+    let transport = create_client_transport(config).await;
+
+    // Request path to the management destination
+    if !args.json {
+        print!("Requesting path... ");
+        io::stdout().flush().ok();
+    }
+
+    transport.request_path(&mgmt_dest_hash, None).await;
+
+    let path_found = wait_for_path(&transport, &mgmt_dest_hash, timeout_duration).await;
+    if !path_found {
+        if args.json {
+            output_json_error("path_not_found", "Could not find path to remote transport");
+        } else {
+            println!("not found");
+            eprintln!("Could not find path to remote transport.");
+            eprintln!("Make sure the transport is running and reachable.");
+        }
+        return 10;
+    }
+
+    if !args.json {
+        println!("OK");
+    }
+
+    // Wait for announce to get identity
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let remote_identity = match transport.recall_identity(&mgmt_dest_hash).await {
+        Some(id) => id,
+        None => {
+            if args.json {
+                output_json_error("no_identity", "Could not recall remote identity");
+            } else {
+                eprintln!("Error: Could not recall remote identity");
+            }
+            return 11;
+        }
+    };
+
+    // Create destination descriptor for link establishment
+    let dest_name = DestinationName::new("rnstransport", "remote.management");
+    let dest_desc = SingleOutputDestination::new(remote_identity.clone(), dest_name);
+
+    // Establish link
+    if !args.json {
+        print!("Establishing link... ");
+        io::stdout().flush().ok();
+    }
+
+    let link = transport.link(dest_desc.desc).await;
+
+    // Wait for link activation
+    let mut out_link_events = transport.out_link_events();
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            if args.json {
+                output_json_error("link_timeout", "Could not establish link to remote transport");
+            } else {
+                println!("timeout");
+                eprintln!("Could not establish link to remote transport.");
+            }
+            return 12;
+        }
+
+        let status = link.lock().await.status();
+        if status == LinkStatus::Active {
+            if !args.json {
+                println!("OK");
+            }
+            break;
+        }
+
+        tokio::select! {
+            Ok(_event) = out_link_events.recv() => {
+                // Link events are handled internally
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if !args.json {
+                    print!(".");
+                    io::stdout().flush().ok();
+                }
+            }
+        }
+    }
+
+    // Identify with management identity (if we have one)
+    if let Some(ref mgmt_id) = management_identity {
+        if !args.json {
+            print!("Identifying... ");
+            io::stdout().flush().ok();
+        }
+
+        let identify_packet = {
+            let link_guard = link.lock().await;
+            match link_guard.identify(mgmt_id) {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    if args.json {
+                        output_json_error("identify_error", &format!("{:?}", e));
+                    } else {
+                        println!("error");
+                        eprintln!("Could not create identify packet: {:?}", e);
+                    }
+                    return 13;
+                }
+            }
+        };
+
+        transport.send_packet(identify_packet).await;
+
+        // Give server time to process identity
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        if !args.json {
+            println!("OK");
+        }
+    }
+
+    // Send status request
+    if !args.json {
+        print!("Requesting status... ");
+        io::stdout().flush().ok();
+    }
+
+    let request_data = build_status_request(args.link_stats);
+    let request_packet = {
+        let link_guard = link.lock().await;
+        match link_guard.request_packet(&request_data) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                if args.json {
+                    output_json_error("request_error", &format!("{:?}", e));
+                } else {
+                    println!("error");
+                    eprintln!("Could not create request packet: {:?}", e);
+                }
+                return 14;
+            }
+        }
+    };
+
+    transport.send_packet(request_packet).await;
+
+    // Wait for response
+    let response_deadline = tokio::time::Instant::now() + timeout_duration;
+
+    let response_data = loop {
+        if tokio::time::Instant::now() >= response_deadline {
+            if args.json {
+                output_json_error("response_timeout", "No response received from remote transport");
+            } else {
+                println!("timeout");
+                eprintln!("No response received from remote transport.");
+            }
+            return 15;
+        }
+
+        tokio::select! {
+            Ok(event) = out_link_events.recv() => {
+                if let LinkEvent::Response(payload) = &event.event {
+                    if !args.json {
+                        println!("OK");
+                    }
+                    break payload.as_slice().to_vec();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if !args.json {
+                    print!(".");
+                    io::stdout().flush().ok();
+                }
+            }
+        }
+    };
+
+    // Parse and display response
+    if !args.json {
+        println!();
+    }
+
+    match parse_status_response(&response_data) {
+        Ok((interfaces, link_count)) => {
+            display_remote_status(args, transport_hash_str, &interfaces, link_count);
+            0
+        }
+        Err(e) => {
+            if args.json {
+                output_json_error("parse_error", &e);
+            } else {
+                eprintln!("Error parsing response: {}", e);
+            }
+            16
+        }
+    }
+}
+
+/// Parse a transport identity hash from hex string.
+fn parse_transport_hash(hash_str: &str) -> Result<[u8; 16], String> {
+    let clean = hash_str
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+
+    if clean.len() != 32 {
+        return Err(format!(
+            "Invalid transport hash length: expected 32 hex characters, got {}",
+            clean.len()
+        ));
+    }
+
+    let bytes = hex::decode(clean)
+        .map_err(|_| "Invalid hexadecimal string".to_string())?;
+
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&bytes);
+    Ok(hash)
+}
+
+/// Load a private identity from a file.
+///
+/// Uses binary format (64 bytes) which is compatible with Python.
+fn load_identity(path: &PathBuf) -> Result<PrivateIdentity, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|mut f| f.read_to_end(&mut bytes))
+        .map_err(|e| format!("Could not read identity file: {}", e))?;
+
+    // Binary format: 64 bytes (Python-compatible)
+    if bytes.len() != 64 {
+        return Err(format!(
+            "Invalid identity file: expected 64 bytes, got {} bytes",
+            bytes.len()
+        ));
+    }
+
+    PrivateIdentity::new_from_bytes(&bytes)
+        .map_err(|e| format!("Invalid identity format: {:?}", e))
+}
+
+/// Compute the management destination hash from a transport identity hash.
+fn compute_management_destination_hash(transport_identity_hash: &[u8; 16]) -> AddressHash {
+    // Name hash for "rnstransport.remote.management"
+    let name = DestinationName::new("rnstransport", "remote.management");
+    let name_hash = name.as_name_hash_slice();
+
+    // Destination hash = truncated(sha256(name_hash || identity_hash))
+    let mut hasher = Sha256::new();
+    hasher.update(name_hash);
+    hasher.update(transport_identity_hash);
+    let result = hasher.finalize();
+
+    AddressHash::new_from_hash(&Hash::new(result.into()))
+}
+
+/// Create a client transport matching Python's require_shared_instance=False behavior.
+///
+/// Order of operations (matching Python Reticulum.py lines 373-435):
+/// 1. Try to become the shared instance (start LocalServerInterface)
+/// 2. If that fails (daemon already running), connect as client via LocalClientInterface
+/// 3. If both fail, become standalone (just load network interfaces)
+async fn create_client_transport(config: &ReticulumConfig) -> Transport {
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let transport_config = TransportConfig::new("rnstatus", &identity, false);
+    let transport = Transport::new(transport_config);
+
+    let socket_dir = config.paths.config_dir.join("sockets");
+    if let Err(e) = std::fs::create_dir_all(&socket_dir) {
+        log::warn!("Failed to create socket directory: {}", e);
+    }
+
+    let local_addr = ListenerAddr::default_transport(
+        "default",
+        &socket_dir,
+        config.shared_instance_port,
+    );
+
+    // Step 1: Try to become the shared instance (start LocalServerInterface)
+    // This will fail if another daemon is already running on this socket
+    let became_shared_instance = try_become_shared_instance(
+        &transport,
+        local_addr.clone(),
+        config,
+    ).await;
+
+    if became_shared_instance {
+        log::info!("Started as shared instance, serving other clients");
+        return transport;
+    }
+
+    // Step 2: Daemon exists, connect as client via LocalClientInterface
+    log::info!("Connecting to existing daemon via LocalClientInterface");
+
+    transport
+        .iface_manager()
+        .lock()
+        .await
+        .spawn(
+            LocalClientInterface::new(local_addr.clone()),
+            LocalClientInterface::spawn,
+        );
+
+    // Give LocalClientInterface time to connect
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    transport
+}
+
+/// Try to start as a shared instance by binding LocalServerInterface.
+/// Returns true if successful (we became the shared instance).
+/// Returns false if binding fails (another daemon is running).
+async fn try_become_shared_instance(
+    transport: &Transport,
+    local_addr: ListenerAddr,
+    config: &ReticulumConfig,
+) -> bool {
+    // Try to bind to the socket - this will fail if daemon is already running
+    match IpcListener::bind(&local_addr).await {
+        Ok(_listener) => {
+            // We successfully bound - we are the shared instance
+            // Drop the listener so LocalServerInterface can bind it
+            drop(_listener);
+
+            // Start LocalServerInterface to serve other clients
+            transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(
+                    LocalServerInterface::new(local_addr, transport.iface_manager()),
+                    LocalServerInterface::spawn,
+                );
+
+            // Load network interfaces from config (matching Python's __start_local_interface)
+            spawn_network_interfaces(transport, config).await;
+
+            // Give interfaces time to connect
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            true
+        }
+        Err(e) => {
+            log::debug!("Could not bind LocalServerInterface: {} - daemon likely running", e);
+            false
+        }
+    }
+}
+
+/// Spawn network interfaces from configuration.
+async fn spawn_network_interfaces(transport: &Transport, config: &ReticulumConfig) {
+    for iface_config in config.interface_configs() {
+        if !iface_config.enabled {
+            continue;
+        }
+
+        match iface_config.interface_type.as_str() {
+            "TCPClientInterface" | "tcp_client" => {
+                if let Some(ref target) = iface_config.target_host {
+                    let port = iface_config.target_port.unwrap_or(4242);
+                    let addr = format!("{}:{}", target, port);
+                    log::info!("Starting TCPClientInterface: {}", addr);
+                    transport
+                        .iface_manager()
+                        .lock()
+                        .await
+                        .spawn(TcpClient::new(&addr), TcpClient::spawn);
+                }
+            }
+            "TCPServerInterface" | "tcp_server" => {
+                // Skip server interfaces for rnstatus - we only need outbound connectivity
+                log::debug!("Skipping TCPServerInterface for rnstatus transport");
+            }
+            _ => {
+                log::debug!("Skipping unsupported interface type: {}", iface_config.interface_type);
+            }
+        }
+    }
+}
+
+/// Wait for a path to be established.
+async fn wait_for_path(transport: &Transport, dest_hash: &AddressHash, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while tokio::time::Instant::now() < deadline {
+        if transport.has_path(dest_hash).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    false
+}
+
+/// Build a status request packet data.
+fn build_status_request(include_link_stats: bool) -> Vec<u8> {
+    // Request format: [timestamp, path_hash("/status"), [include_link_stats]]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    let path_hash = RequestRouter::path_hash("/status");
+
+    // Build the request data payload
+    let mut data_payload = Vec::new();
+    rmpv::encode::write_value(&mut data_payload, &rmpv::Value::Array(vec![
+        rmpv::Value::Boolean(include_link_stats),
+    ])).unwrap();
+
+    // Build the full request
+    let request = rmpv::Value::Array(vec![
+        rmpv::Value::F64(timestamp),
+        rmpv::Value::Binary(path_hash.to_vec()),
+        rmpv::Value::Binary(data_payload),
+    ]);
+
+    let mut packed = Vec::new();
+    rmpv::encode::write_value(&mut packed, &request).unwrap();
+    packed
+}
+
+/// Parse a status response.
+fn parse_status_response(data: &[u8]) -> Result<(Vec<RemoteInterfaceStats>, Option<u64>), String> {
+    // Response format: [request_id, response_data]
+    // where response_data is [interface_stats_obj, link_count?]
+    // and interface_stats_obj is {"interfaces": [...], "rxb": ..., "txb": ..., ...} (Python format)
+    // or just an array of interfaces (Rust format)
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
+        .map_err(|e| format!("Failed to decode response: {}", e))?;
+
+    let arr = value.as_array().ok_or("Response is not an array")?;
+    if arr.len() < 2 {
+        return Err("Response too short".to_string());
+    }
+
+    // Second element is the actual response data
+    let response_data = &arr[1];
+
+    // Parse the response data (which may be binary/msgpack encoded or directly an array)
+    let inner = if let Some(bytes) = response_data.as_slice() {
+        rmpv::decode::read_value(&mut std::io::Cursor::new(bytes))
+            .map_err(|e| format!("Failed to decode inner response: {}", e))?
+    } else {
+        response_data.clone()
+    };
+
+    let inner_arr = inner.as_array().ok_or("Inner response is not an array")?;
+    if inner_arr.is_empty() {
+        return Ok((vec![], None));
+    }
+
+    // Parse interface stats - handle both Python (map with "interfaces" key) and Rust (direct array) formats
+    let interfaces = if let Some(stats_map) = inner_arr[0].as_map() {
+        // Python format: {"interfaces": [...], "rxb": ..., "txb": ..., ...}
+        let iface_arr = stats_map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("interfaces"))
+            .and_then(|(_, v)| v.as_array());
+        if let Some(arr) = iface_arr {
+            arr.iter().filter_map(parse_remote_interface).collect()
+        } else {
+            vec![]
+        }
+    } else if let Some(iface_arr) = inner_arr[0].as_array() {
+        // Rust format: direct array of interfaces
+        iface_arr.iter().filter_map(parse_remote_interface).collect()
+    } else {
+        vec![]
+    };
+
+    // Parse link count if present
+    let link_count = if inner_arr.len() > 1 {
+        inner_arr[1].as_u64()
+    } else {
+        None
+    };
+
+    Ok((interfaces, link_count))
+}
+
+/// Remote interface statistics from response.
+#[derive(Debug, Clone)]
+struct RemoteInterfaceStats {
+    name: String,
+    interface_type: String,
+    online: bool,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+/// Parse a single interface from the response.
+fn parse_remote_interface(value: &rmpv::Value) -> Option<RemoteInterfaceStats> {
+    let map = value.as_map()?;
+
+    let get_str = |key: &str| -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_str().map(|s| s.to_string()))
+    };
+
+    let get_bool = |key: &str| -> bool {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_bool())
+            .unwrap_or(false)
+    };
+
+    let get_u64 = |key: &str| -> u64 {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64())
+            .unwrap_or(0)
+    };
+
+    // Python uses "status" for online state, Rust uses "online"
+    let online = get_bool("online") || get_bool("status");
+
+    // Python uses "name" for full interface name, "short_name" for just the name
+    let name = get_str("short_name").or_else(|| get_str("name"))?;
+
+    Some(RemoteInterfaceStats {
+        name,
+        interface_type: get_str("type").unwrap_or_default(),
+        online,
+        rx_bytes: get_u64("rxb"),
+        tx_bytes: get_u64("txb"),
+    })
+}
+
+/// Display the remote status.
+fn display_remote_status(
+    args: &Args,
+    transport_hash: &str,
+    interfaces: &[RemoteInterfaceStats],
+    link_count: Option<u64>,
+) {
+    if args.json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("transport_hash".to_string(), serde_json::Value::String(transport_hash.to_string()));
+
+        let iface_arr: Vec<serde_json::Value> = interfaces.iter().map(|iface| {
+            let mut m = serde_json::Map::new();
+            m.insert("name".to_string(), serde_json::Value::String(iface.name.clone()));
+            m.insert("type".to_string(), serde_json::Value::String(iface.interface_type.clone()));
+            m.insert("online".to_string(), serde_json::Value::Bool(iface.online));
+            m.insert("rx_bytes".to_string(), serde_json::Value::Number(iface.rx_bytes.into()));
+            m.insert("tx_bytes".to_string(), serde_json::Value::Number(iface.tx_bytes.into()));
+            serde_json::Value::Object(m)
+        }).collect();
+
+        obj.insert("interfaces".to_string(), serde_json::Value::Array(iface_arr));
+
+        if let Some(count) = link_count {
+            obj.insert("link_count".to_string(), serde_json::Value::Number(count.into()));
+        }
+
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap());
+    } else {
+        println!("Remote Transport Status: <{}>", transport_hash);
+        println!();
+
+        if interfaces.is_empty() {
+            println!("  No interface statistics available");
+        } else {
+            println!("  Interfaces:");
+            for iface in interfaces {
+                let status = if iface.online { "Online" } else { "Offline" };
+                println!("    {} [{}] - {}", iface.name, iface.interface_type, status);
+                println!("      RX: {} bytes, TX: {} bytes", iface.rx_bytes, iface.tx_bytes);
+            }
+        }
+
+        if let Some(count) = link_count {
+            println!();
+            println!("  Active links: {}", count);
+        }
+    }
+}
+
+/// Output a JSON error message.
+fn output_json_error(error_type: &str, message: &str) {
+    let mut obj = serde_json::Map::new();
+    obj.insert("error".to_string(), serde_json::Value::String(error_type.to_string()));
+    obj.insert("message".to_string(), serde_json::Value::String(message.to_string()));
+    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap());
 }
 
 /// Show discovered interfaces
-fn show_discovered_interfaces(args: &Args, _config: &ReticulumConfig) {
-    // For now, return empty list - discovery system would populate this
-    let discovered: Vec<DiscoveredInterface> = Vec::new();
+fn show_discovered_interfaces(args: &Args, config: &ReticulumConfig) {
+    // Query daemon for discovered interfaces via RPC
+    let socket_dir = config.paths.config_dir.join("sockets");
+    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
+    let client = RpcClient::new(rpc_addr);
+
+    // Use tokio runtime to make async RPC call
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create runtime: {}", e);
+            return;
+        }
+    };
+
+    let discovered: Vec<DiscoveredInterface> = rt.block_on(async {
+        // Try to get interfaces from daemon
+        match client.get_discovered_interfaces().await {
+            Ok(rpc_interfaces) => {
+                // Convert RPC entries to our local format
+                rpc_interfaces
+                    .into_iter()
+                    .map(|entry| DiscoveredInterface {
+                        name: entry.name,
+                        interface_type: entry.interface_type,
+                        status: entry.status,
+                        transport: entry.transport,
+                        hops: entry.hops,
+                        discovered: entry.discovered,
+                        last_heard: entry.last_heard,
+                        value: entry.value,
+                        latitude: entry.latitude,
+                        longitude: entry.longitude,
+                        height: entry.height,
+                        transport_id: entry.transport_id,
+                        network_id: entry.network_id,
+                        frequency: entry.frequency,
+                        bandwidth: entry.bandwidth,
+                        sf: entry.sf,
+                        cr: entry.cr,
+                        modulation: entry.modulation,
+                        reachable_on: entry.reachable_on,
+                        port: entry.port,
+                        config_entry: entry.config_entry,
+                    })
+                    .collect()
+            }
+            Err(_) => {
+                // Daemon not running or no interfaces discovered
+                Vec::new()
+            }
+        }
+    });
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&discovered).unwrap());
@@ -681,28 +1377,6 @@ fn get_shared_instance_stats(config: &ReticulumConfig) -> Result<NetworkStats, S
             ..Default::default()
         })
     })
-}
-
-/// Get stats in standalone mode (no shared instance)
-fn get_standalone_stats(config: &ReticulumConfig) -> NetworkStats {
-    let mut stats = NetworkStats::default();
-
-    // Build interface stats from configuration
-    for iface_config in config.interface_configs() {
-        let if_stats = InterfaceStats {
-            name: format!("{}[{}]", iface_config.interface_type, iface_config.name),
-            short_name: iface_config.name.clone(),
-            hash: format!("{:016x}", hash_string(&iface_config.name)),
-            interface_type: iface_config.interface_type.clone(),
-            status: iface_config.enabled,
-            mode: InterfaceMode::Full as u8,
-            bitrate: iface_config.bitrate,
-            ..Default::default()
-        };
-        stats.interfaces.push(if_stats);
-    }
-
-    stats
 }
 
 /// Get link count from shared instance via RPC
@@ -1215,14 +1889,6 @@ fn pretty_hex(hex: &str) -> String {
     } else {
         format!("<{}>", hex)
     }
-}
-
-/// Simple string hash for generating deterministic hashes
-fn hash_string(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Format a number with comma separators (e.g., 1000000 -> "1,000,000")

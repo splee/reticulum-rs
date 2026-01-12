@@ -4,6 +4,7 @@ pub mod link_map;
 pub mod link_stats;
 pub mod plain;
 pub mod proof;
+pub mod request;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use rand_core::CryptoRngCore;

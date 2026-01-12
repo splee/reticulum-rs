@@ -20,7 +20,7 @@ check_containers || start_containers
 info "Test 1: Rust identity -> Python verification"
 
 # Generate identity with Rust
-RUST_ID_OUTPUT=$(exec_rust rnid -g --hex 2>&1)
+RUST_ID_OUTPUT=$(exec_rust rnid -g 2>&1)
 RUST_ADDRESS=$(echo "$RUST_ID_OUTPUT" | grep "Address Hash:" | sed 's/.*Address Hash:[[:space:]]*//' | tr -d '/' | tr -d ' ')
 
 if [ -n "$RUST_ADDRESS" ]; then
@@ -65,15 +65,39 @@ exec_rust sh -c 'rnid -g -e /tmp/test_identity.dat' 2>&1 || true
 if exec_rust test -f /tmp/test_identity.dat; then
     success "Rust identity exported to file"
 
-    # Show the format
-    IDENTITY_CONTENT=$(exec_rust cat /tmp/test_identity.dat 2>&1)
-    info "Identity file content (hex): ${IDENTITY_CONTENT:0:64}..."
+    # Get file size - should be 194 bytes for a full identity (2 x 32-byte keys + overhead)
+    FILE_SIZE=$(exec_rust stat -c %s /tmp/test_identity.dat 2>/dev/null || exec_rust wc -c < /tmp/test_identity.dat | tr -d ' ')
+    info "Identity file size: ${FILE_SIZE} bytes"
 
-    # Verify it's valid hex
-    if echo "$IDENTITY_CONTENT" | grep -qE '^[a-f0-9]+$'; then
-        success "Identity file is valid hex format"
+    # Verify Python can read the Rust-exported identity
+    PYTHON_READ_OUTPUT=$(exec_python sh -c 'python3 -c "
+import RNS
+identity = RNS.Identity.from_file(\"/tmp/test_identity.dat\")
+print(\"ADDRESS=\" + identity.hexhash)
+"' 2>&1 || true)
+
+    if echo "$PYTHON_READ_OUTPUT" | grep -q "ADDRESS="; then
+        PYTHON_READ_ADDRESS=$(echo "$PYTHON_READ_OUTPUT" | grep "ADDRESS=" | cut -d= -f2)
+        success "Python successfully read Rust identity: /$PYTHON_READ_ADDRESS/"
     else
-        fail "Identity file is not valid hex format"
+        # Copy file from Rust to Python container for testing
+        docker cp reticulum-rust-node:/tmp/test_identity.dat /tmp/test_identity_transfer.dat 2>/dev/null
+        docker cp /tmp/test_identity_transfer.dat reticulum-python-hub:/tmp/test_identity.dat 2>/dev/null
+        rm -f /tmp/test_identity_transfer.dat
+
+        PYTHON_READ_OUTPUT=$(exec_python sh -c 'python3 -c "
+import RNS
+identity = RNS.Identity.from_file(\"/tmp/test_identity.dat\")
+print(\"ADDRESS=\" + identity.hexhash)
+"' 2>&1 || true)
+
+        if echo "$PYTHON_READ_OUTPUT" | grep -q "ADDRESS="; then
+            PYTHON_READ_ADDRESS=$(echo "$PYTHON_READ_OUTPUT" | grep "ADDRESS=" | cut -d= -f2)
+            success "Python successfully read Rust identity: /$PYTHON_READ_ADDRESS/"
+        else
+            fail "Python could not read Rust identity file"
+            echo "$PYTHON_READ_OUTPUT"
+        fi
     fi
 else
     fail "Failed to export identity to file"

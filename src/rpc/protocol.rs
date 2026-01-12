@@ -79,6 +79,9 @@ pub enum RpcRequest {
 
     /// Ping the daemon to check if it's alive.
     Ping,
+
+    /// Get discovered interfaces (from network announcements).
+    GetDiscoveredInterfaces,
 }
 
 /// RPC response from the daemon.
@@ -122,6 +125,9 @@ pub enum RpcResult {
 
     /// Blackholed identities list.
     BlackholeList(Vec<BlackholeEntry>),
+
+    /// Discovered interfaces list.
+    DiscoveredInterfaces(Vec<DiscoveredInterfaceEntry>),
 }
 
 /// Entry in the routing path table.
@@ -184,6 +190,73 @@ pub struct BlackholeEntry {
     pub reason: String,
 }
 
+/// Discovered interface entry from network announcements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredInterfaceEntry {
+    /// Interface name
+    pub name: String,
+    /// Interface type (e.g., "RNodeInterface")
+    #[serde(rename = "type")]
+    pub interface_type: String,
+    /// Status string ("available", "unknown", "stale")
+    pub status: String,
+    /// Whether interface supports transport
+    pub transport: bool,
+    /// Number of hops to interface
+    pub hops: u8,
+    /// Unix timestamp when first discovered
+    pub discovered: f64,
+    /// Unix timestamp when last heard
+    pub last_heard: f64,
+    /// Stamp value (proof-of-work difficulty achieved)
+    pub value: u32,
+    /// Transport identity hash (hex encoded)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_id: Option<String>,
+    /// Network identity hash (hex encoded)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// Latitude coordinate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// Longitude coordinate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// Height/altitude in meters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f32>,
+    /// Radio frequency in Hz
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<u64>,
+    /// Radio bandwidth in Hz
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<u64>,
+    /// LoRa spreading factor
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sf: Option<u8>,
+    /// LoRa coding rate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cr: Option<u8>,
+    /// Modulation type (e.g., "LoRa")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modulation: Option<String>,
+    /// Network address/hostname to reach this interface
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachable_on: Option<String>,
+    /// Network port
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// IFAC network name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ifac_netname: Option<String>,
+    /// IFAC network key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ifac_netkey: Option<String>,
+    /// Generated config entry for adding this interface
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_entry: Option<String>,
+}
+
 impl RpcRequest {
     /// Returns a human-readable name for this request type.
     pub fn name(&self) -> &'static str {
@@ -202,6 +275,7 @@ impl RpcRequest {
             RpcRequest::BlackholeIdentity { .. } => "BlackholeIdentity",
             RpcRequest::UnblackholeIdentity { .. } => "UnblackholeIdentity",
             RpcRequest::Ping => "Ping",
+            RpcRequest::GetDiscoveredInterfaces => "GetDiscoveredInterfaces",
         }
     }
 }

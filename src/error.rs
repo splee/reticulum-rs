@@ -7,4 +7,6 @@ pub enum RnsError {
     CryptoError,
     PacketError,
     ConnectionError,
+    /// Operation was cancelled before completion
+    Cancelled,
 }

@@ -14,7 +14,8 @@ use tokio::time::timeout;
 use crate::ipc::addr::{connect, ListenerAddr};
 
 use super::protocol::{
-    InterfaceStats, NextHopInfo, PathEntry, RpcRequest, RpcResponse, RpcResult,
+    DiscoveredInterfaceEntry, InterfaceStats, NextHopInfo, PathEntry, RpcRequest, RpcResponse,
+    RpcResult,
 };
 
 /// Timeout for RPC operations.
@@ -172,6 +173,18 @@ impl RpcClient {
             .await?;
         match response {
             RpcResponse::Success(RpcResult::Ok) => Ok(()),
+            RpcResponse::Success(_) => Err(RpcClientError::UnexpectedResponse),
+            RpcResponse::Error(e) => Err(RpcClientError::ServerError(e)),
+        }
+    }
+
+    /// Get discovered interfaces from the daemon.
+    pub async fn get_discovered_interfaces(
+        &self,
+    ) -> Result<Vec<DiscoveredInterfaceEntry>, RpcClientError> {
+        let response = self.call(RpcRequest::GetDiscoveredInterfaces).await?;
+        match response {
+            RpcResponse::Success(RpcResult::DiscoveredInterfaces(interfaces)) => Ok(interfaces),
             RpcResponse::Success(_) => Err(RpcClientError::UnexpectedResponse),
             RpcResponse::Error(e) => Err(RpcClientError::ServerError(e)),
         }

@@ -144,11 +144,11 @@ fn export_identity_to_file(identity: &PrivateIdentity, path: &PathBuf) -> Result
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
-    // Export as hex for now (simple format)
-    let hex_string = identity.to_hex_string();
+    // Export as binary (Python-compatible format)
+    let bytes = identity.to_bytes();
 
     let mut file = File::create(path).map_err(|e| format!("Failed to create file: {}", e))?;
-    file.write_all(hex_string.as_bytes())
+    file.write_all(&bytes)
         .map_err(|e| format!("Failed to write file: {}", e))?;
 
     Ok(())
@@ -157,11 +157,19 @@ fn export_identity_to_file(identity: &PrivateIdentity, path: &PathBuf) -> Result
 fn load_identity_from_file(path: &PathBuf) -> Result<PrivateIdentity, String> {
     let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    PrivateIdentity::new_from_hex_string(contents.trim())
+    // Binary format: 64 bytes (Python-compatible)
+    if bytes.len() != 64 {
+        return Err(format!(
+            "Invalid identity file: expected 64 bytes, got {} bytes",
+            bytes.len()
+        ));
+    }
+
+    PrivateIdentity::new_from_bytes(&bytes)
         .map_err(|e| format!("Failed to parse identity: {:?}", e))
 }
 

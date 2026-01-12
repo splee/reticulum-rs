@@ -182,21 +182,33 @@ impl InterfaceManager {
     }
 
     pub async fn send(&self, message: TxMessage) {
+        let mut sent = false;
         for iface in &self.ifaces {
-            let should_send = match message.tx_type {
+            let should_send = match &message.tx_type {
                 TxMessageType::Broadcast(address) => {
                     let mut should_send = true;
                     if let Some(address) = address {
-                        should_send = address != iface.address;
+                        should_send = *address != iface.address;
                     }
 
                     should_send
                 },
-                TxMessageType::Direct(address) => address == iface.address,
+                TxMessageType::Direct(address) => *address == iface.address,
             };
 
             if should_send && !iface.stop.is_cancelled() {
                 let _ = iface.tx_send.send(message.clone()).await;
+                sent = true;
+            }
+        }
+
+        // Log warning if no interface matched for direct send (but not for every packet)
+        if !sent {
+            if let TxMessageType::Direct(target_addr) = &message.tx_type {
+                log::debug!(
+                    "iface_manager: no interface matched for direct send to {}",
+                    target_addr
+                );
             }
         }
     }

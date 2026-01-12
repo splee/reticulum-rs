@@ -290,6 +290,25 @@ impl PrivateIdentity {
         ))
     }
 
+    /// Create from raw 64-byte binary data (Python-compatible format).
+    ///
+    /// Format: [32 bytes X25519 private key][32 bytes Ed25519 signing key seed]
+    pub fn new_from_bytes(bytes: &[u8]) -> Result<Self, RnsError> {
+        if bytes.len() < PUBLIC_KEY_LENGTH * 2 {
+            return Err(RnsError::IncorrectHash);
+        }
+
+        let mut prv_bytes = [0u8; PUBLIC_KEY_LENGTH];
+        let mut sign_bytes = [0u8; PUBLIC_KEY_LENGTH];
+        prv_bytes.copy_from_slice(&bytes[0..PUBLIC_KEY_LENGTH]);
+        sign_bytes.copy_from_slice(&bytes[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2]);
+
+        Ok(Self::new(
+            StaticSecret::from(prv_bytes),
+            SigningKey::from_bytes(&sign_bytes),
+        ))
+    }
+
     pub fn sign_key(&self) -> &SigningKey {
         &self.sign_key
     }
@@ -318,6 +337,16 @@ impl PrivateIdentity {
         }
 
         hex_string
+    }
+
+    /// Export as raw 64-byte binary data (Python-compatible format).
+    ///
+    /// Format: [32 bytes X25519 private key][32 bytes Ed25519 signing key seed]
+    pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_LENGTH * 2] {
+        let mut bytes = [0u8; PUBLIC_KEY_LENGTH * 2];
+        bytes[0..PUBLIC_KEY_LENGTH].copy_from_slice(self.private_key.as_bytes());
+        bytes[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2].copy_from_slice(self.sign_key.as_bytes());
+        bytes
     }
 
     pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<(), RnsError> {

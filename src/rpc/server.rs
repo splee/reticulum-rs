@@ -13,8 +13,11 @@ use crate::ipc::addr::{IpcListener, ListenerAddr};
 use crate::transport::Transport;
 
 use super::protocol::{
-    InterfaceStats, PathEntry, RpcRequest, RpcResponse, RpcResult,
+    DiscoveredInterfaceEntry, InterfaceStats, PathEntry, RpcRequest, RpcResponse, RpcResult,
 };
+
+use crate::config::ReticulumConfig;
+use crate::discovery::InterfaceDiscoveryStorage;
 
 /// Maximum size of an RPC message (16 KB should be plenty).
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
@@ -225,6 +228,11 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
             // Not yet implemented
             RpcResponse::success(RpcResult::Ok)
         }
+
+        RpcRequest::GetDiscoveredInterfaces => {
+            let interfaces = get_discovered_interfaces().await;
+            RpcResponse::success(RpcResult::DiscoveredInterfaces(interfaces))
+        }
     }
 }
 
@@ -276,6 +284,80 @@ async fn drop_path(_transport: &Transport, _destination_hash: &[u8]) -> Result<(
 async fn drop_all_via(_transport: &Transport, _destination_hash: &[u8]) -> Result<(), String> {
     // Not yet implemented
     Ok(())
+}
+
+/// Get discovered interfaces from storage.
+async fn get_discovered_interfaces() -> Vec<DiscoveredInterfaceEntry> {
+    // Load configuration to get storage path
+    let config = match ReticulumConfig::load(None) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to load config for discovery: {}", e);
+            return vec![];
+        }
+    };
+
+    let storage = match InterfaceDiscoveryStorage::new(&config.paths.storage_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to create discovery storage: {}", e);
+            return vec![];
+        }
+    };
+
+    // Load and convert all discovered interfaces (no source filtering)
+    match storage.list_discovered(None) {
+        Ok(interfaces) => {
+            interfaces
+                .into_iter()
+                .map(|info| {
+                    // Get status string - should be set by list_discovered
+                    let status_str = info.status
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    DiscoveredInterfaceEntry {
+                        name: info.name,
+                        interface_type: info.interface_type,
+                        status: status_str,
+                        transport: info.transport,
+                        hops: info.hops,
+                        discovered: info.discovered,
+                        last_heard: info.last_heard,
+                        value: info.value,
+                        transport_id: if info.transport_id.is_empty() {
+                            None
+                        } else {
+                            Some(info.transport_id)
+                        },
+                        network_id: if info.network_id.is_empty() {
+                            None
+                        } else {
+                            Some(info.network_id)
+                        },
+                        latitude: info.latitude,
+                        longitude: info.longitude,
+                        height: info.height,
+                        frequency: info.frequency,
+                        bandwidth: info.bandwidth,
+                        sf: info.sf,
+                        cr: info.cr,
+                        modulation: info.modulation,
+                        reachable_on: info.reachable_on,
+                        port: info.port,
+                        ifac_netname: info.ifac_netname,
+                        ifac_netkey: info.ifac_netkey,
+                        config_entry: info.config_entry,
+                    }
+                })
+                .collect()
+        }
+        Err(e) => {
+            log::warn!("Failed to load discovered interfaces: {}", e);
+            vec![]
+        }
+    }
 }
 
 /// Errors that can occur during RPC handling.
