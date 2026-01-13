@@ -12,8 +12,8 @@
 services:
   python-hub:
     build:
-      context: ../..
-      dockerfile: reticulum-rust/docker/Dockerfile.python
+      context: ..
+      dockerfile: docker/Dockerfile.python
     container_name: reticulum-python-hub
     hostname: python-hub
     networks:

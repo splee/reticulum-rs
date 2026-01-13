@@ -41,10 +41,19 @@ echo "Python-Rust Reticulum Integration Tests"
 echo "========================================"
 echo -e "${NC}"
 
-# Build and start containers
+# Set up build sentinel to avoid rebuilding for each test
+BUILD_SENTINEL="/tmp/reticulum-test-images-built"
+export BUILD_SENTINEL
+
+# Create sentinel to indicate we're managing builds
+touch "$BUILD_SENTINEL"
+trap "rm -f '$BUILD_SENTINEL'" EXIT INT TERM
+
+# Build and start containers (only builds once)
 echo -e "${YELLOW}Building and starting containers...${NC}"
 cd "$DOCKER_DIR"
 docker compose up -d --build 2>&1 | grep -v "^$"
+cd - > /dev/null
 
 # Wait for containers to be healthy
 echo -e "${YELLOW}Waiting for containers to be ready...${NC}"

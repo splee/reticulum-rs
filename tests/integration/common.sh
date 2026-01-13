@@ -66,6 +66,9 @@ exec_rust() {
     exec_in reticulum-rust-node "$@"
 }
 
+# Sentinel file to track if images are already built
+BUILD_SENTINEL="${BUILD_SENTINEL:-/tmp/reticulum-test-images-built}"
+
 # Check if containers are running
 check_containers() {
     info "Checking if containers are running..."
@@ -84,16 +87,48 @@ check_containers() {
     return 0
 }
 
-# Start containers if not running
+# Build containers (respects sentinel for optimization)
+build_containers() {
+    local force_build=${1:-false}
+
+    cd "$(dirname "$0")/../../docker"
+
+    # Check if we should skip build
+    if [ -f "$BUILD_SENTINEL" ] && [ "$force_build" != "true" ]; then
+        info "Using existing images (build sentinel detected)"
+        docker compose up -d --no-build
+    else
+        info "Building Docker images..."
+        docker compose up -d --build
+
+        # Create sentinel if it doesn't exist
+        if [ ! -f "$BUILD_SENTINEL" ]; then
+            touch "$BUILD_SENTINEL"
+            # Mark that we created it (for cleanup)
+            export CREATED_BUILD_SENTINEL=true
+        fi
+    fi
+
+    cd - > /dev/null
+}
+
+# Start containers if not running (uses build_containers)
 start_containers() {
     info "Starting containers..."
-    cd "$(dirname "$0")/../../docker"
-    docker compose up -d --build
-    cd - > /dev/null
-
+    build_containers
     wait_for_healthy reticulum-python-hub 60
     wait_for_healthy reticulum-rust-node 60
 }
+
+# Clean up build sentinel if we created it
+cleanup_build_sentinel() {
+    if [ "${CREATED_BUILD_SENTINEL:-false}" = "true" ] && [ -f "$BUILD_SENTINEL" ]; then
+        rm -f "$BUILD_SENTINEL"
+    fi
+}
+
+# Register cleanup trap (only if not already set by test)
+trap cleanup_build_sentinel EXIT
 
 # Stop containers
 stop_containers() {
@@ -161,4 +196,180 @@ assert_contains() {
         fail "$message (expected to contain: $expected)"
         return 1
     fi
+}
+
+# ============================================
+# Background Process Management
+# ============================================
+
+# Run a command in a container in the background, capturing output to a file
+# Returns: "PID:CAT_PID:FIFO:OUTPUT_FILE"
+run_in_background() {
+    local container=$1
+    local timeout=$2
+    shift 2
+    local command="$@"
+
+    local fifo=$(mktemp -u)
+    mkfifo "$fifo"
+    local output=$(mktemp)
+
+    (docker exec "$container" timeout "$timeout" $command > "$fifo" 2>&1) &
+    local pid=$!
+
+    cat "$fifo" > "$output" &
+    local cat_pid=$!
+
+    echo "$pid:$cat_pid:$fifo:$output"
+}
+
+# Wait for a background process to complete and return output file path
+# Args: handle from run_in_background
+# Returns: path to output file
+wait_for_background() {
+    local handle=$1
+    IFS=':' read -r pid cat_pid fifo output <<< "$handle"
+
+    wait "$pid" 2>/dev/null || true
+    wait "$cat_pid" 2>/dev/null || true
+    rm -f "$fifo"
+
+    echo "$output"
+}
+
+# Cleanup background process (graceful kill with timeout)
+kill_background() {
+    local handle=$1
+    local timeout=${2:-5}
+    IFS=':' read -r pid cat_pid fifo output <<< "$handle"
+
+    # Kill main process
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+
+        # Wait for graceful exit
+        for i in $(seq 1 $timeout); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+
+        # Force kill if still running
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    # Kill cat process
+    kill "$cat_pid" 2>/dev/null || true
+    kill -9 "$cat_pid" 2>/dev/null || true
+
+    # Cleanup
+    rm -f "$fifo" "$output"
+}
+
+# ============================================
+# Destination Hash Helpers
+# ============================================
+
+# Wait for destination hash to appear in output file
+# Returns: destination hash or empty string on timeout
+wait_for_destination_hash() {
+    local output_file=$1
+    local timeout=${2:-10}
+    local elapsed=0
+
+    while [ $elapsed -lt $timeout ]; do
+        if [ -f "$output_file" ] && grep -q "DESTINATION_HASH=" "$output_file" 2>/dev/null; then
+            grep "DESTINATION_HASH=" "$output_file" | head -1 | cut -d= -f2
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    return 1
+}
+
+# Extract any field from output file (KEY=VALUE format)
+extract_field() {
+    local output_file=$1
+    local field_name=$2
+
+    if [ -f "$output_file" ] && grep -q "${field_name}=" "$output_file" 2>/dev/null; then
+        grep "${field_name}=" "$output_file" | head -1 | cut -d= -f2
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================
+# Temporary File Management
+# ============================================
+
+declare -a TEMP_FILES=()
+
+# Create a temporary file and register it for cleanup
+create_temp_file() {
+    local temp=$(mktemp)
+    TEMP_FILES+=("$temp")
+    echo "$temp"
+}
+
+# Cleanup all registered temporary files
+cleanup_temp_files() {
+    for file in "${TEMP_FILES[@]}"; do
+        rm -f "$file" 2>/dev/null || true
+    done
+    TEMP_FILES=()
+}
+
+# Register cleanup trap (safe to call multiple times)
+register_cleanup_trap() {
+    trap 'cleanup_temp_files; cleanup_build_sentinel' EXIT INT TERM
+}
+
+# ============================================
+# Docker Execution Helpers
+# ============================================
+
+# Execute command in container with timeout
+exec_with_timeout() {
+    local container=$1
+    local timeout=$2
+    shift 2
+    docker exec "$container" timeout "$timeout" "$@" 2>&1 || true
+}
+
+# ============================================
+# Log Collection
+# ============================================
+
+# Get container logs (last N lines)
+get_container_logs() {
+    local container=$1
+    local lines=${2:-50}
+    docker logs "$container" 2>&1 | tail -"$lines"
+}
+
+# Dump logs from all standard containers
+dump_all_logs() {
+    local lines=${1:-30}
+    echo ""
+    info "Python hub logs:"
+    get_container_logs reticulum-python-hub "$lines"
+    echo ""
+    info "Rust node logs:"
+    get_container_logs reticulum-rust-node "$lines"
+}
+
+# ============================================
+# Output Validation
+# ============================================
+
+# Check if output contains a marker
+has_marker() {
+    local output=$1
+    local marker=$2
+    grep -q "$marker" <<< "$output"
 }
