@@ -9,10 +9,13 @@ use std::time::Duration;
 
 use clap::Parser;
 use rand_core::OsRng;
+use reticulum::config::ReticulumConfig;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
+use reticulum::ipc::addr::ListenerAddr;
+use reticulum::ipc::LocalClientInterface;
 use reticulum::transport::{Transport, TransportConfig};
 
 /// Test destination creator for integration testing
@@ -39,6 +42,10 @@ struct Args {
     /// TCP client to connect to (e.g., "python-hub:4242")
     #[arg(long)]
     tcp_client: Option<String>,
+
+    /// Connect to shared rnsd instance via Unix socket (for local client testing)
+    #[arg(long)]
+    shared: bool,
 
     /// Announce interval in seconds
     #[arg(short = 'i', long, default_value = "30")]
@@ -98,29 +105,65 @@ fn main() {
         let mut transport = Transport::new(TransportConfig::new("test_dest", &identity, false));
 
         // Set up interfaces
-        if let Some(server_addr) = &args.tcp_server {
-            log::info!("Starting TCP server on {}", server_addr);
+        if args.shared {
+            // Connect to shared rnsd instance via Unix socket
+            log::info!("Connecting to shared rnsd instance via Unix socket");
+
+            // Load config to get socket path
+            let config = match ReticulumConfig::load(None) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    log::error!("Failed to load config: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let socket_dir = config.paths.config_dir.join("sockets");
+            let local_addr = ListenerAddr::default_transport(
+                "default",
+                &socket_dir,
+                config.shared_instance_port,
+            );
+
+            log::info!("Connecting to {}", local_addr.display());
+
             transport
                 .iface_manager()
                 .lock()
                 .await
                 .spawn(
-                    TcpServer::new(server_addr, transport.iface_manager()),
-                    TcpServer::spawn,
+                    LocalClientInterface::new(local_addr),
+                    LocalClientInterface::spawn,
                 );
-        }
 
-        if let Some(client_addr) = &args.tcp_client {
-            log::info!("Connecting TCP client to {}", client_addr);
-            transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(TcpClient::new(client_addr), TcpClient::spawn);
-        }
+            // Give LocalClientInterface time to connect
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
+            // Use TCP interfaces for standalone operation
+            if let Some(server_addr) = &args.tcp_server {
+                log::info!("Starting TCP server on {}", server_addr);
+                transport
+                    .iface_manager()
+                    .lock()
+                    .await
+                    .spawn(
+                        TcpServer::new(server_addr, transport.iface_manager()),
+                        TcpServer::spawn,
+                    );
+            }
 
-        // Give interfaces time to connect
-        tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Some(client_addr) = &args.tcp_client {
+                log::info!("Connecting TCP client to {}", client_addr);
+                transport
+                    .iface_manager()
+                    .lock()
+                    .await
+                    .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            }
+
+            // Give interfaces time to connect
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
         // Create destination
         let dest_name = DestinationName::new(&args.app_name, &args.aspect);

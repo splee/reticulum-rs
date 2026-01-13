@@ -81,9 +81,9 @@ struct Args {
     #[arg(short = 'i', long, value_name = "IDENTITY")]
     identity: Option<String>,
 
-    /// Generate a new identity
-    #[arg(short = 'g', long)]
-    generate: bool,
+    /// Generate a new identity and save to file
+    #[arg(short = 'g', long, value_name = "FILE")]
+    generate: Option<PathBuf>,
 
     /// Import identity from hex, base32, or base64 string
     #[arg(short = 'm', long = "import", value_name = "IDENTITY_DATA")]
@@ -243,8 +243,8 @@ async fn run(args: &Args) -> i32 {
     let encoding = Encoding::from_args(args);
 
     // Handle generate first (doesn't need existing identity)
-    if args.generate {
-        return handle_generate(args, encoding);
+    if let Some(ref path) = args.generate {
+        return handle_generate(args, path, encoding);
     }
 
     // Handle import from string
@@ -473,40 +473,45 @@ fn handle_public_identity_operations(args: &Args, identity: &Identity, encoding:
     EXIT_OK
 }
 
-/// Generate a new identity
-fn handle_generate(args: &Args, encoding: Encoding) -> i32 {
+/// Generate a new identity and save to file (Python-compatible interface)
+fn handle_generate(args: &Args, path: &PathBuf, encoding: Encoding) -> i32 {
     log::info!("Generating new identity...");
 
-    let identity = PrivateIdentity::new_from_rand(OsRng);
-
-    println!("Identity generated successfully");
-    println!();
-    print_identity_info(&identity, args.print_private, args.export, encoding);
-
-    // Save to file if specified
-    if let Some(ref path) = args.write {
-        if path.exists() && !args.force {
-            eprintln!("Error: File already exists: {:?}", path);
-            eprintln!("Use -f to overwrite");
-            return EXIT_GENERAL_ERROR;
-        }
-
-        match export_identity_to_file(&identity, path) {
-            Ok(_) => {
-                println!();
-                println!("Identity saved to {:?}", path);
-            }
-            Err(e) => {
-                eprintln!("Failed to save identity: {}", e);
-                return EXIT_GENERAL_ERROR;
-            }
-        }
-    } else {
-        println!();
-        println!("Note: Identity not saved. Use -w <file> to save.");
+    // Check if file exists
+    if path.exists() && !args.force {
+        eprintln!("Error: File already exists: {:?}", path);
+        eprintln!("Use -f to overwrite");
+        return EXIT_GENERAL_ERROR;
     }
 
-    EXIT_OK
+    // Generate identity
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+
+    // Save to file
+    match export_identity_to_file(&identity, path) {
+        Ok(_) => {
+            // Print Python-compatible output format: timestamp + message
+            let timestamp = chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]");
+            println!(
+                "{} New identity {} written to {}",
+                timestamp,
+                format_hash(identity.as_identity().address_hash.as_slice()),
+                path.display()
+            );
+
+            // If verbose or print flags are set, also show full details
+            if args.print_identity || args.verbose > 0 {
+                println!();
+                print_identity_info(&identity, args.print_private, false, encoding);
+            }
+
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("Failed to save identity: {}", e);
+            EXIT_GENERAL_ERROR
+        }
+    }
 }
 
 /// Import identity from encoded string
@@ -1160,8 +1165,7 @@ fn print_usage() {
     eprintln!("No action specified. Use --help for usage information.");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  rnid -g                       Generate new identity");
-    eprintln!("  rnid -g -w identity.dat       Generate and save to file");
+    eprintln!("  rnid -g identity.dat          Generate and save new identity");
     eprintln!("  rnid -i identity.dat -p       Print identity information");
     eprintln!("  rnid -i identity.dat -x       Export identity as hex");
     eprintln!("  rnid -i identity.dat -s file  Sign a file");

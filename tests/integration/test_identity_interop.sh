@@ -19,9 +19,9 @@ check_containers || start_containers
 # Test 1: Generate identity with Rust and read with Python
 info "Test 1: Rust identity -> Python verification"
 
-# Generate identity with Rust
-RUST_ID_OUTPUT=$(exec_rust rnid -g 2>&1)
-RUST_ADDRESS=$(echo "$RUST_ID_OUTPUT" | grep "Address Hash:" | sed 's/.*Address Hash:[[:space:]]*//' | tr -d '/' | tr -d ' ')
+# Generate identity with Rust (Python-compatible interface: -g requires file argument)
+RUST_ID_OUTPUT=$(exec_rust rnid -g /tmp/test_rust_identity.dat 2>&1)
+RUST_ADDRESS=$(echo "$RUST_ID_OUTPUT" | grep -oE '<[a-f0-9]{32}>' | tr -d '<>')
 
 if [ -n "$RUST_ADDRESS" ]; then
     success "Rust generated identity with address: /$RUST_ADDRESS/"
@@ -58,8 +58,8 @@ fi
 # Test 4: Create identity file and verify cross-platform reading
 info "Test 4: Identity file format compatibility"
 
-# Export Rust identity to file
-exec_rust sh -c 'rnid -g -e /tmp/test_identity.dat' 2>&1 || true
+# Export Rust identity to file (Python-compatible: -g saves to file)
+exec_rust rnid -g /tmp/test_identity.dat 2>&1 || true
 
 # Check if file was created
 if exec_rust test -f /tmp/test_identity.dat; then

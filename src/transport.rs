@@ -1608,15 +1608,26 @@ async fn handle_announce<'a>(
         let dest_hash = destination.identity.address_hash;
         let destination = Arc::new(Mutex::new(destination));
 
+        // Get hop count for logging
+        let hops = packet.header.hops;
+
+        // Determine interface name for logging
+        let iface_name = if from_local_client {
+            "LocalInterface[unix-client]"
+        } else {
+            "TCPInterface"
+        };
+
         if !destination_known {
             if !handler
                 .single_out_destinations
                 .contains_key(&packet.destination)
             {
-                log::trace!(
-                    "tp({}): new announce for {}",
-                    handler.config.name,
-                    packet.destination
+                log::debug!(
+                    "Valid announce for {} {} hops away, received on {}",
+                    packet.destination,
+                    hops,
+                    iface_name
                 );
 
                 handler
@@ -1648,6 +1659,11 @@ async fn handle_announce<'a>(
                 &dest_hash,
                 &transport_id,
             ) {
+                log::debug!(
+                    "Rebroadcasting announce for {} with hop count {}",
+                    packet.destination,
+                    packet.header.hops
+                );
                 handler.send(TxMessage {
                     tx_type: TxMessageType::Broadcast(Some(recv_from)),
                     packet

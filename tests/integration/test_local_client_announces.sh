@@ -56,11 +56,11 @@ EOFPY
 '
 
 info "Test 2: Get initial Python hub announce count..."
-PYTHON_BEFORE=$(docker logs reticulum-python-hub 2>&1 | grep -c "announce" || echo "0")
+PYTHON_BEFORE=$(docker logs reticulum-python-hub 2>&1 | grep -c "announce" | tr -d '\n' || echo "0")
 info "Python hub announce count before: $PYTHON_BEFORE"
 
 info "Test 3: Get initial Rust node announce count..."
-RUST_BEFORE=$(docker logs reticulum-rust-node 2>&1 | grep -c "announce" || echo "0")
+RUST_BEFORE=$(docker logs reticulum-rust-node 2>&1 | grep -c "announce" | tr -d '\n' || echo "0")
 info "Rust node announce count before: $RUST_BEFORE"
 
 info "Test 4: Run announce from Python local client..."
@@ -77,7 +77,7 @@ fi
 sleep 3
 
 info "Test 5: Check Python hub logs for announce..."
-PYTHON_AFTER=$(docker logs reticulum-python-hub 2>&1 | grep -c "announce" || echo "0")
+PYTHON_AFTER=$(docker logs reticulum-python-hub 2>&1 | grep -c "announce" | tr -d '\n' || echo "0")
 info "Python hub announce count after: $PYTHON_AFTER"
 
 if [ "$PYTHON_AFTER" -gt "$PYTHON_BEFORE" ]; then
@@ -87,7 +87,7 @@ else
 fi
 
 info "Test 6: Check Rust node logs for forwarded announce..."
-RUST_AFTER=$(docker logs reticulum-rust-node 2>&1 | grep -c "announce" || echo "0")
+RUST_AFTER=$(docker logs reticulum-rust-node 2>&1 | grep -c "announce" | tr -d '\n' || echo "0")
 info "Rust node announce count after: $RUST_AFTER"
 
 docker logs reticulum-rust-node 2>&1 | tail -50
@@ -101,21 +101,29 @@ fi
 # Now test the reverse - announce from Rust local client
 info "Test 7: Create test destination in Rust container..."
 
-# Use test_destination binary
-exec_rust test_destination --app test --aspect rustannounce --announce 2>&1 | tee /tmp/rust_announce.txt
+# Use test_destination binary with --shared flag to connect to rnsd via Unix socket (announces once and exits)
+RUST_ANNOUNCE_OUTPUT=$(exec_rust test_destination --shared --app-name test --aspect rustannounce -n 1 2>&1 | tee /tmp/rust_announce.txt)
+
+# Extract the destination hash from the output
+RUST_DEST_HASH=$(echo "$RUST_ANNOUNCE_OUTPUT" | grep "DESTINATION_HASH=" | sed 's/DESTINATION_HASH=//')
+
+if [ -z "$RUST_DEST_HASH" ]; then
+    fail "Failed to extract destination hash from Rust announce"
+fi
+
+info "Rust announced destination: /$RUST_DEST_HASH/"
 
 sleep 3
 
 info "Test 8: Check if Rust announce was forwarded to Python..."
-PYTHON_FINAL=$(docker logs reticulum-python-hub 2>&1 | grep -c "announce" || echo "0")
-info "Python hub final announce count: $PYTHON_FINAL"
-
-docker logs reticulum-python-hub 2>&1 | tail -50
-
-if [ "$PYTHON_FINAL" -gt "$PYTHON_AFTER" ]; then
+# Check if Python hub has the destination in its path table
+if exec_python rnpath -t 2>&1 | grep -q "$RUST_DEST_HASH"; then
     success "Python hub received announce from Rust local client!"
+    exec_python rnpath -t 2>&1 | grep "$RUST_DEST_HASH"
 else
     fail "Python hub did NOT receive announce from Rust local client"
+    info "Python hub path table:"
+    exec_python rnpath -t 2>&1 | tail -10
 fi
 
 print_summary

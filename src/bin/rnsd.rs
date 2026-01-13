@@ -78,19 +78,20 @@ fn main() {
         return;
     }
 
-    // Determine log level from verbosity flags
-    let log_level = if args.quiet {
-        LogLevel::Critical
-    } else {
-        match args.verbose {
-            0 => LogLevel::Info,
+    // Determine log level from verbosity flags or use a default for initial logging
+    let cli_log_level = if args.quiet {
+        Some(LogLevel::Critical)
+    } else if args.verbose > 0 {
+        Some(match args.verbose {
             1 => LogLevel::Debug,
             _ => LogLevel::Verbose,
-        }
+        })
+    } else {
+        None // Will use config file loglevel
     };
 
-    // Initialize logging
-    logging::init_with_level(log_level);
+    // Initialize logging with default level for startup messages
+    logging::init_with_level(cli_log_level.unwrap_or(LogLevel::Info));
 
     log::info!("Reticulum Network Stack Daemon starting...");
 
@@ -105,6 +106,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Update log level from config if no CLI override was specified
+    let final_log_level = cli_log_level.unwrap_or(config.log_level);
+    logging::init_with_level(final_log_level);
+    log::debug!("Log level set to: {:?}", final_log_level);
 
     log::debug!("Configuration loaded: transport={}, share_instance={}",
         config.enable_transport, config.share_instance);
