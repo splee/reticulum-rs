@@ -19,11 +19,11 @@ services:
     networks:
       - hub-relay-net
     ports:
-      - "4242:4242"
+      - "14242:14242"
     volumes:
       - python-data:/root/.reticulum
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.connect(('127.0.0.1', 4242)); s.close()"]
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.connect(('127.0.0.1', 14242)); s.close()"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -39,7 +39,7 @@ services:
       - hub-relay-net
       - relay-endpoint-net
     ports:
-      - "4243:4243"
+      - "14243:14243"
     volumes:
       - relay-data:/root/.reticulum
       - ./configs/rust-relay.conf:/root/.reticulum/config:ro
@@ -47,7 +47,7 @@ services:
       python-hub:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 4243 || exit 1"]
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 14243 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -62,7 +62,7 @@ services:
     networks:
       - relay-endpoint-net  # Only connected to relay, not hub
     ports:
-      - "4244:4244"
+      - "14244:14244"
     volumes:
       - endpoint-data:/root/.reticulum
       - ./configs/rust-endpoint.conf:/root/.reticulum/config:ro
@@ -70,7 +70,7 @@ services:
       rust-relay:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 4244 || exit 1"]
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 14244 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10

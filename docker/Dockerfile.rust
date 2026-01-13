@@ -49,7 +49,7 @@ RUN mkdir -p /root/.reticulum
 COPY docker/configs/rust-node.conf /root/.reticulum/config
 
 # Expose TCP interface port
-EXPOSE 4243
+EXPOSE 14243
 
 # Default command - run the daemon
 CMD ["rnsd", "-v"]

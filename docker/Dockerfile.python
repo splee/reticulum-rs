@@ -30,7 +30,7 @@ COPY reticulum-rust/docker/configs/python-hub.conf /root/.reticulum/config
 COPY reticulum-rust/tests/integration/helpers /app/helpers
 
 # Expose TCP interface port
-EXPOSE 4242
+EXPOSE 14242
 
 # Default command - run the daemon with verbose logging
 CMD ["rnsd", "-vvv"]
