@@ -1,7 +1,50 @@
+# Cache and OS files
 .cache
 **/.DS_Store
 
+# Rust build artifacts
 /target
+debug/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+flycheck*/
 
+# IDE and editor files
 .vscode
+.idea/
+*.swp
+*.swo
+*~
+.*.un~
 
+# Reticulum runtime data (contains cryptographic keys)
+.reticulum/
+storage/
+identities/
+*.reticulum
+
+# Sensitive files
+.env*
+!.env.example
+*.pem
+*.key
+credentials.*
+secrets.*
+*.p12
+*.pfx
+*.jks
+id_rsa*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.backup
+*.old
+*.orig
+
+# Python artifacts (from test helpers)
+__pycache__/
+*.pyc
+.pytest_cache/
