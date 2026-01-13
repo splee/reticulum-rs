@@ -78,7 +78,8 @@ chmod +x "$SCRIPT_DIR"/*.sh
 # Run tests
 run_test "Connectivity Test" "$SCRIPT_DIR/test_connectivity.sh"
 run_test "Identity Interop Test" "$SCRIPT_DIR/test_identity_interop.sh"
-run_test "Announce Test" "$SCRIPT_DIR/test_announce.sh"
+run_test "Local Client Announces (Native)" "$SCRIPT_DIR/test_local_client_announces.sh"
+run_test "Python Client via Rust Hub" "$SCRIPT_DIR/test_python_client_via_rust_hub.sh"
 run_test "Link Test" "$SCRIPT_DIR/test_link.sh"
 run_test "Link Data Test" "$SCRIPT_DIR/test_link_data.sh"
 run_test "Resource Test" "$SCRIPT_DIR/test_resource.sh"
