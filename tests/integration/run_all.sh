@@ -2,8 +2,10 @@
 # Run all integration tests for Python-Rust Reticulum interoperability
 #
 # Usage:
-#   ./tests/integration/run_all.sh          # Run all tests
-#   ./tests/integration/run_all.sh --keep   # Keep containers running after tests
+#   ./tests/integration/run_all.sh                    # Run all tests
+#   ./tests/integration/run_all.sh --keep             # Keep containers running after tests
+#   ./tests/integration/run_all.sh --fail-fast        # Stop on first test failure
+#   ./tests/integration/run_all.sh --fail-fast --keep # Combine flags
 
 set -e
 
@@ -18,6 +20,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 KEEP_CONTAINERS=false
+FAIL_FAST=false
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 
@@ -28,8 +31,13 @@ while [[ $# -gt 0 ]]; do
             KEEP_CONTAINERS=true
             shift
             ;;
+        --fail-fast)
+            FAIL_FAST=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
+            echo "Usage: $0 [--keep] [--fail-fast]"
             exit 1
             ;;
     esac
@@ -61,7 +69,9 @@ sleep 10
 
 # Check container status
 echo -e "${YELLOW}Container status:${NC}"
+cd "$DOCKER_DIR"
 docker compose ps
+cd - > /dev/null
 
 # Run each test
 run_test() {
@@ -78,6 +88,34 @@ run_test() {
     else
         ((TOTAL_FAILED++))
         echo -e "${RED}$test_name: FAILED${NC}"
+
+        if [ "$FAIL_FAST" = true ]; then
+            echo ""
+            echo -e "${RED}Stopping due to --fail-fast flag${NC}"
+
+            # Show container logs immediately
+            echo ""
+            echo -e "${YELLOW}Container logs (last 30 lines each):${NC}"
+            echo ""
+            echo "=== Python Hub ==="
+            docker logs reticulum-python-hub 2>&1 | tail -30
+            echo ""
+            echo "=== Rust Node ==="
+            docker logs reticulum-rust-node 2>&1 | tail -30
+
+            # Cleanup and exit
+            if [ "$KEEP_CONTAINERS" = false ]; then
+                echo ""
+                echo -e "${YELLOW}Stopping containers...${NC}"
+                cd "$DOCKER_DIR"
+                docker compose down
+                cd - > /dev/null
+            else
+                echo ""
+                echo -e "${YELLOW}Containers kept running (use 'docker compose down' to stop)${NC}"
+            fi
+            exit 1
+        fi
     fi
 }
 
@@ -123,7 +161,9 @@ fi
 if [ "$KEEP_CONTAINERS" = false ]; then
     echo ""
     echo -e "${YELLOW}Stopping containers...${NC}"
+    cd "$DOCKER_DIR"
     docker compose down
+    cd - > /dev/null
 else
     echo ""
     echo -e "${YELLOW}Containers kept running (use 'docker compose down' to stop)${NC}"

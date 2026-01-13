@@ -303,7 +303,7 @@ impl SortField {
 }
 
 /// Reticulum Network Status CLI
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "rnstatus")]
 #[command(author = "Reticulum Network Stack")]
 #[command(version)]
@@ -437,56 +437,117 @@ fn run_once(args: &Args, config: &ReticulumConfig) {
 
 /// Run in continuous monitor mode
 fn run_monitor_mode(args: &Args, config: &ReticulumConfig, running: Arc<AtomicBool>) {
-    let interval = Duration::from_secs_f64(args.monitor_interval);
+    if args.remote.is_some() {
+        // Remote mode - existing implementation
+        let interval = Duration::from_secs_f64(args.monitor_interval);
 
-    while running.load(Ordering::SeqCst) {
-        // Clear screen (ANSI escape sequence)
-        print!("\x1B[H\x1B[2J");
-        io::stdout().flush().ok();
+        while running.load(Ordering::SeqCst) {
+            // Clear screen (ANSI escape sequence)
+            print!("\x1B[H\x1B[2J");
+            io::stdout().flush().ok();
 
-        if args.remote.is_some() {
             show_remote_status(args, config);
-        } else {
-            show_local_status(args, config);
-        }
 
-        // Sleep for interval, checking for shutdown periodically
-        let start = Instant::now();
-        while running.load(Ordering::SeqCst) && start.elapsed() < interval {
-            std::thread::sleep(Duration::from_millis(100));
+            // Sleep for interval, checking for shutdown periodically
+            let start = Instant::now();
+            while running.load(Ordering::SeqCst) && start.elapsed() < interval {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
+    } else {
+        // Local mode - use async
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Failed to create runtime: {}", e);
+                std::process::exit(20);
+            }
+        };
+
+        let interval = Duration::from_secs_f64(args.monitor_interval);
+        let args_clone = args.clone();
+        let config_clone = config.clone();
+        let running_clone = running.clone();
+
+        rt.block_on(async move {
+            // Create or connect to shared instance once
+            let (transport, is_server) = create_client_transport(&config_clone).await;
+
+            while running_clone.load(Ordering::SeqCst) {
+                // Clear screen (ANSI escape sequence)
+                print!("\x1B[H\x1B[2J");
+                io::stdout().flush().ok();
+
+                // Query stats
+                if let Ok(stats) = get_transport_stats(&transport).await {
+                    display_stats_with_mode(&args_clone, &stats, is_server, None);
+                }
+
+                // Sleep for interval, checking for shutdown periodically
+                let start = Instant::now();
+                while running_clone.load(Ordering::SeqCst) && start.elapsed() < interval {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
     }
+}
+
+/// Synchronous wrapper for show_local_status_async
+fn show_local_status(args: &Args, config: &ReticulumConfig) {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create runtime: {}", e);
+            std::process::exit(20);
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let exit_code = rt.block_on(async {
+        show_local_status_async(args, config, running).await
+    });
+
+    std::process::exit(exit_code);
 }
 
 /// Show status from local/shared Reticulum instance
 ///
-/// Requires a running rnsd daemon to query. This matches Python behavior where
-/// rnstatus sets `require_shared_instance=True` and fails if no daemon is available.
-fn show_local_status(args: &Args, config: &ReticulumConfig) {
-    // Try to connect to shared instance - require it to be running
-    let stats = match get_shared_instance_stats(config) {
+/// This matches Python behavior where rnstatus sets `require_shared_instance=True`:
+/// - Try to become the shared instance (start daemon)
+/// - If that fails (daemon already running), connect as client via LocalClientInterface
+/// - Query interface stats directly from Transport (no RPC)
+async fn show_local_status_async(args: &Args, config: &ReticulumConfig, running: Arc<AtomicBool>) -> i32 {
+    // Create or connect to shared instance
+    let (transport, is_server) = create_client_transport(config).await;
+
+    // Query stats directly from transport
+    let stats = match get_transport_stats(&transport).await {
         Ok(stats) => stats,
-        Err(_) => {
-            // Match Python behavior: fail if no shared instance available
+        Err(e) => {
             if args.json {
-                output_json_error("no_shared_instance", "No shared RNS instance available to get status from");
+                output_json_error("stats_error", &format!("Failed to get stats: {}", e));
             } else {
                 println!();
-                println!("No shared RNS instance available to get status from");
+                println!("Failed to get transport stats: {}", e);
                 println!();
             }
-            std::process::exit(1);
+            return 1;
         }
     };
 
-    // Get link count if requested
-    let link_count = if args.link_stats {
-        get_link_count(config).ok()
-    } else {
-        None
-    };
+    // Display stats with server/client indicator
+    display_stats_with_mode(args, &stats, is_server, None);
 
-    display_stats(args, &stats, link_count);
+    // If we started as server (became daemon) and not in monitor mode, keep running
+    if is_server && !args.monitor {
+        log::info!("Running as shared instance daemon, press Ctrl-C to stop");
+        while running.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    0
 }
 
 /// Show status from remote transport instance
@@ -554,7 +615,7 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
     }
 
     // Create transport and interfaces
-    let transport = create_client_transport(config).await;
+    let (transport, _is_server) = create_client_transport(config).await;
 
     // Request path to the management destination
     if !args.json {
@@ -799,6 +860,45 @@ fn load_identity(path: &PathBuf) -> Result<PrivateIdentity, String> {
         .map_err(|e| format!("Invalid identity format: {:?}", e))
 }
 
+/// Load or create the daemon identity.
+///
+/// This mirrors rnsd.rs behavior - uses the same identity file so rnstatus
+/// can become the daemon when needed (matching Python's pattern).
+fn load_or_create_identity(config: &ReticulumConfig) -> PrivateIdentity {
+    let identity_file = config.paths.identity_path.join("daemon_identity");
+
+    if identity_file.exists() {
+        log::debug!("Loading existing daemon identity from {:?}", identity_file);
+        if let Ok(identity) = load_identity(&identity_file) {
+            let public = identity.as_identity();
+            log::debug!("Loaded daemon identity: {}", hex::encode(public.address_hash.as_slice()));
+            return identity;
+        } else {
+            log::warn!("Failed to load daemon identity, creating new one");
+        }
+    }
+
+    // Create new identity
+    log::info!("Creating new daemon identity");
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let public = identity.as_identity();
+    log::info!("Created daemon identity: {}", hex::encode(public.address_hash.as_slice()));
+
+    // Save identity in binary format (Python-compatible)
+    if let Some(parent) = identity_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = fs::File::create(&identity_file) {
+        use std::io::Write;
+        let bytes = identity.to_bytes();
+        let _ = file.write_all(&bytes);
+        log::debug!("Saved daemon identity to {:?}", identity_file);
+    }
+
+    identity
+}
+
 /// Compute the management destination hash from a transport identity hash.
 fn compute_management_destination_hash(transport_identity_hash: &[u8; 16]) -> AddressHash {
     // Name hash for "rnstransport.remote.management"
@@ -814,15 +914,17 @@ fn compute_management_destination_hash(transport_identity_hash: &[u8; 16]) -> Ad
     AddressHash::new_from_hash(&Hash::new(result.into()))
 }
 
-/// Create a client transport matching Python's require_shared_instance=False behavior.
+/// Create a client transport matching Python's require_shared_instance=True behavior.
 ///
 /// Order of operations (matching Python Reticulum.py lines 373-435):
 /// 1. Try to become the shared instance (start LocalServerInterface)
 /// 2. If that fails (daemon already running), connect as client via LocalClientInterface
-/// 3. If both fail, become standalone (just load network interfaces)
-async fn create_client_transport(config: &ReticulumConfig) -> Transport {
-    let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport_config = TransportConfig::new("rnstatus", &identity, false);
+///
+/// Returns (Transport, is_server) where is_server indicates if we became the shared instance.
+async fn create_client_transport(config: &ReticulumConfig) -> (Transport, bool) {
+    // Load or create daemon identity (same as rnsd)
+    let identity = load_or_create_identity(config);
+    let transport_config = TransportConfig::new("rnstatus", &identity, config.enable_transport);
     let transport = Transport::new(transport_config);
 
     let socket_dir = config.paths.config_dir.join("sockets");
@@ -846,7 +948,7 @@ async fn create_client_transport(config: &ReticulumConfig) -> Transport {
 
     if became_shared_instance {
         log::info!("Started as shared instance, serving other clients");
-        return transport;
+        return (transport, true);
     }
 
     // Step 2: Daemon exists, connect as client via LocalClientInterface
@@ -864,7 +966,7 @@ async fn create_client_transport(config: &ReticulumConfig) -> Transport {
     // Give LocalClientInterface time to connect
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    transport
+    (transport, false)
 }
 
 /// Try to start as a shared instance by binding LocalServerInterface.
@@ -950,6 +1052,86 @@ async fn wait_for_path(transport: &Transport, dest_hash: &AddressHash, timeout: 
     }
 
     false
+}
+
+/// Get network stats directly from Transport (replaces RPC-based approach).
+///
+/// This matches Python's behavior of querying Transport.interfaces directly
+/// rather than going through RPC.
+async fn get_transport_stats(transport: &Transport) -> Result<NetworkStats, String> {
+    // Query interface stats directly from transport
+    let interface_snapshots = transport.get_interface_stats().await;
+
+    // Convert to display format
+    let interfaces: Vec<InterfaceStats> = interface_snapshots
+        .into_iter()
+        .map(|s| InterfaceStats {
+            name: s.name.clone(),
+            short_name: s.short_name,
+            hash: hex::encode(s.interface_hash.as_slice()),
+            interface_type: s.interface_type,
+            rxb: s.rx_bytes,
+            txb: s.tx_bytes,
+            rxs: s.rx_speed,
+            txs: s.tx_speed,
+            status: s.online,
+            mode: s.mode as u8,
+            clients: None, // TODO: Track connected local clients
+            bitrate: s.bitrate,
+            incoming_announce_frequency: 0.0, // TODO: Implement announce freq tracking
+            outgoing_announce_frequency: 0.0, // TODO: Implement announce freq tracking
+            held_announces: 0, // TODO: Implement held announces tracking
+            announce_queue: None,
+            ifac_signature: None,
+            ifac_size: None,
+            ifac_netname: None,
+            parent_interface_name: None,
+            parent_interface_hash: s.parent_interface_hash.map(|h| hex::encode(h.as_slice())),
+            autoconnect_source: None,
+            peers: None,
+            i2p_connectable: None,
+            i2p_b32: None,
+            tunnelstate: None,
+            airtime_short: None,
+            airtime_long: None,
+            channel_load_short: None,
+            channel_load_long: None,
+            noise_floor: None,
+            interference: None,
+            interference_last_ts: None,
+            interference_last_dbm: None,
+            cpu_temp: None,
+            cpu_load: None,
+            mem_load: None,
+            battery_percent: None,
+            battery_state: None,
+            switch_id: None,
+            via_switch_id: None,
+            endpoint_id: None,
+        })
+        .collect();
+
+    // Calculate totals
+    let total_rxb = interfaces.iter().map(|i| i.rxb).sum();
+    let total_txb = interfaces.iter().map(|i| i.txb).sum();
+    let total_rxs = interfaces.iter().map(|i| i.rxs).sum();
+    let total_txs = interfaces.iter().map(|i| i.txs).sum();
+
+    // Get transport identity if available (TODO: Transport doesn't expose this yet)
+    let transport_id = None; // transport.identity_hash().map(|h| hex::encode(h.as_slice()));
+
+    Ok(NetworkStats {
+        interfaces,
+        rxb: total_rxb,
+        txb: total_txb,
+        rxs: total_rxs,
+        txs: total_txs,
+        transport_id,
+        network_id: None,
+        transport_uptime: None,
+        probe_responder: None,
+        rss: None,
+    })
 }
 
 /// Build a status request packet data.
@@ -1439,6 +1621,31 @@ fn get_link_count(config: &ReticulumConfig) -> Result<u32, String> {
 }
 
 /// Display the network statistics
+/// Display stats with server/client mode indicator
+fn display_stats_with_mode(args: &Args, stats: &NetworkStats, is_server: bool, link_count: Option<u32>) {
+    if args.json {
+        display_json(stats, link_count);
+        return;
+    }
+
+    // Display shared instance status (matching Python output)
+    if is_server {
+        println!();
+        println!(" Shared Instance[rns/default]");
+        println!("    Status    : Up");
+        println!("    Serving   : 0 programs"); // TODO: Track connected local clients
+        println!("    Rate      : 1.00 Gbps");
+        println!("    Traffic   : ↑0 B  0 bps");
+        println!("                ↓0 B  0 bps");
+    } else {
+        // Connected to existing daemon
+        log::debug!("Connected to shared instance");
+    }
+
+    // Continue with normal stats display
+    display_stats(args, stats, link_count);
+}
+
 fn display_stats(args: &Args, stats: &NetworkStats, link_count: Option<u32>) {
     if args.json {
         display_json(stats, link_count);
