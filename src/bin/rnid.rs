@@ -45,7 +45,9 @@ const EPHEMERAL_KEY_SIZE: usize = 32;
 // Exit codes matching Python implementation
 const EXIT_OK: i32 = 0;
 const EXIT_GENERAL_ERROR: i32 = 1;
+#[allow(dead_code)]
 const EXIT_IDENTITY_NOT_FOUND: i32 = 5;
+#[allow(dead_code)]
 const EXIT_IDENTITY_REQUEST_TIMEOUT: i32 = 6;
 const EXIT_SIGNING_NO_PRIVATE_KEY: i32 = 16;
 const EXIT_SIGNING_READ_ERROR: i32 = 17;
@@ -301,6 +303,7 @@ fn needs_identity(args: &Args) -> bool {
         || args.announce.is_some()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum IdentityType {
     Private(PrivateIdentity),
     Public(Identity),

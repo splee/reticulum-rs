@@ -8,7 +8,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -47,7 +47,7 @@ impl ListenerAddr {
     /// - Linux: Abstract socket `\0rns/{instance_name}`
     /// - macOS/BSD: Filesystem socket `{socket_dir}/{instance_name}.sock`
     /// - Windows: TCP `127.0.0.1:{port}`
-    pub fn default_transport(instance_name: &str, socket_dir: &PathBuf, port: u16) -> Self {
+    pub fn default_transport(instance_name: &str, socket_dir: &Path, port: u16) -> Self {
         #[cfg(target_os = "linux")]
         {
             let _ = socket_dir; // unused on Linux
@@ -75,7 +75,7 @@ impl ListenerAddr {
     /// - Linux: Abstract socket `\0rns/{instance_name}/rpc`
     /// - macOS/BSD: Filesystem socket `{socket_dir}/{instance_name}_rpc.sock`
     /// - Windows: TCP `127.0.0.1:{port}`
-    pub fn default_rpc(instance_name: &str, socket_dir: &PathBuf, port: u16) -> Self {
+    pub fn default_rpc(instance_name: &str, socket_dir: &Path, port: u16) -> Self {
         #[cfg(target_os = "linux")]
         {
             let _ = socket_dir;

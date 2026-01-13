@@ -310,7 +310,7 @@ impl AutoInterface {
                 sha2::Sha256::digest(group_id.as_bytes()).into()
             );
 
-            if &data[21..29] != &expected_group_hash.as_bytes()[..8] {
+            if data[21..29] != expected_group_hash.as_bytes()[..8] {
                 return None;
             }
         }

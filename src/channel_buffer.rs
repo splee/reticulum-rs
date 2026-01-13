@@ -297,7 +297,7 @@ impl RawChannelWriter {
 
         self.eof = true;
         self.send_chunk(&[], true, false)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+            .map_err(|e| io::Error::other(format!("{:?}", e)))
     }
 }
 
@@ -344,7 +344,7 @@ impl Write for RawChannelWriter {
                 if matches!(e, RnsError::ConnectionError) {
                     io::Error::new(io::ErrorKind::WouldBlock, "channel not ready")
                 } else {
-                    io::Error::new(io::ErrorKind::Other, format!("{:?}", e))
+                    io::Error::other(format!("{:?}", e))
                 }
             })?;
 

@@ -82,31 +82,25 @@ impl SerialConfig {
 
 /// Parity setting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Parity {
+    #[default]
     None,
     Odd,
     Even,
 }
 
-impl Default for Parity {
-    fn default() -> Self {
-        Parity::None
-    }
-}
 
 /// Flow control setting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum FlowControl {
+    #[default]
     None,
     Hardware,
     Software,
 }
 
-impl Default for FlowControl {
-    fn default() -> Self {
-        FlowControl::None
-    }
-}
 
 /// Serial interface state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

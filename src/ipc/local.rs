@@ -285,16 +285,16 @@ impl LocalClientInterface {
                                     }
                                     Ok(n) => {
                                         // Process bytes, looking for HDLC frames
-                                        for i in 0..n {
+                                        for &byte in read_buffer.iter().take(n) {
                                             // Push byte to end of buffer
-                                            rx_buffer[BUFFER_SIZE - 1] = read_buffer[i];
+                                            rx_buffer[BUFFER_SIZE - 1] = byte;
 
                                             // Check for complete HDLC frame
                                             if let Some(frame) = Hdlc::find(&rx_buffer[..]) {
                                                 let frame_buffer = &mut rx_buffer[frame.0..frame.1 + 1];
                                                 let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
 
-                                                if let Ok(_) = Hdlc::decode(frame_buffer, &mut output) {
+                                                if Hdlc::decode(frame_buffer, &mut output).is_ok() {
                                                     if let Ok(packet) = Packet::deserialize(
                                                         &mut InputBuffer::new(output.as_slice())
                                                     ) {
@@ -369,10 +369,10 @@ impl LocalClientInterface {
                                 }
 
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
-                                if let Ok(_) = packet.serialize(&mut output) {
+                                if packet.serialize(&mut output).is_ok() {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
-                                    if let Ok(_) = Hdlc::encode(output.as_slice(), &mut hdlc_output) {
+                                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
                                         if let Err(e) = writer.write_all(hdlc_output.as_slice()).await {
                                             log::warn!("local_client: write error to <{}>: {}", peer_addr, e);
                                             stop.cancel();

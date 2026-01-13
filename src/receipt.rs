@@ -26,10 +26,12 @@ pub const TIMEOUT_PER_HOP: f64 = 6.0;
 /// Receipt status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum ReceiptStatus {
     /// Packet delivery failed
     Failed = 0x00,
     /// Packet was sent but not yet confirmed
+    #[default]
     Sent = 0x01,
     /// Packet delivery was confirmed via proof
     Delivered = 0x02,
@@ -37,13 +39,10 @@ pub enum ReceiptStatus {
     Culled = 0xFF,
 }
 
-impl Default for ReceiptStatus {
-    fn default() -> Self {
-        ReceiptStatus::Sent
-    }
-}
 
 /// Callbacks for packet receipt events
+#[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct ReceiptCallbacks {
     /// Called when delivery is confirmed
     pub delivery: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
@@ -51,14 +50,6 @@ pub struct ReceiptCallbacks {
     pub timeout: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
 }
 
-impl Default for ReceiptCallbacks {
-    fn default() -> Self {
-        Self {
-            delivery: None,
-            timeout: None,
-        }
-    }
-}
 
 impl std::fmt::Debug for ReceiptCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,6 +95,7 @@ pub struct PacketReceipt {
     /// When the packet was sent
     sent_at: Instant,
     /// Unix timestamp when sent
+    #[allow(dead_code)]
     sent_timestamp: f64,
     /// Whether delivery has been proved
     proved: bool,

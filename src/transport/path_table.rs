@@ -39,6 +39,7 @@ pub struct PathInfo {
 pub struct PathTable {
     map: HashMap<AddressHash, PathEntry>,
     /// Track when each entry was created for expiration
+    #[allow(dead_code)]
     created_at: Instant,
 }
 

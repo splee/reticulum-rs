@@ -78,8 +78,10 @@ pub enum ChannelErrorType {
 /// Message state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum MessageState {
     /// New message, not yet sent
+    #[default]
     New = 0,
     /// Message has been sent
     Sent = 1,
@@ -89,11 +91,6 @@ pub enum MessageState {
     Failed = 3,
 }
 
-impl Default for MessageState {
-    fn default() -> Self {
-        MessageState::New
-    }
-}
 
 /// Trait for messages that can be sent over a channel.
 ///

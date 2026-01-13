@@ -150,13 +150,13 @@ impl InterfaceManager {
 
         let inner = Arc::new(Mutex::new(inner));
 
-        let context = InterfaceContext::<T> {
+        
+
+        InterfaceContext::<T> {
             inner: inner.clone(),
             channel,
             cancel: self.cancel.clone(),
-        };
-
-        context
+        }
     }
 
     pub fn spawn<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
@@ -166,7 +166,7 @@ impl InterfaceManager {
         R::Output: Send + 'static,
     {
         let context = self.new_context(inner);
-        let address = context.channel.address().clone();
+        let address = *context.channel.address();
 
         task::spawn(worker(context));
 
@@ -197,7 +197,7 @@ impl InterfaceManager {
             };
 
             if should_send && !iface.stop.is_cancelled() {
-                let _ = iface.tx_send.send(message.clone()).await;
+                let _ = iface.tx_send.send(message).await;
                 sent = true;
             }
         }

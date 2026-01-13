@@ -276,7 +276,7 @@ async fn handle_link_event(
                     println!(
                         "RESOURCE_ADVERTISEMENT={}:{}:{}:{}:{}",
                         link_id_hex,
-                        hex::encode(&adv.hash),
+                        hex::encode(adv.hash),
                         adv.data_size,
                         adv.transfer_size,
                         adv.num_parts
@@ -309,14 +309,14 @@ async fn handle_link_event(
                                 log::info!(
                                     "Sending resource request ({} bytes) for hash {}",
                                     request_data.len(),
-                                    hex::encode(&truncated_hash)
+                                    hex::encode(truncated_hash)
                                 );
 
                                 if transport.send_resource_request(&link_id, &request_data).await {
                                     println!(
                                         "RESOURCE_REQUEST_SENT={}:{}",
                                         link_id_hex,
-                                        hex::encode(&truncated_hash)
+                                        hex::encode(truncated_hash)
                                     );
 
                                     // Store the resource for tracking
@@ -408,16 +408,7 @@ async fn handle_link_event(
                     let mut resource = tracked.resource;
 
                     // Get raw assembled data
-                    let raw_data_opt = resource.get_raw_assembled_data();
-                    if raw_data_opt.is_none() {
-                        log::error!("Failed to get raw assembled data for resource {}", hex::encode(&hash));
-                        println!(
-                            "RESOURCE_ASSEMBLY_ERROR={}:{}:NoRawData",
-                            link_id_hex,
-                            hex::encode(&hash)
-                        );
-                    } else {
-                        let raw_data = raw_data_opt.unwrap();
+                    if let Some(raw_data) = resource.get_raw_assembled_data() {
                         let raw_data_len = raw_data.len();
 
                         // Decrypt the assembled data using the link's key
@@ -439,13 +430,13 @@ async fn handle_link_event(
                                     Ok(data) => {
                                         log::info!(
                                             "Resource {} complete! Received {} bytes",
-                                            hex::encode(&hash),
+                                            hex::encode(hash),
                                             data.len()
                                         );
                                         println!(
                                             "RESOURCE_COMPLETE={}:{}:{}",
                                             link_id_hex,
-                                            hex::encode(&hash),
+                                            hex::encode(hash),
                                             data.len()
                                         );
 
@@ -456,32 +447,39 @@ async fn handle_link_event(
                                             println!(
                                                 "RESOURCE_PROOF_SENT={}:{}",
                                                 link_id_hex,
-                                                hex::encode(&hash)
+                                                hex::encode(hash)
                                             );
                                         }
                                         return true;
                                     }
                                     Err(e) => {
-                                        log::error!("Failed to assemble resource {}: {:?}", hex::encode(&hash), e);
+                                        log::error!("Failed to assemble resource {}: {:?}", hex::encode(hash), e);
                                         println!(
                                             "RESOURCE_ASSEMBLY_ERROR={}:{}:{:?}",
                                             link_id_hex,
-                                            hex::encode(&hash),
+                                            hex::encode(hash),
                                             e
                                         );
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::error!("Failed to decrypt resource {}: {:?}", hex::encode(&hash), e);
+                                log::error!("Failed to decrypt resource {}: {:?}", hex::encode(hash), e);
                                 println!(
                                     "RESOURCE_ASSEMBLY_ERROR={}:{}:DecryptFailed:{:?}",
                                     link_id_hex,
-                                    hex::encode(&hash),
+                                    hex::encode(hash),
                                     e
                                 );
                             }
                         }
+                    } else {
+                        log::error!("Failed to get raw assembled data for resource {}", hex::encode(hash));
+                        println!(
+                            "RESOURCE_ASSEMBLY_ERROR={}:{}:NoRawData",
+                            link_id_hex,
+                            hex::encode(hash)
+                        );
                     }
                 }
             }
@@ -490,7 +488,7 @@ async fn handle_link_event(
             if let Some((hash, request_data)) = needs_more_request {
                 log::debug!(
                     "Requesting more parts for resource {}",
-                    hex::encode(&hash)
+                    hex::encode(hash)
                 );
                 transport.send_resource_request(&link_id, &request_data).await;
             }
@@ -520,7 +518,7 @@ async fn handle_link_event(
                 println!(
                     "RESOURCE_HASHMAP_UPDATED={}:{}:{}",
                     link_id_hex,
-                    hex::encode(&resource_hash),
+                    hex::encode(resource_hash),
                     hashmap_data.len()
                 );
 

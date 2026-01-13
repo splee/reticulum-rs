@@ -113,6 +113,7 @@ pub enum PathRequestState {
 }
 
 /// A pending path request
+#[allow(clippy::type_complexity)]
 pub struct PathRequest {
     /// Destination hash being requested
     pub destination: AddressHash,
@@ -236,9 +237,8 @@ impl PathRequestManager {
     /// This is the PLAIN destination "rnstransport.path.request" that all
     /// nodes listen on for incoming path requests.
     pub fn path_request_destination_hash() -> AddressHash {
-        PlainDestination::new("rnstransport", "path.request")
+        *PlainDestination::new("rnstransport", "path.request")
             .address_hash()
-            .clone()
     }
 
     /// Build path request packet data.
@@ -381,12 +381,12 @@ impl PathRequestManager {
         }
 
         // Create request
-        let mut request = PathRequest::new(destination.clone(), true);
+        let mut request = PathRequest::new(destination, true);
         if let Some(cb) = callback {
             request.callback = Some(cb);
         }
 
-        requests.insert(destination.clone(), request);
+        requests.insert(destination, request);
         last_times.insert(destination, Instant::now());
 
         Ok(true)
@@ -400,7 +400,7 @@ impl PathRequestManager {
             return Ok(false);
         }
 
-        let request = PathRequest::new(destination.clone(), false);
+        let request = PathRequest::new(destination, false);
         requests.insert(destination, request);
 
         Ok(true)
@@ -447,7 +447,7 @@ impl PathRequestManager {
         for (dest, request) in requests.iter_mut() {
             if request.should_retry() {
                 request.mark_sent();
-                to_retry.push(dest.clone());
+                to_retry.push(*dest);
             }
         }
 
@@ -498,7 +498,7 @@ impl PathRequestManager {
         let start = Instant::now();
 
         // Create the request
-        let _ = self.request_path(destination.clone(), None);
+        let _ = self.request_path(destination, None);
 
         // Poll until found or timeout
         while start.elapsed() < timeout {

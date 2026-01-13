@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,7 +133,7 @@ fn get_config_dir(config_override: Option<&str>) -> PathBuf {
 }
 
 /// Get the identity file path
-fn get_identity_path(config_dir: &PathBuf, identity_override: Option<&str>) -> PathBuf {
+fn get_identity_path(config_dir: &Path, identity_override: Option<&str>) -> PathBuf {
     if let Some(path) = identity_override {
         PathBuf::from(path)
     } else {
@@ -561,8 +561,10 @@ fn fetch_file_path_hash() -> [u8; 10] {
 /// Configuration for listen mode fetch server
 struct FetchServerConfig {
     allow_fetch: bool,
+    #[allow(dead_code)]
     no_auth: bool,
     fetch_jail: Option<PathBuf>,
+    #[allow(dead_code)]
     allowed_identity_hashes: Vec<[u8; 16]>,
     auto_compress: bool,
 }
@@ -786,7 +788,7 @@ async fn handle_listen_link_event(
     event: &LinkEventData,
     incoming_resources: &Arc<RwLock<HashMap<[u8; 16], TrackedIncomingResource>>>,
     outgoing_resources: &Arc<RwLock<HashMap<[u8; 16], TrackedOutgoingResource>>>,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     allow_overwrite: bool,
     fetch_config: &Arc<FetchServerConfig>,
 ) {
@@ -886,8 +888,8 @@ async fn handle_listen_link_event(
             let mut needs_more_request: Option<([u8; 16], Vec<u8>)> = None;
 
             for (hash, tracked) in resources.iter_mut() {
-                if tracked.link_id == link_id {
-                    if tracked.resource.receive_part(payload.as_slice().to_vec()) {
+                if tracked.link_id == link_id
+                    && tracked.resource.receive_part(payload.as_slice().to_vec()) {
                         let progress = tracked.resource.progress();
                         log::info!(
                             "Resource progress: {}/{}",
@@ -902,7 +904,6 @@ async fn handle_listen_link_event(
                         }
                         break;
                     }
-                }
             }
 
             // Handle completion
@@ -1469,7 +1470,7 @@ async fn run_send_mode(
     };
 
     // Create transport
-    let mut transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+    let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
 
     // Set up TCP interfaces if specified
     if let Some(server_addr) = matches.get_one::<String>("tcp-server") {
@@ -1512,7 +1513,7 @@ async fn run_send_mode(
                 let announced_hash = event.destination.lock().await.desc.address_hash;
                 if announced_hash == dest_hash {
                     log::info!("Received announce from target destination");
-                    dest_desc = Some(event.destination.lock().await.desc.clone());
+                    dest_desc = Some(event.destination.lock().await.desc);
                     break;
                 }
             }
@@ -1537,7 +1538,7 @@ async fn run_send_mode(
     );
 
     let mut link_events = transport.out_link_events();
-    let link = transport.link(dest_desc.clone()).await;
+    let link = transport.link(dest_desc).await;
     let link_id = *link.lock().await.id();
     let link_id_hex = hex::encode(&link_id.as_slice()[..8]);
 
@@ -1850,7 +1851,7 @@ async fn run_fetch_mode(
     };
 
     // Create transport
-    let mut transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+    let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
 
     // Set up TCP interfaces if specified
     if let Some(server_addr) = matches.get_one::<String>("tcp-server") {
@@ -1903,7 +1904,7 @@ async fn run_fetch_mode(
                 let announced_hash = event.destination.lock().await.desc.address_hash;
                 if announced_hash == dest_hash {
                     log::info!("Received announce from target destination");
-                    dest_desc = Some(event.destination.lock().await.desc.clone());
+                    dest_desc = Some(event.destination.lock().await.desc);
                     break;
                 }
             }
@@ -1930,7 +1931,7 @@ async fn run_fetch_mode(
     }
 
     let mut link_events = transport.out_link_events();
-    let link = transport.link(dest_desc.clone()).await;
+    let link = transport.link(dest_desc).await;
     let link_id = *link.lock().await.id();
     let link_id_hex = hex::encode(&link_id.as_slice()[..8]);
 
@@ -2017,7 +2018,7 @@ async fn run_fetch_mode(
                                     eprintln!("Fetch not allowed on remote");
                                     request_failed = true;
                                     request_resolved = true;
-                                } else if response_data.iter().any(|&b| b == 0xc2) {
+                                } else if response_data.contains(&0xc2) {
                                     // 0xc2 is msgpack false
                                     eprintln!("File not found on remote");
                                     request_failed = true;

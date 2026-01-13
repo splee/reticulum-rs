@@ -12,8 +12,10 @@ use crate::config::LogLevel;
 
 /// Log destination types
 #[derive(Clone)]
+#[derive(Default)]
 pub enum LogDestination {
     /// Log to stdout
+    #[default]
     Stdout,
     /// Log to a file
     File(std::path::PathBuf),
@@ -34,11 +36,6 @@ impl std::fmt::Debug for LogDestination {
     }
 }
 
-impl Default for LogDestination {
-    fn default() -> Self {
-        LogDestination::Stdout
-    }
-}
 
 /// Global logger state
 struct LoggerState {
@@ -89,7 +86,7 @@ pub fn init_with_level(level: LogLevel) {
 /// Initialize the logging system
 pub fn init(level: LogLevel, destination: LogDestination) -> io::Result<()> {
     let mut logger = LOGGER.write().map_err(|_| {
-        io::Error::new(io::ErrorKind::Other, "Failed to acquire logger lock")
+        io::Error::other("Failed to acquire logger lock")
     })?;
 
     logger.level = level;

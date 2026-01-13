@@ -234,7 +234,7 @@ fn pack_blackhole_list(entries: &[BlackholeInfoEntry]) -> Vec<u8> {
             ),
             (
                 rmpv::Value::String("until".into()),
-                entry.until.map(|t| rmpv::Value::F64(t)).unwrap_or(rmpv::Value::Nil),
+                entry.until.map(rmpv::Value::F64).unwrap_or(rmpv::Value::Nil),
             ),
             (
                 rmpv::Value::String("reason".into()),

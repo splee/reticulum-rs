@@ -111,7 +111,7 @@ impl GroupKey {
 
     /// Get the hash of this key for identification
     pub fn hash(&self) -> Hash {
-        Hash::new(Hash::generator().chain_update(&self.full_key).finalize().into())
+        Hash::new(Hash::generator().chain_update(self.full_key).finalize().into())
     }
 }
 

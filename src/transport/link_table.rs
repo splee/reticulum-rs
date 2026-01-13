@@ -6,12 +6,15 @@ use crate::hash::AddressHash;
 use crate::packet::{Header, HeaderType, IfacFlag, Packet};
 
 pub struct LinkEntry {
+    #[allow(dead_code)]
     pub timestamp: Instant,
     pub proof_timeout: Instant,
     pub next_hop: AddressHash,
+    #[allow(dead_code)]
     pub next_hop_iface: AddressHash,
     pub received_from: AddressHash,
     pub original_destination: AddressHash,
+    #[allow(dead_code)]
     pub taken_hops: u8,
     pub remaining_hops: u8,
     pub validated: bool,
@@ -64,7 +67,7 @@ impl LinkTable {
         let entry = LinkEntry {
             timestamp: now,
             proof_timeout: now + Duration::from_secs(600), // TODO
-            next_hop: next_hop,
+            next_hop,
             next_hop_iface: iface,
             received_from,
             original_destination: destination,
@@ -77,7 +80,7 @@ impl LinkTable {
     }
 
     pub fn original_destination(&self, link_id: &LinkId) -> Option<AddressHash> {
-        self.0.get(&link_id).filter(|e| e.validated).map(|e| e.original_destination)
+        self.0.get(link_id).filter(|e| e.validated).map(|e| e.original_destination)
     }
 
     pub fn handle_keepalive(&self, packet: &Packet) -> Option<(Packet, AddressHash)> {
@@ -103,10 +106,8 @@ impl LinkTable {
         for (link_id, entry) in &self.0 {
             if entry.validated {
                 // TODO remove active timed out links
-            } else {
-                if entry.proof_timeout <= now {
-                    stale.push(link_id.clone());
-                }
+            } else if entry.proof_timeout <= now {
+                stale.push(*link_id);
             }
         }
 

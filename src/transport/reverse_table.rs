@@ -67,7 +67,7 @@ impl ReverseTable {
             self.cleanup();
         }
 
-        let entry = ReverseEntry::new(receiving_interface, packet_hash.clone(), hops);
+        let entry = ReverseEntry::new(receiving_interface, packet_hash, hops);
         self.entries.insert(packet_hash, entry);
     }
 
@@ -88,7 +88,7 @@ impl ReverseTable {
 
     /// Get the receiving interface for a packet hash
     pub fn receiving_interface(&self, packet_hash: &Hash) -> Option<AddressHash> {
-        self.get(packet_hash).map(|e| e.receiving_interface.clone())
+        self.get(packet_hash).map(|e| e.receiving_interface)
     }
 
     /// Clean up expired entries

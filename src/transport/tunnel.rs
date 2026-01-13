@@ -14,8 +14,10 @@ pub const TUNNEL_EXPIRY: Duration = Duration::from_secs(3600); // 1 hour
 /// Tunnel states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum TunnelState {
     /// Tunnel is being established
+    #[default]
     Establishing = 0,
     /// Tunnel is active
     Active = 1,
@@ -25,11 +27,6 @@ pub enum TunnelState {
     Expired = 3,
 }
 
-impl Default for TunnelState {
-    fn default() -> Self {
-        TunnelState::Establishing
-    }
-}
 
 /// Information about a tunnel to another transport instance
 #[derive(Debug, Clone)]
@@ -145,11 +142,11 @@ impl TunnelManager {
 
     /// Register a new tunnel
     pub fn register(&mut self, tunnel: TunnelInfo) {
-        let tunnel_id = tunnel.id.clone();
+        let tunnel_id = tunnel.id;
 
         // Update destination mappings
         for path in &tunnel.paths {
-            self.destination_to_tunnel.insert(path.clone(), tunnel_id.clone());
+            self.destination_to_tunnel.insert(*path, tunnel_id);
         }
 
         self.tunnels.insert(tunnel_id, tunnel);
@@ -188,8 +185,8 @@ impl TunnelManager {
     /// Add a path to a tunnel
     pub fn add_path(&mut self, tunnel_id: &Hash, destination: AddressHash) {
         if let Some(tunnel) = self.tunnels.get_mut(tunnel_id) {
-            tunnel.add_path(destination.clone());
-            self.destination_to_tunnel.insert(destination, tunnel_id.clone());
+            tunnel.add_path(destination);
+            self.destination_to_tunnel.insert(destination, *tunnel_id);
         }
     }
 
@@ -207,7 +204,7 @@ impl TunnelManager {
             .tunnels
             .iter()
             .filter(|(_, t)| t.is_expired())
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
 
         for id in expired {

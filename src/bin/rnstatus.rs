@@ -32,7 +32,9 @@ use reticulum::transport::{Transport, TransportConfig};
 /// Interface mode constants matching Python implementation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum InterfaceMode {
+    #[default]
     Full = 0x00,
     AccessPoint = 0x01,
     PointToPoint = 0x02,
@@ -41,11 +43,6 @@ pub enum InterfaceMode {
     Gateway = 0x05,
 }
 
-impl Default for InterfaceMode {
-    fn default() -> Self {
-        InterfaceMode::Full
-    }
-}
 
 impl InterfaceMode {
     /// Convert mode to display string
@@ -287,7 +284,7 @@ pub enum SortField {
 
 impl SortField {
     /// Parse a string into a sort field
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "rate" | "bitrate" => Some(SortField::Rate),
             "traffic" => Some(SortField::Traffic),
@@ -599,7 +596,7 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
 
     // Create destination descriptor for link establishment
     let dest_name = DestinationName::new("rnstransport", "remote.management");
-    let dest_desc = SingleOutputDestination::new(remote_identity.clone(), dest_name);
+    let dest_desc = SingleOutputDestination::new(remote_identity, dest_name);
 
     // Establish link
     if !args.json {
@@ -1411,7 +1408,7 @@ fn display_stats(args: &Args, stats: &NetworkStats, link_count: Option<u32>) {
     // Sort interfaces if requested
     let mut interfaces: Vec<_> = stats.interfaces.iter().collect();
     if let Some(ref sort_field) = args.sort {
-        if let Some(field) = SortField::from_str(sort_field) {
+        if let Some(field) = SortField::parse(sort_field) {
             sort_interfaces(&mut interfaces, field, args.reverse);
         }
     }
@@ -1452,8 +1449,8 @@ fn display_stats(args: &Args, stats: &NetworkStats, link_count: Option<u32>) {
         let rx_str = format!("↓{}", pretty_size(stats.rxb));
         let tx_str = format!("↑{}", pretty_size(stats.txb));
 
-        let rx_speed = format!("{}", pretty_speed(stats.rxs));
-        let tx_speed = format!("{}", pretty_speed(stats.txs));
+        let rx_speed = pretty_speed(stats.rxs).to_string();
+        let tx_speed = pretty_speed(stats.txs).to_string();
 
         // Pad to align
         let max_len = rx_str.len().max(tx_str.len());
@@ -1882,13 +1879,9 @@ fn format_status(status: &str) -> String {
     }
 }
 
-/// Format a hex string with pretty separators
+/// Format a hex string with angle brackets
 fn pretty_hex(hex: &str) -> String {
-    if hex.len() >= 32 {
-        format!("<{}>", hex)
-    } else {
-        format!("<{}>", hex)
-    }
+    format!("<{}>", hex)
 }
 
 /// Format a number with comma separators (e.g., 1000000 -> "1,000,000")

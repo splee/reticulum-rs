@@ -235,7 +235,7 @@ async fn run_probe(args: &Args, config: &ReticulumConfig, dest_hash: &AddressHas
 
     // Create output destination for packet encryption
     let destination = SingleOutputDestination::new(
-        identity.clone(),
+        identity,
         DestinationName::new_from_hash_slice(dest_hash.as_slice()),
     );
 
@@ -267,7 +267,7 @@ async fn run_probe(args: &Args, config: &ReticulumConfig, dest_hash: &AddressHas
 
         // Send packet and get receipt
         let receipt = transport
-            .send_packet_with_receipt(packet, dest_hash.clone(), hops)
+            .send_packet_with_receipt(packet, *dest_hash, hops)
             .await;
 
         sent += 1;

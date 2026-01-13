@@ -238,7 +238,7 @@ fn main() {
         let mut link_events = transport.out_link_events();
 
         // Create link
-        let link = transport.link(dest_desc.clone()).await;
+        let link = transport.link(dest_desc).await;
         let link_id = *link.lock().await.id();
         let link_id_hex = hex::encode(link_id.as_slice());
 

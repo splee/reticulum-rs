@@ -13,8 +13,10 @@ use crate::packet::Packet;
 /// Proof strategy for a destination
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum ProofStrategy {
     /// Never generate proofs automatically
+    #[default]
     None = 0x00,
     /// Let the application decide whether to prove
     App = 0x01,
@@ -22,11 +24,6 @@ pub enum ProofStrategy {
     All = 0x02,
 }
 
-impl Default for ProofStrategy {
-    fn default() -> Self {
-        ProofStrategy::None
-    }
-}
 
 impl From<u8> for ProofStrategy {
     fn from(value: u8) -> Self {
@@ -42,8 +39,10 @@ impl From<u8> for ProofStrategy {
 /// Request policy for determining which requests to allow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum RequestPolicy {
     /// Deny all requests
+    #[default]
     AllowNone = 0x00,
     /// Allow all requests
     AllowAll = 0x01,
@@ -51,11 +50,6 @@ pub enum RequestPolicy {
     AllowList = 0x02,
 }
 
-impl Default for RequestPolicy {
-    fn default() -> Self {
-        RequestPolicy::AllowNone
-    }
-}
 
 /// Response data from a request handler
 #[derive(Debug, Clone)]

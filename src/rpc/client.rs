@@ -5,7 +5,7 @@
 //! receives a response, and closes the connection.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,7 +45,7 @@ impl RpcClient {
     /// * `instance_name` - The daemon instance name (usually "default")
     /// * `socket_dir` - Directory for filesystem sockets (macOS/BSD)
     /// * `port` - TCP port for Windows fallback
-    pub fn default_addr(instance_name: &str, socket_dir: &PathBuf, port: u16) -> Self {
+    pub fn default_addr(instance_name: &str, socket_dir: &Path, port: u16) -> Self {
         let addr = ListenerAddr::default_rpc(instance_name, socket_dir, port);
         Self::new(addr)
     }
@@ -304,7 +304,7 @@ impl std::error::Error for RpcClientError {
 /// Check if the daemon is running by attempting to ping it.
 ///
 /// This is a convenience function for quick checks without creating a client.
-pub async fn is_daemon_running(instance_name: &str, socket_dir: &PathBuf, port: u16) -> bool {
+pub async fn is_daemon_running(instance_name: &str, socket_dir: &Path, port: u16) -> bool {
     let client = RpcClient::default_addr(instance_name, socket_dir, port);
     client.is_daemon_running().await
 }

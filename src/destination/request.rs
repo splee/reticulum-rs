@@ -28,8 +28,10 @@ use sha2::{Sha256, Digest};
 
 /// Access control policy for request handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AllowPolicy {
     /// No requests allowed (handler disabled).
+    #[default]
     AllowNone,
     /// All identified peers can make requests.
     AllowAll,
@@ -38,11 +40,6 @@ pub enum AllowPolicy {
     AllowList(Vec<[u8; 16]>),
 }
 
-impl Default for AllowPolicy {
-    fn default() -> Self {
-        AllowPolicy::AllowNone
-    }
-}
 
 impl AllowPolicy {
     /// Check if a remote identity is allowed by this policy.

@@ -58,7 +58,7 @@ impl TestNode {
 
     /// Set simulated packet loss rate
     pub fn with_loss_rate(mut self, rate: f64) -> Self {
-        self.loss_rate = rate.max(0.0).min(1.0);
+        self.loss_rate = rate.clamp(0.0, 1.0);
         self
     }
 

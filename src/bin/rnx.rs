@@ -227,6 +227,7 @@ fn build_request_data(
 }
 
 /// Parse request data from msgpack
+#[allow(clippy::type_complexity)]
 fn parse_request_data(
     data: &[u8],
 ) -> Result<(String, Option<f64>, Option<usize>, Option<usize>, Option<Vec<u8>>), &'static str> {
@@ -651,7 +652,7 @@ async fn execute_command(
     }
 
     // Wait for output with optional timeout
-    let timeout_duration = exec_timeout.map(|t| Duration::from_secs_f64(t));
+    let timeout_duration = exec_timeout.map(Duration::from_secs_f64);
 
     let output = if let Some(timeout) = timeout_duration {
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -780,7 +781,7 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
                 let announced_hash = event.destination.lock().await.desc.address_hash;
                 if announced_hash == dest_hash {
                     println!("OK");
-                    break event.destination.lock().await.desc.clone();
+                    break event.destination.lock().await.desc;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -1038,7 +1039,7 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
                 let announced_hash = event.destination.lock().await.desc.address_hash;
                 if announced_hash == dest_hash {
                     println!("Path found");
-                    break event.destination.lock().await.desc.clone();
+                    break event.destination.lock().await.desc;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}

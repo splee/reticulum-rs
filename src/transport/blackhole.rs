@@ -107,13 +107,13 @@ impl BlackholeManager {
 
     /// Add an identity to the blackhole
     pub fn add(&self, identity_hash: AddressHash) {
-        let entry = BlackholeEntry::new(identity_hash.clone());
+        let entry = BlackholeEntry::new(identity_hash);
         self.entries.write().unwrap().insert(identity_hash, entry);
     }
 
     /// Add an identity to the blackhole with expiry
     pub fn add_temporary(&self, identity_hash: AddressHash, duration: Duration) {
-        let entry = BlackholeEntry::with_expiry(identity_hash.clone(), duration);
+        let entry = BlackholeEntry::with_expiry(identity_hash, duration);
         self.entries.write().unwrap().insert(identity_hash, entry);
     }
 
@@ -160,7 +160,7 @@ impl BlackholeManager {
         if let Some(ref path) = self.file_path {
             if let Ok(metadata) = fs::metadata(path) {
                 if let Ok(modified) = metadata.modified() {
-                    let last_modified = self.last_modified.read().unwrap().clone();
+                    let last_modified = *self.last_modified.read().unwrap();
                     if last_modified.map(|m| modified != m).unwrap_or(true) {
                         *self.last_modified.write().unwrap() = Some(modified);
                         return self.reload().map(|_| true);
@@ -188,20 +188,18 @@ impl BlackholeManager {
 
         let mut new_entries = HashMap::new();
 
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
 
-                // Parse hex hash
-                if let Ok(bytes) = hex_decode(line) {
-                    if bytes.len() >= 16 {
-                        let hash = AddressHash::new_from_slice(&bytes);
-                        let entry = BlackholeEntry::new(hash.clone());
-                        new_entries.insert(hash, entry);
-                    }
+            // Parse hex hash
+            if let Ok(bytes) = hex_decode(line) {
+                if bytes.len() >= 16 {
+                    let hash = AddressHash::new_from_slice(&bytes);
+                    let entry = BlackholeEntry::new(hash);
+                    new_entries.insert(hash, entry);
                 }
             }
         }

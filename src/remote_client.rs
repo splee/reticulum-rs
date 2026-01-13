@@ -390,7 +390,7 @@ impl RemoteClient {
         };
 
         let dest_name = DestinationName::new(app_name, aspects);
-        let dest_desc = SingleOutputDestination::new(remote_identity.clone(), dest_name);
+        let dest_desc = SingleOutputDestination::new(remote_identity, dest_name);
 
         // Establish link
         let link = self.transport.link(dest_desc.desc).await;

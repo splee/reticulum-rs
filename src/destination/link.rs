@@ -49,6 +49,12 @@ pub struct LinkPayload {
     len: usize,
 }
 
+impl Default for LinkPayload {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinkPayload {
     pub fn new() -> Self {
         Self {
@@ -67,12 +73,10 @@ impl LinkPayload {
         Self { buffer, len }
     }
 
-    pub fn new_from_vec(data: &Vec<u8>) -> Self {
+    pub fn new_from_vec(data: &[u8]) -> Self {
         let mut buffer = [0u8; PACKET_MDU];
-
-        for i in 0..min(buffer.len(), data.len()) {
-            buffer[i] = data[i];
-        }
+        let len = min(buffer.len(), data.len());
+        buffer[..len].copy_from_slice(&data[..len]);
 
         Self {
             buffer,
@@ -82,6 +86,11 @@ impl LinkPayload {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Returns true if the payload contains no data.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -102,9 +111,9 @@ impl From<&Packet> for LinkId {
 
         AddressHash::new_from_hash(&Hash::new(
             Hash::generator()
-                .chain_update(&[packet.header.to_meta() & 0b00001111])
+                .chain_update([packet.header.to_meta() & 0b00001111])
                 .chain_update(packet.destination.as_slice())
-                .chain_update(&[packet.context as u8])
+                .chain_update([packet.context as u8])
                 .chain_update(hashable_data)
                 .finalize()
                 .into(),
@@ -306,7 +315,9 @@ impl Link {
         packet_data.safe_write(&signature.to_bytes()[..]);
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
 
-        let packet = Packet {
+        
+
+        Packet {
             header: Header {
                 packet_type: PacketType::Proof,
                 ..Default::default()
@@ -316,9 +327,7 @@ impl Link {
             transport: None,
             context: PacketContext::LinkRequestProof,
             data: packet_data,
-        };
-
-        packet
+        }
     }
 
     fn handle_data_packet(&mut self, packet: &Packet) -> LinkHandleResult {
@@ -338,12 +347,12 @@ impl Link {
                 }
             }
             PacketContext::KeepAlive => {
-                if packet.data.len() >= 1 && packet.data.as_slice()[0] == 0xFF {
+                if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFF {
                     self.request_time = Instant::now();
                     log::trace!("link({}): keep-alive request", self.id);
                     return LinkHandleResult::KeepAlive;
                 }
-                if packet.data.len() >= 1 && packet.data.as_slice()[0] == 0xFE {
+                if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFE {
                     log::trace!("link({}): keep-alive response", self.id);
                     self.request_time = Instant::now();
                     return LinkHandleResult::None;
@@ -485,7 +494,7 @@ impl Link {
 
                     if identity.verify(&signed_data, &signature).is_ok() {
                         log::info!("link({}): remote peer identified as {}", self.id, identity.address_hash);
-                        self.remote_identity = Some(identity.clone());
+                        self.remote_identity = Some(identity);
                         self.request_time = Instant::now();
                         self.post_event(LinkEvent::Identified(identity));
                     } else {
@@ -549,7 +558,7 @@ impl Link {
             _ => {}
         }
 
-        return LinkHandleResult::None;
+        LinkHandleResult::None
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
@@ -749,7 +758,7 @@ impl Link {
 
         self.derived_key = self
             .priv_identity
-            .derive_key(&self.peer_identity.public_key, Some(&self.id.as_slice()));
+            .derive_key(&self.peer_identity.public_key, Some(self.id.as_slice()));
     }
 
     fn post_event(&self, event: LinkEvent) {
@@ -919,7 +928,7 @@ impl Link {
         log::debug!(
             "link({}): registering outgoing resource {}",
             self.id,
-            hex::encode(&resource_id)
+            hex::encode(resource_id)
         );
 
         self.outgoing_resources.insert(
@@ -944,7 +953,7 @@ impl Link {
         log::debug!(
             "link({}): registering incoming resource {}",
             self.id,
-            hex::encode(&resource_id)
+            hex::encode(resource_id)
         );
 
         self.incoming_resources.insert(

@@ -382,7 +382,7 @@ fn parse_path_request_data(data: &[u8]) -> Option<(String, Option<String>, Optio
 
     let destination_hash = if arr.len() > 1 {
         arr[1].as_str().map(|s| s.to_string())
-            .or_else(|| arr[1].as_slice().map(|b| hex::encode(b)))
+            .or_else(|| arr[1].as_slice().map(hex::encode))
     } else {
         None
     };
@@ -428,7 +428,7 @@ fn pack_path_table_response(table: &[PathInfo]) -> Vec<u8> {
                 ),
                 (
                     rmpv::Value::String("expires".into()),
-                    entry.expires.map(|e| rmpv::Value::F64(e)).unwrap_or(rmpv::Value::Nil),
+                    entry.expires.map(rmpv::Value::F64).unwrap_or(rmpv::Value::Nil),
                 ),
                 (
                     rmpv::Value::String("interface".into()),
@@ -459,7 +459,7 @@ fn pack_rate_table_response(table: &[RateInfo]) -> Vec<u8> {
                 ),
                 (
                     rmpv::Value::String("last".into()),
-                    entry.last_announce.map(|t| rmpv::Value::F64(t)).unwrap_or(rmpv::Value::Nil),
+                    entry.last_announce.map(rmpv::Value::F64).unwrap_or(rmpv::Value::Nil),
                 ),
                 (
                     rmpv::Value::String("rate_violations".into()),
@@ -467,7 +467,7 @@ fn pack_rate_table_response(table: &[RateInfo]) -> Vec<u8> {
                 ),
                 (
                     rmpv::Value::String("blocked_until".into()),
-                    entry.blocked_until.map(|t| rmpv::Value::F64(t)).unwrap_or(rmpv::Value::Nil),
+                    entry.blocked_until.map(rmpv::Value::F64).unwrap_or(rmpv::Value::Nil),
                 ),
                 (
                     rmpv::Value::String("timestamps".into()),

@@ -53,7 +53,7 @@ pub const RATE_VERY_SLOW: f64 = (2.0 * 1000.0) / 8.0;
 
 /// Maximum efficient size for a single resource segment (about 1 MB)
 /// Capped at 16777215 (0xFFFFFF) to fit in 3 bytes in advertisements
-pub const MAX_EFFICIENT_SIZE: usize = 1 * 1024 * 1024 - 1;
+pub const MAX_EFFICIENT_SIZE: usize = 1024 * 1024 - 1;
 
 /// Maximum metadata size (about 16 MB)
 pub const METADATA_MAX_SIZE: usize = 16 * 1024 * 1024 - 1;
@@ -95,8 +95,10 @@ pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 /// Resource status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum ResourceStatus {
     /// No status
+    #[default]
     None = 0x00,
     /// Resource is queued for transfer
     Queued = 0x01,
@@ -116,11 +118,6 @@ pub enum ResourceStatus {
     Corrupt = 0x08,
 }
 
-impl Default for ResourceStatus {
-    fn default() -> Self {
-        ResourceStatus::None
-    }
-}
 
 impl From<u8> for ResourceStatus {
     fn from(value: u8) -> Self {
@@ -316,9 +313,11 @@ pub struct Resource {
     /// Random hash prepended to data
     random_hash: [u8; RANDOM_HASH_SIZE],
     /// Expected proof hash
+    #[allow(dead_code)]
     expected_proof: [u8; 32],
 
     /// Uncompressed data size
+    #[allow(dead_code)]
     uncompressed_size: usize,
     /// Compressed/transfer size
     size: usize,
@@ -373,6 +372,7 @@ pub struct Resource {
     /// Bytes received in current RTT cycle
     rtt_rxd_bytes: usize,
     /// Bytes received at last part request
+    #[allow(dead_code)]
     rtt_rxd_bytes_at_part_req: usize,
     /// Request-response RTT rate
     req_resp_rtt_rate: f64,
@@ -380,8 +380,10 @@ pub struct Resource {
     req_data_rtt_rate: f64,
 
     /// Time of last activity
+    #[allow(dead_code)]
     last_activity: Instant,
     /// Time when transfer started
+    #[allow(dead_code)]
     started_transferring: Option<Instant>,
     /// Time of last part sent
     last_part_sent: Option<Instant>,
@@ -390,12 +392,14 @@ pub struct Resource {
     retries_left: u32,
 
     /// Configuration
+    #[allow(dead_code)]
     config: ResourceConfig,
 
     /// Request ID for request/response pattern
     request_id: Option<[u8; 16]>,
 
     /// Metadata bytes
+    #[allow(dead_code)]
     metadata: Option<Vec<u8>>,
 
     /// Original uncompressed data (for outgoing resources, needed to verify proof)
@@ -500,7 +504,7 @@ impl Resource {
         let hash = Hash::new(
             Hash::generator()
                 .chain_update(&uncompressed_data)  // Includes metadata, uncompressed
-                .chain_update(&random_hash)
+                .chain_update(random_hash)
                 .finalize()
                 .into(),
         );
@@ -523,7 +527,7 @@ impl Resource {
         );
 
         // Calculate number of parts
-        let total_parts = (size + sdu - 1) / sdu;
+        let total_parts = size.div_ceil(sdu);
 
         // Build parts and hashmap
         let mut parts = Vec::with_capacity(total_parts);
@@ -559,7 +563,7 @@ impl Resource {
 
         // Determine if we need to split into segments
         let total_segments = if total_size > MAX_EFFICIENT_SIZE {
-            (total_size + MAX_EFFICIENT_SIZE - 1) / MAX_EFFICIENT_SIZE
+            total_size.div_ceil(MAX_EFFICIENT_SIZE)
         } else {
             1
         };
@@ -894,8 +898,8 @@ impl Resource {
                     i,
                     expected_hash
                 );
-                if expected_hash == map_hash {
-                    if self.received_parts[i].is_none() {
+                if expected_hash == map_hash
+                    && self.received_parts[i].is_none() {
                         self.received_parts[i] = Some(data);
                         self.rtt_rxd_bytes += self.sdu;
                         self.received_count += 1;
@@ -922,7 +926,6 @@ impl Resource {
 
                         return true;
                     }
-                }
             }
         }
 
@@ -951,10 +954,8 @@ impl Resource {
 
         // Concatenate all parts
         let mut stream = Vec::with_capacity(self.size);
-        for part in &self.received_parts {
-            if let Some(data) = part {
-                stream.extend_from_slice(data);
-            }
+        for data in self.received_parts.iter().flatten() {
+            stream.extend_from_slice(data);
         }
 
         // Decrypt if resource is encrypted
@@ -982,7 +983,7 @@ impl Resource {
         let calculated_hash = Hash::new(
             Hash::generator()
                 .chain_update(&final_data)
-                .chain_update(&self.random_hash)
+                .chain_update(self.random_hash)
                 .finalize()
                 .into(),
         );
@@ -1022,10 +1023,8 @@ impl Resource {
         }
 
         let mut stream = Vec::with_capacity(self.size);
-        for part in &self.received_parts {
-            if let Some(data) = part {
-                stream.extend_from_slice(data);
-            }
+        for data in self.received_parts.iter().flatten() {
+            stream.extend_from_slice(data);
         }
         Some(stream)
     }
@@ -1058,7 +1057,7 @@ impl Resource {
         let calculated_hash = Hash::new(
             Hash::generator()
                 .chain_update(&final_data)
-                .chain_update(&self.random_hash)
+                .chain_update(self.random_hash)
                 .finalize()
                 .into(),
         );
@@ -1311,7 +1310,7 @@ impl Resource {
                     "handle_request: part {} has hash {:?}",
                     idx, &self.parts[idx].map_hash
                 );
-                if &self.parts[idx].map_hash == requested_hash {
+                if self.parts[idx].map_hash == requested_hash {
                     parts_to_send.push(idx);
                     found = true;
                     log::debug!("handle_request: found match at part {}", idx);
@@ -1378,7 +1377,7 @@ impl Resource {
         let proof_hash = Hash::new(
             Hash::generator()
                 .chain_update(data)
-                .chain_update(&self.hash)
+                .chain_update(self.hash)
                 .finalize()
                 .into(),
         );
@@ -1399,7 +1398,7 @@ impl Resource {
         }
 
         // First 32 bytes should match our hash
-        if &proof_data[..32] != &self.hash {
+        if proof_data[..32] != self.hash {
             log::debug!(
                 "verify_proof: hash mismatch, expected {:?}, got {:?}",
                 &self.hash[..16],
@@ -1418,7 +1417,7 @@ impl Resource {
         let expected_proof = Hash::new(
             Hash::generator()
                 .chain_update(original_data)
-                .chain_update(&self.hash)
+                .chain_update(self.hash)
                 .finalize()
                 .into(),
         );

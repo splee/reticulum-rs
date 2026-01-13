@@ -10,6 +10,7 @@ use crate::packet::{
 
 pub struct AnnounceEntry {
     pub packet: Packet,
+    #[allow(dead_code)]
     pub timestamp: Instant,
     pub timeout: Instant,
     pub received_from: AddressHash,
@@ -39,7 +40,7 @@ impl AnnounceEntry {
             },
             ifac: None,
             destination: self.packet.destination, // TODO
-            transport: Some(transport_id.clone()),
+            transport: Some(*transport_id),
             context: PacketContext::None,
             data: self.packet.data,
         };
@@ -75,7 +76,7 @@ impl AnnounceTable {
         let hops = announce.header.hops + 1;
 
         let entry = AnnounceEntry {
-            packet: announce.clone(),
+            packet: *announce,
             timestamp: now,
             timeout: now + Duration::from_secs(60), // TODO
             received_from,
@@ -91,6 +92,7 @@ impl AnnounceTable {
         self.stale.clear();
     }
 
+    #[allow(dead_code)]
     pub fn stale(&mut self, destination: &AddressHash) {
         self.map.remove(destination);
     }
@@ -108,10 +110,11 @@ impl AnnounceTable {
         transport_id: &AddressHash,
     ) -> Option<(AddressHash, Packet)> {
         // temporary hack
-        self.map.get_mut(dest_hash).map_or(None, |e| e.retransmit(transport_id))
+        self.map.get_mut(dest_hash).and_then(|e| e.retransmit(transport_id))
     }
 
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_retransmit(
         &mut self,
         transport_id: &AddressHash,
@@ -123,7 +126,7 @@ impl AnnounceTable {
             if let Some(pair) = entry.retransmit(transport_id) {
                 packets.push(pair);
             } else {
-                completed.push(destination.clone());
+                completed.push(*destination);
             }
         }
 

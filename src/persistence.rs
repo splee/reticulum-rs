@@ -83,7 +83,7 @@ impl KnownDestinations {
             })?;
 
         let mut cache = self.cache.write().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "Failed to acquire write lock")
+            io::Error::other("Failed to acquire write lock")
         })?;
 
         cache.clear();
@@ -105,7 +105,7 @@ impl KnownDestinations {
         // Check if already saving
         {
             let mut saving = self.saving.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "Failed to acquire saving lock")
+                io::Error::other("Failed to acquire saving lock")
             })?;
             if *saving {
                 return Ok(()); // Already saving, skip
@@ -115,7 +115,7 @@ impl KnownDestinations {
 
         let result = (|| {
             let cache = self.cache.read().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "Failed to acquire read lock")
+                io::Error::other("Failed to acquire read lock")
             })?;
 
             // Convert to Vec<u8> keys for serialization
@@ -135,7 +135,7 @@ impl KnownDestinations {
             let mut writer = BufWriter::new(file);
 
             rmp_serde::encode::write(&mut writer, &serializable).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("MessagePack error: {}", e))
+                io::Error::other(format!("MessagePack error: {}", e))
             })?;
 
             writer.flush()?;
@@ -187,7 +187,7 @@ impl KnownDestinations {
         };
 
         let mut cache = self.cache.write().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "Failed to acquire write lock")
+            io::Error::other("Failed to acquire write lock")
         })?;
 
         cache.insert(*destination_hash, known);
@@ -251,7 +251,7 @@ impl RatchetManager {
         }
 
         let mut cache = self.cache.write().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "Failed to acquire write lock")
+            io::Error::other("Failed to acquire write lock")
         })?;
 
         cache.clear();
@@ -266,7 +266,7 @@ impl RatchetManager {
             let path = entry.path();
 
             // Skip temporary files
-            if path.extension().map_or(false, |e| e == "out") {
+            if path.extension().is_some_and(|e| e == "out") {
                 continue;
             }
 
@@ -304,7 +304,7 @@ impl RatchetManager {
         // Check if we already have this exact ratchet
         {
             let cache = self.cache.read().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "Failed to acquire read lock")
+                io::Error::other("Failed to acquire read lock")
             })?;
 
             if let Some(existing) = cache.get(destination_hash) {
@@ -317,7 +317,7 @@ impl RatchetManager {
         // Update cache
         {
             let mut cache = self.cache.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "Failed to acquire write lock")
+                io::Error::other("Failed to acquire write lock")
             })?;
             cache.insert(*destination_hash, ratchet.to_vec());
         }
@@ -348,7 +348,7 @@ impl RatchetManager {
         let mut writer = BufWriter::new(file);
 
         rmp_serde::encode::write(&mut writer, &stored).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("MessagePack error: {}", e))
+            io::Error::other(format!("MessagePack error: {}", e))
         })?;
 
         writer.flush()?;
@@ -385,7 +385,7 @@ impl RatchetManager {
             let path = entry.path();
 
             // Skip temporary files
-            if path.extension().map_or(false, |e| e == "out") {
+            if path.extension().is_some_and(|e| e == "out") {
                 let _ = fs::remove_file(&path); // Clean up stale temp files
                 continue;
             }
@@ -463,7 +463,7 @@ impl PersistedIdentity {
         let mut writer = BufWriter::new(file);
 
         rmp_serde::encode::write(&mut writer, self).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("MessagePack error: {}", e))
+            io::Error::other(format!("MessagePack error: {}", e))
         })?;
 
         writer.flush()?;

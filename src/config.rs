@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 /// Log levels matching Python implementation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum LogLevel {
     /// Critical errors that cause shutdown
     Critical = 0,
@@ -19,6 +20,7 @@ pub enum LogLevel {
     /// Warnings about potential issues
     Warning = 2,
     /// Normal operational messages
+    #[default]
     Notice = 3,
     /// Informational messages
     Info = 4,
@@ -30,11 +32,6 @@ pub enum LogLevel {
     Extreme = 7,
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Notice
-    }
-}
 
 impl From<u8> for LogLevel {
     fn from(value: u8) -> Self {

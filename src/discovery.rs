@@ -385,9 +385,9 @@ impl InterfaceAnnouncement {
         hasher.update(interface_hash.as_slice());
         hasher.update(public_key);
         hasher.update(verifying_key);
-        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(timestamp.to_be_bytes());
         hasher.update(metadata_bytes);
-        hasher.update(&nonce.to_be_bytes());
+        hasher.update(nonce.to_be_bytes());
         hasher.finalize().into()
     }
 
@@ -555,7 +555,7 @@ impl InterfaceAnnouncer {
 
         // Create new announcement
         let announce = InterfaceAnnouncement::new(
-            self.interface_hash.clone(),
+            self.interface_hash,
             &self.identity,
             self.metadata.clone(),
             self.difficulty,
@@ -575,6 +575,7 @@ impl InterfaceAnnouncer {
 }
 
 /// Handler for incoming interface announcements
+#[allow(clippy::type_complexity)]
 pub struct InterfaceAnnounceHandler {
     /// Required proof-of-work difficulty
     difficulty: u8,
@@ -649,7 +650,7 @@ impl InterfaceAnnounceHandler {
                 announcements.retain(|_, a| now.duration_since(a.received_at) < ANNOUNCE_EXPIRY);
             }
 
-            announcements.insert(announcement.interface_hash.clone(), announcement.clone());
+            announcements.insert(announcement.interface_hash, announcement.clone());
         }
 
         // Call callback
@@ -1174,11 +1175,10 @@ impl InterfaceDiscoveryStorage {
             }
 
             if let Ok(info) = self.load_interface(&path) {
-                if info.should_remove(now) {
-                    if fs::remove_file(&path).is_ok() {
+                if info.should_remove(now)
+                    && fs::remove_file(&path).is_ok() {
                         removed += 1;
                     }
-                }
             }
         }
 
@@ -1238,6 +1238,7 @@ pub const DISCOVERY_ASPECT: &str = "rnstransport.discovery.interface";
 ///
 /// This handler parses announcements from Python nodes and validates
 /// the LXMF workblock stamps.
+#[allow(clippy::type_complexity)]
 pub struct PythonDiscoveryHandler {
     /// Required stamp value (difficulty)
     required_value: u8,
@@ -1298,7 +1299,7 @@ impl PythonDiscoveryHandler {
 
         // Parse flags
         let flags = app_data[0];
-        let mut payload = &app_data[1..];
+        let payload = &app_data[1..];
 
         let _signed = flags & announce_flags::FLAG_SIGNED != 0;
         let encrypted = flags & announce_flags::FLAG_ENCRYPTED != 0;
@@ -1472,7 +1473,7 @@ impl PythonDiscoveryHandler {
         let discovery_hash_material = format!("{}{}", transport_id, name);
         let discovery_hash = Stamper::full_hash(discovery_hash_material.as_bytes());
 
-        let mut info = DiscoveredInterfaceInfo {
+        let info = DiscoveredInterfaceInfo {
             interface_type,
             transport,
             name,
@@ -1522,6 +1523,7 @@ impl PythonDiscoveryHandler {
 /// Generate a configuration entry for an interface.
 ///
 /// This creates a ready-to-use configuration snippet matching Python's output.
+#[allow(clippy::too_many_arguments)]
 fn generate_config_entry(
     interface_type: &str,
     name: &str,

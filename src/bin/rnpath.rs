@@ -253,6 +253,7 @@ fn create_rpc_client(config: &ReticulumConfig) -> RpcClient {
 }
 
 /// Check if a daemon is running
+#[allow(dead_code)]
 async fn is_daemon_running(config: &ReticulumConfig) -> bool {
     let client = create_rpc_client(config);
     client.is_daemon_running().await
@@ -811,9 +812,9 @@ async fn handle_blackhole(args: &Args, config: &ReticulumConfig) -> i32 {
     // Add to blackhole with or without expiry
     if let Some(hours) = args.duration {
         let duration = Duration::from_secs_f64(hours * 3600.0);
-        manager.add_temporary(identity_hash.clone(), duration);
+        manager.add_temporary(identity_hash, duration);
     } else {
-        manager.add(identity_hash.clone());
+        manager.add(identity_hash);
     }
 
     // Save to file
@@ -1564,7 +1565,7 @@ fn display_rate_table(args: &Args, entries: &[RemoteRateEntry]) {
         let span = calculate_span_str(&entry.timestamps, now);
 
         let last_str = entry.last
-            .map(|t| timestamp_str(t))
+            .map(timestamp_str)
             .unwrap_or_else(|| "never".to_string());
 
         let blocked_str = if let Some(until) = entry.blocked_until {

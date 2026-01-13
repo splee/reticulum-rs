@@ -57,6 +57,7 @@ struct AnnounceLimitEntry {
     /// History of announce timestamps for rate calculation
     timestamp_history: VecDeque<Instant>,
     /// When this entry was created (for unix timestamp calculation)
+    #[allow(dead_code)]
     created_at: std::time::SystemTime,
 }
 
@@ -187,6 +188,7 @@ impl AnnounceLimitEntry {
     }
 
     /// Calculate announces per hour based on timestamp history
+    #[allow(dead_code)]
     pub fn announces_per_hour(&self) -> f64 {
         if self.timestamp_history.is_empty() {
             return 0.0;
@@ -251,7 +253,7 @@ impl AnnounceLimits {
         // Create new entry with default rate limits and record this announce
         let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));
         let result = entry.handle_announce();
-        self.limits.insert(destination.clone(), entry);
+        self.limits.insert(*destination, entry);
 
         result
     }
@@ -272,16 +274,19 @@ impl AnnounceLimits {
     }
 
     /// Get the number of tracked destinations
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.limits.len()
     }
 
     /// Check if no destinations are being tracked
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.limits.is_empty()
     }
 
     /// Remove entries that haven't been heard from in a while
+    #[allow(dead_code)]
     pub fn cleanup_stale(&mut self, max_age: Duration) {
         self.limits.retain(|_, entry| {
             entry

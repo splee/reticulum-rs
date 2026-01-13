@@ -276,6 +276,7 @@ impl Stamper {
     ///
     /// # Returns
     /// Tuple of (transient_id, lxm_data, stamp_value, stamp) or None if invalid.
+    #[allow(clippy::type_complexity)]
     pub fn validate_pn_stamp(
         transient_data: &[u8],
         target_cost: u8,
@@ -312,6 +313,7 @@ impl Stamper {
     ///
     /// # Returns
     /// List of valid (transient_id, lxm_data, stamp_value, stamp) tuples.
+    #[allow(clippy::type_complexity)]
     pub fn validate_pn_stamps(
         transient_list: &[Vec<u8>],
         target_cost: u8,
