@@ -18,6 +18,12 @@
 //! [include_link_stats: bool]
 //! ```
 //!
+//! Request format (msgpack on "/path" path):
+//! ```text
+//! ["table", destination_hash_or_nil, max_hops_or_nil]  -- for path table
+//! ["rates"]  -- for rate table
+//! ```
+//!
 //! Response format (msgpack):
 //! ```text
 //! [interface_stats: array, link_count: u64 (if include_link_stats)]
@@ -25,6 +31,9 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::transport::path_table::PathInfo;
+use crate::transport::announce_limits::RateInfo;
 
 use crate::destination::link::{LinkEvent, LinkEventData, LinkId};
 use crate::destination::request::{
@@ -36,6 +45,21 @@ use crate::identity::PrivateIdentity;
 /// The aspect name for the remote management destination.
 /// This matches Python's `RNS.Transport.APP_NAME + ".remote.management"`.
 pub const REMOTE_MANAGEMENT_ASPECT: &str = "rnstransport.remote.management";
+
+/// Context data for processing remote management requests.
+///
+/// This provides access to transport data that handlers need.
+#[derive(Default)]
+pub struct RemoteManagementContext {
+    /// Path table data (for /path requests with "table" command)
+    pub path_table: Option<Vec<PathInfo>>,
+    /// Rate table data (for /path requests with "rates" command)
+    pub rate_table: Option<Vec<RateInfo>>,
+    /// Interface stats (for /status requests)
+    pub interface_stats: Vec<RemoteInterfaceStats>,
+    /// Link count (for /status requests)
+    pub link_count: Option<u64>,
+}
 
 /// Configuration for remote management service.
 #[derive(Clone)]
@@ -130,6 +154,7 @@ impl RemoteManagementService {
     /// * `request_data` - The raw request data (msgpack encoded)
     /// * `link_id` - The link the request came from
     /// * `remote_identity` - The remote peer's identity hash (if identified)
+    /// * `context` - Context data from transport (path table, rate table, etc.)
     ///
     /// # Returns
     /// The response data to send back, or None if no response.
@@ -138,6 +163,7 @@ impl RemoteManagementService {
         request_data: &[u8],
         link_id: &[u8],
         remote_identity: Option<&[u8; 16]>,
+        context: &RemoteManagementContext,
     ) -> Option<Vec<u8>> {
         // Parse the request to get timestamp, path_hash, and data
         let (requested_at, path_hash, data) = match parse_request(request_data) {
@@ -151,33 +177,58 @@ impl RemoteManagementService {
         // Compute request ID from the packed request
         let request_id = compute_request_id(request_data);
 
-        // Route to the appropriate handler
-        match self.router.handle_request(
-            &path_hash,
-            &data,
-            &request_id,
-            link_id,
-            remote_identity,
-            requested_at,
-        ) {
-            Ok(Some(response_data)) => {
-                // Pack the response with the request_id
-                match pack_response(&request_id, &response_data) {
-                    Ok(packed) => Some(packed),
-                    Err(e) => {
-                        log::warn!("remote_management: failed to pack response: {}", e);
-                        None
-                    }
+        // Check if this is a /path request - we handle it specially with context
+        let path_hash_for_path = RequestRouter::path_hash("/path");
+        let path_hash_for_status = RequestRouter::path_hash("/status");
+
+        let response_data = if path_hash == path_hash_for_path {
+            // Handle /path request with context data
+            if let Some(handler) = self.router.get_by_path("/path") {
+                if !handler.is_allowed(remote_identity) {
+                    log::warn!("remote_management: /path request denied for {:?}", remote_identity);
+                    return None;
                 }
             }
-            Ok(None) => {
-                log::trace!("remote_management: handler returned no response");
-                None
+            handle_path_request_with_context(&data, context)
+        } else if path_hash == path_hash_for_status {
+            // Handle /status request with context data
+            if let Some(handler) = self.router.get_by_path("/status") {
+                if !handler.is_allowed(remote_identity) {
+                    log::warn!("remote_management: /status request denied for {:?}", remote_identity);
+                    return None;
+                }
             }
-            Err(e) => {
-                log::warn!("remote_management: request error: {}", e);
-                None
+            handle_status_request_with_context(&data, context)
+        } else {
+            // Route to the appropriate handler (for other paths)
+            match self.router.handle_request(
+                &path_hash,
+                &data,
+                &request_id,
+                link_id,
+                remote_identity,
+                requested_at,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    log::warn!("remote_management: request error: {}", e);
+                    return None;
+                }
             }
+        };
+
+        // Pack the response with the request_id
+        if let Some(response_data) = response_data {
+            match pack_response(&request_id, &response_data) {
+                Ok(packed) => Some(packed),
+                Err(e) => {
+                    log::warn!("remote_management: failed to pack response: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::trace!("remote_management: handler returned no response");
+            None
         }
     }
 
@@ -192,36 +243,21 @@ impl RemoteManagementService {
     }
 }
 
-/// Handle a /status request.
-///
-/// This gathers interface statistics and returns them to the caller.
+/// Handle a /status request (legacy handler, used by router for access control).
 fn handle_status_request(
     _path: &str,
-    data: &[u8],
+    _data: &[u8],
     _request_id: &[u8; 16],
     _link_id: &[u8],
     _remote_identity: Option<&[u8; 16]>,
     _requested_at: f64,
 ) -> Option<Vec<u8>> {
-    // Parse request data: [include_link_stats: bool]
-    let include_link_stats = parse_status_request_data(data);
-
-    // Gather interface statistics
-    // For now, return a placeholder response since we don't have direct access
-    // to the transport's interface manager from this context.
-    // In practice, this would be populated by the transport when it handles the request.
-    let interface_stats = gather_interface_stats();
-    let link_count = if include_link_stats { Some(0u64) } else { None };
-
-    // Pack response as msgpack
-    let response = pack_status_response(&interface_stats, link_count);
-
-    Some(response)
+    // This handler is only used for access control checks.
+    // Actual processing is done in handle_status_request_with_context.
+    None
 }
 
-/// Handle a /path request.
-///
-/// This queries the path table for a specific destination.
+/// Handle a /path request (legacy handler, used by router for access control).
 fn handle_path_request(
     _path: &str,
     _data: &[u8],
@@ -230,14 +266,226 @@ fn handle_path_request(
     _remote_identity: Option<&[u8; 16]>,
     _requested_at: f64,
 ) -> Option<Vec<u8>> {
-    // Placeholder for path request handling
-    // This would look up path information for a specific destination
-    log::debug!("remote_management: /path request (not yet implemented)");
+    // This handler is only used for access control checks.
+    // Actual processing is done in handle_path_request_with_context.
+    None
+}
 
-    // Return empty response for now
-    let mut response = Vec::new();
-    rmpv::encode::write_value(&mut response, &rmpv::Value::Nil).ok()?;
+/// Handle a /status request with context data.
+fn handle_status_request_with_context(
+    data: &[u8],
+    context: &RemoteManagementContext,
+) -> Option<Vec<u8>> {
+    // Parse request data: [include_link_stats: bool]
+    let include_link_stats = parse_status_request_data(data);
+
+    // Get link count if requested and available
+    let link_count = if include_link_stats {
+        context.link_count
+    } else {
+        None
+    };
+
+    // Pack response as msgpack
+    let response = pack_status_response(&context.interface_stats, link_count);
+
     Some(response)
+}
+
+/// Handle a /path request with context data.
+///
+/// Request format: ["table"|"rates", destination_hash?, max_hops?]
+fn handle_path_request_with_context(
+    data: &[u8],
+    context: &RemoteManagementContext,
+) -> Option<Vec<u8>> {
+    // Parse request data
+    let (command, destination_hash, max_hops) = match parse_path_request_data(data) {
+        Some(parsed) => parsed,
+        None => {
+            log::warn!("remote_management: failed to parse /path request data");
+            return None;
+        }
+    };
+
+    log::debug!(
+        "remote_management: /path request command={}, dest_hash={:?}, max_hops={:?}",
+        command, destination_hash.as_ref(), max_hops
+    );
+
+    match command.as_str() {
+        "table" => {
+            // Return path table, optionally filtered
+            let table = context.path_table.as_ref().map(|t| {
+                t.iter()
+                    .filter(|entry| {
+                        // Filter by destination hash if specified
+                        if let Some(ref filter_hash) = destination_hash {
+                            if entry.destination != *filter_hash {
+                                return false;
+                            }
+                        }
+                        // Filter by max hops if specified
+                        if let Some(max) = max_hops {
+                            if entry.hops > max {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }).unwrap_or_default();
+
+            let response = pack_path_table_response(&table);
+            Some(response)
+        }
+        "rates" => {
+            // Return rate table, optionally filtered
+            let table = context.rate_table.as_ref().map(|t| {
+                t.iter()
+                    .filter(|entry| {
+                        // Filter by destination hash if specified
+                        if let Some(ref filter_hash) = destination_hash {
+                            if entry.destination != *filter_hash {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }).unwrap_or_default();
+
+            let response = pack_rate_table_response(&table);
+            Some(response)
+        }
+        _ => {
+            log::warn!("remote_management: unknown /path command: {}", command);
+            None
+        }
+    }
+}
+
+/// Parse /path request data.
+///
+/// Returns (command, destination_hash, max_hops) if successful.
+fn parse_path_request_data(data: &[u8]) -> Option<(String, Option<String>, Option<u8>)> {
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data)).ok()?;
+
+    let arr = value.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+
+    let command = arr[0].as_str()?.to_string();
+
+    let destination_hash = if arr.len() > 1 {
+        arr[1].as_str().map(|s| s.to_string())
+            .or_else(|| arr[1].as_slice().map(|b| hex::encode(b)))
+    } else {
+        None
+    };
+
+    let max_hops = if arr.len() > 2 {
+        arr[2].as_u64().map(|n| n as u8)
+    } else {
+        None
+    };
+
+    Some((command, destination_hash, max_hops))
+}
+
+/// Pack path table response as msgpack.
+///
+/// Response format: array of path entries, each entry is a map with:
+/// - "hash": destination hash (hex string)
+/// - "timestamp": float
+/// - "via": next hop hash (hex string)
+/// - "hops": u8
+/// - "expires": float (or nil)
+/// - "interface": interface hash (hex string)
+fn pack_path_table_response(table: &[PathInfo]) -> Vec<u8> {
+    let entries: Vec<rmpv::Value> = table
+        .iter()
+        .map(|entry| {
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("hash".into()),
+                    rmpv::Value::String(entry.destination.clone().into()),
+                ),
+                (
+                    rmpv::Value::String("timestamp".into()),
+                    rmpv::Value::F64(entry.timestamp),
+                ),
+                (
+                    rmpv::Value::String("via".into()),
+                    rmpv::Value::String(entry.next_hop.clone().into()),
+                ),
+                (
+                    rmpv::Value::String("hops".into()),
+                    rmpv::Value::Integer(entry.hops.into()),
+                ),
+                (
+                    rmpv::Value::String("expires".into()),
+                    entry.expires.map(|e| rmpv::Value::F64(e)).unwrap_or(rmpv::Value::Nil),
+                ),
+                (
+                    rmpv::Value::String("interface".into()),
+                    rmpv::Value::String(entry.interface_hash.clone().into()),
+                ),
+            ])
+        })
+        .collect();
+
+    let response = rmpv::Value::Array(entries);
+
+    let mut packed = Vec::new();
+    if rmpv::encode::write_value(&mut packed, &response).is_err() {
+        log::warn!("remote_management: failed to pack path table response");
+    }
+    packed
+}
+
+/// Pack rate table response as msgpack.
+fn pack_rate_table_response(table: &[RateInfo]) -> Vec<u8> {
+    let entries: Vec<rmpv::Value> = table
+        .iter()
+        .map(|entry| {
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("hash".into()),
+                    rmpv::Value::String(entry.destination.clone().into()),
+                ),
+                (
+                    rmpv::Value::String("last".into()),
+                    entry.last_announce.map(|t| rmpv::Value::F64(t)).unwrap_or(rmpv::Value::Nil),
+                ),
+                (
+                    rmpv::Value::String("rate_violations".into()),
+                    rmpv::Value::Integer(entry.violations.into()),
+                ),
+                (
+                    rmpv::Value::String("blocked_until".into()),
+                    entry.blocked_until.map(|t| rmpv::Value::F64(t)).unwrap_or(rmpv::Value::Nil),
+                ),
+                (
+                    rmpv::Value::String("timestamps".into()),
+                    rmpv::Value::Array(
+                        entry.timestamps.iter().map(|t| rmpv::Value::F64(*t)).collect()
+                    ),
+                ),
+            ])
+        })
+        .collect();
+
+    let response = rmpv::Value::Array(entries);
+
+    let mut packed = Vec::new();
+    if rmpv::encode::write_value(&mut packed, &response).is_err() {
+        log::warn!("remote_management: failed to pack rate table response");
+    }
+    packed
 }
 
 /// Parse the status request data.
@@ -264,13 +512,6 @@ pub struct RemoteInterfaceStats {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub bitrate: Option<u64>,
-}
-
-/// Gather interface statistics (placeholder).
-fn gather_interface_stats() -> Vec<RemoteInterfaceStats> {
-    // This is a placeholder. In practice, the Transport would inject
-    // actual interface statistics when processing the request.
-    vec![]
 }
 
 /// Pack the status response as msgpack.
@@ -329,6 +570,7 @@ fn pack_status_response(
 pub async fn process_link_event(
     service: &RemoteManagementService,
     event: &LinkEventData,
+    context: &RemoteManagementContext,
     send_response: impl FnOnce(LinkId, Vec<u8>) + Send,
 ) {
     match &event.event {
@@ -359,6 +601,7 @@ pub async fn process_link_event(
                 payload.as_slice(),
                 event.id.as_slice(),
                 None, // Would need to get this from the link
+                context,
             ) {
                 send_response(event.id, response);
             }

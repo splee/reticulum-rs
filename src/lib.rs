@@ -38,6 +38,9 @@ pub mod testing;
 pub mod ipc;
 pub mod rpc;
 
+// Remote management client utilities
+pub mod remote_client;
+
 // Internal modules
 mod utils;
 mod serde;

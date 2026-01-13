@@ -62,6 +62,10 @@ struct Args {
     /// Identity hashes allowed for remote management (can be repeated)
     #[arg(long = "remote-management-allowed", value_name = "HASH")]
     remote_management_allowed: Vec<String>,
+
+    /// Enable publishing of blackhole list (public, no auth required)
+    #[arg(long)]
+    publish_blackhole: bool,
 }
 
 fn main() {
@@ -208,6 +212,18 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
             log::info!("Remote management destination: {}", format_hash(dest_hash.as_slice()));
             // Output full remote management destination hash for scripting/testing
             log::info!("REMOTE_MGMT_DEST={}", hex::encode(dest_hash.as_slice()));
+        }
+
+        // Start blackhole info publishing if enabled
+        if args.publish_blackhole {
+            log::info!("Starting blackhole info service...");
+            let dest_hash = transport.start_blackhole_info_service(
+                &identity,
+                cancel.clone(),
+            ).await;
+            log::info!("Blackhole info destination: {}", format_hash(dest_hash.as_slice()));
+            // Output full blackhole info destination hash for scripting/testing
+            log::info!("BLACKHOLE_INFO_DEST={}", hex::encode(dest_hash.as_slice()));
         }
 
         // Start shared instance services if enabled

@@ -17,6 +17,9 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::ipc::addr::ListenerAddr;
 use reticulum::logging;
+use reticulum::remote_client::{
+    self, RemoteClient, RemoteClientConfig, BLACKHOLE_INFO_ASPECT, REMOTE_MANAGEMENT_ASPECT,
+};
 use reticulum::rpc::RpcClient;
 use reticulum::transport::{Transport, TransportConfig};
 use reticulum::transport::blackhole::BlackholeManager;
@@ -88,6 +91,22 @@ struct Args {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Transport identity hash of remote instance to manage
+    #[arg(short = 'R', value_name = "HASH")]
+    remote: Option<String>,
+
+    /// Path to identity used for remote management authentication
+    #[arg(short = 'i', value_name = "PATH")]
+    identity: Option<PathBuf>,
+
+    /// Timeout for remote queries (seconds)
+    #[arg(short = 'W', value_name = "SECONDS", default_value = "15.0")]
+    remote_timeout: f64,
+
+    /// View published blackhole list for remote transport instance
+    #[arg(short = 'p', long = "blackholed-list")]
+    remote_blackholed_list: bool,
+
     /// Destination hash (required for some operations)
     destination: Option<String>,
 
@@ -152,7 +171,23 @@ async fn main() {
     };
 
     // Dispatch to appropriate handler
-    let exit_code = if args.blackholed {
+    // Check for remote mode first
+    let exit_code = if args.remote.is_some() {
+        // Remote mode - query remote transport instance
+        if args.remote_blackholed_list {
+            handle_remote_blackholed_list(&args, &config).await
+        } else if args.table {
+            handle_remote_path_table(&args, &config).await
+        } else if args.rates {
+            handle_remote_rate_table(&args, &config).await
+        } else {
+            // No operation specified for remote mode
+            if !args.json {
+                eprintln!("Remote mode requires -t (table), -r (rates), or -p (blackholed-list).");
+            }
+            1
+        }
+    } else if args.blackholed {
         handle_blackholed_list(&args, &config).await
     } else if args.blackhole {
         handle_blackhole(&args, &config).await
@@ -839,6 +874,718 @@ async fn handle_unblackhole(args: &Args, config: &ReticulumConfig) -> i32 {
             println!("{} was not blackholed", pretty_hash(&identity_hash));
         }
         1
+    }
+}
+
+// =============================================================================
+// Remote management handlers
+// =============================================================================
+
+/// Handle remote path table query (-R with -t)
+async fn handle_remote_path_table(args: &Args, config: &ReticulumConfig) -> i32 {
+    let transport_hash_str = args.remote.as_ref().unwrap();
+
+    if !args.json {
+        println!("Querying remote transport <{}>", transport_hash_str);
+    }
+
+    // Parse transport hash
+    let transport_hash = match remote_client::parse_transport_hash(transport_hash_str) {
+        Ok(hash) => hash,
+        Err(e) => {
+            if !args.json {
+                eprintln!("Error: {}", e);
+            }
+            return 1;
+        }
+    };
+
+    // Load identity if specified
+    let identity = if let Some(ref path) = args.identity {
+        match remote_client::load_identity(path) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                if !args.json {
+                    eprintln!("Error loading identity: {}", e);
+                }
+                return 2;
+            }
+        }
+    } else {
+        Some(PrivateIdentity::new_from_rand(OsRng))
+    };
+
+    // Create transport and client
+    let transport = remote_client::create_client_transport(config, "rnpath").await;
+    let client_config = RemoteClientConfig {
+        timeout: Duration::from_secs_f64(args.remote_timeout),
+        identity,
+    };
+    let client = RemoteClient::new(transport, client_config);
+
+    if !args.json {
+        print!("Establishing link... ");
+        io::stdout().flush().ok();
+    }
+
+    // Connect to remote management destination
+    let link = match client.connect(REMOTE_MANAGEMENT_ASPECT, &transport_hash).await {
+        Ok(link) => {
+            if !args.json {
+                println!("OK");
+            }
+            link
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            return 10;
+        }
+    };
+
+    if !args.json {
+        print!("Requesting path table... ");
+        io::stdout().flush().ok();
+    }
+
+    // Build request data: ["table", nil, max_hops]
+    let request_data = build_path_request("table", args.max_hops);
+
+    // Send request
+    match client.request(&link, "/path", &request_data).await {
+        Ok(response) => {
+            if !args.json {
+                println!("OK");
+                println!();
+            }
+
+            // Parse and display response
+            match parse_path_table_response(&response) {
+                Ok(entries) => {
+                    display_path_table(args, &entries);
+                    0
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprintln!("Error parsing response: {}", e);
+                    }
+                    16
+                }
+            }
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            15
+        }
+    }
+}
+
+/// Handle remote rate table query (-R with -r)
+async fn handle_remote_rate_table(args: &Args, config: &ReticulumConfig) -> i32 {
+    let transport_hash_str = args.remote.as_ref().unwrap();
+
+    if !args.json {
+        println!("Querying remote transport <{}>", transport_hash_str);
+    }
+
+    // Parse transport hash
+    let transport_hash = match remote_client::parse_transport_hash(transport_hash_str) {
+        Ok(hash) => hash,
+        Err(e) => {
+            if !args.json {
+                eprintln!("Error: {}", e);
+            }
+            return 1;
+        }
+    };
+
+    // Load identity if specified
+    let identity = if let Some(ref path) = args.identity {
+        match remote_client::load_identity(path) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                if !args.json {
+                    eprintln!("Error loading identity: {}", e);
+                }
+                return 2;
+            }
+        }
+    } else {
+        Some(PrivateIdentity::new_from_rand(OsRng))
+    };
+
+    // Create transport and client
+    let transport = remote_client::create_client_transport(config, "rnpath").await;
+    let client_config = RemoteClientConfig {
+        timeout: Duration::from_secs_f64(args.remote_timeout),
+        identity,
+    };
+    let client = RemoteClient::new(transport, client_config);
+
+    if !args.json {
+        print!("Establishing link... ");
+        io::stdout().flush().ok();
+    }
+
+    // Connect to remote management destination
+    let link = match client.connect(REMOTE_MANAGEMENT_ASPECT, &transport_hash).await {
+        Ok(link) => {
+            if !args.json {
+                println!("OK");
+            }
+            link
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            return 10;
+        }
+    };
+
+    if !args.json {
+        print!("Requesting rate table... ");
+        io::stdout().flush().ok();
+    }
+
+    // Build request data: ["rates"]
+    let request_data = build_path_request("rates", None);
+
+    // Send request
+    match client.request(&link, "/path", &request_data).await {
+        Ok(response) => {
+            if !args.json {
+                println!("OK");
+                println!();
+            }
+
+            // Parse and display response
+            match parse_rate_table_response(&response) {
+                Ok(entries) => {
+                    display_rate_table(args, &entries);
+                    0
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprintln!("Error parsing response: {}", e);
+                    }
+                    16
+                }
+            }
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            15
+        }
+    }
+}
+
+/// Handle remote blackhole list query (-R with -p)
+async fn handle_remote_blackholed_list(args: &Args, config: &ReticulumConfig) -> i32 {
+    let transport_hash_str = args.remote.as_ref().unwrap();
+
+    if !args.json {
+        println!("Querying remote transport <{}>", transport_hash_str);
+    }
+
+    // Parse transport hash
+    let transport_hash = match remote_client::parse_transport_hash(transport_hash_str) {
+        Ok(hash) => hash,
+        Err(e) => {
+            if !args.json {
+                eprintln!("Error: {}", e);
+            }
+            return 1;
+        }
+    };
+
+    // Blackhole info destination is public (ALLOW_ALL), no identity needed
+    // But we still need a temporary identity for the link handshake
+    let identity = Some(PrivateIdentity::new_from_rand(OsRng));
+
+    // Create transport and client
+    let transport = remote_client::create_client_transport(config, "rnpath").await;
+    let client_config = RemoteClientConfig {
+        timeout: Duration::from_secs_f64(args.remote_timeout),
+        identity,
+    };
+    let client = RemoteClient::new(transport, client_config);
+
+    if !args.json {
+        print!("Establishing link... ");
+        io::stdout().flush().ok();
+    }
+
+    // Connect to blackhole info destination (public, not management)
+    let link = match client.connect(BLACKHOLE_INFO_ASPECT, &transport_hash).await {
+        Ok(link) => {
+            if !args.json {
+                println!("OK");
+            }
+            link
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            return 10;
+        }
+    };
+
+    if !args.json {
+        print!("Requesting blackhole list... ");
+        io::stdout().flush().ok();
+    }
+
+    // Build request data (empty for /list)
+    let request_data = {
+        let value = rmpv::Value::Nil;
+        let mut packed = Vec::new();
+        rmpv::encode::write_value(&mut packed, &value).unwrap();
+        packed
+    };
+
+    // Send request
+    match client.request(&link, "/list", &request_data).await {
+        Ok(response) => {
+            if !args.json {
+                println!("OK");
+                println!();
+            }
+
+            // Parse and display response
+            match parse_blackhole_list_response(&response) {
+                Ok(entries) => {
+                    display_blackhole_list(args, &entries);
+                    0
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprintln!("Error parsing response: {}", e);
+                    }
+                    16
+                }
+            }
+        }
+        Err(e) => {
+            if !args.json {
+                println!("failed");
+                eprintln!("Error: {}", e);
+            }
+            15
+        }
+    }
+}
+
+/// Build a /path request payload
+fn build_path_request(command: &str, max_hops: Option<u8>) -> Vec<u8> {
+    let mut arr = vec![rmpv::Value::String(command.into())];
+
+    // Add nil for destination_hash (no filter)
+    arr.push(rmpv::Value::Nil);
+
+    // Add max_hops if specified
+    if let Some(hops) = max_hops {
+        arr.push(rmpv::Value::Integer(hops.into()));
+    }
+
+    let value = rmpv::Value::Array(arr);
+    let mut packed = Vec::new();
+    rmpv::encode::write_value(&mut packed, &value).unwrap();
+    packed
+}
+
+/// Remote path entry from response
+#[derive(Debug, Clone)]
+struct RemotePathEntry {
+    hash: String,
+    timestamp: f64,
+    via: String,
+    hops: u8,
+    expires: Option<f64>,
+    interface: String,
+}
+
+/// Remote rate entry from response
+#[derive(Debug, Clone)]
+struct RemoteRateEntry {
+    hash: String,
+    last: Option<f64>,
+    rate_violations: u32,
+    blocked_until: Option<f64>,
+    timestamps: Vec<f64>,
+}
+
+/// Parse path table response from remote
+fn parse_path_table_response(data: &[u8]) -> Result<Vec<RemotePathEntry>, String> {
+    // Response format: [request_id, response_data]
+    // where response_data is an array of path entries
+    let response_data = remote_client::parse_response(data)
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(&response_data))
+        .map_err(|e| format!("Failed to decode inner response: {}", e))?;
+
+    let arr = value.as_array().ok_or("Response is not an array")?;
+
+    let mut entries = Vec::new();
+    for item in arr {
+        if let Some(entry) = parse_remote_path_entry(item) {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Parse a single path entry from response
+fn parse_remote_path_entry(value: &rmpv::Value) -> Option<RemotePathEntry> {
+    let map = value.as_map()?;
+
+    let get_str = |key: &str| -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_str().map(|s| s.to_string()))
+    };
+
+    let get_f64 = |key: &str| -> Option<f64> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_f64())
+    };
+
+    let get_u8 = |key: &str| -> Option<u8> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64().map(|n| n as u8))
+    };
+
+    Some(RemotePathEntry {
+        hash: get_str("hash")?,
+        timestamp: get_f64("timestamp").unwrap_or(0.0),
+        via: get_str("via").unwrap_or_default(),
+        hops: get_u8("hops").unwrap_or(0),
+        expires: get_f64("expires"),
+        interface: get_str("interface").unwrap_or_default(),
+    })
+}
+
+/// Parse rate table response from remote
+fn parse_rate_table_response(data: &[u8]) -> Result<Vec<RemoteRateEntry>, String> {
+    let response_data = remote_client::parse_response(data)
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(&response_data))
+        .map_err(|e| format!("Failed to decode inner response: {}", e))?;
+
+    let arr = value.as_array().ok_or("Response is not an array")?;
+
+    let mut entries = Vec::new();
+    for item in arr {
+        if let Some(entry) = parse_remote_rate_entry(item) {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Parse a single rate entry from response
+fn parse_remote_rate_entry(value: &rmpv::Value) -> Option<RemoteRateEntry> {
+    let map = value.as_map()?;
+
+    let get_str = |key: &str| -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_str().map(|s| s.to_string()))
+    };
+
+    let get_f64_opt = |key: &str| -> Option<f64> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| if v.is_nil() { None } else { v.as_f64() })
+    };
+
+    let get_u32 = |key: &str| -> u32 {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(0)
+    };
+
+    let get_timestamps = |key: &str| -> Vec<f64> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default()
+    };
+
+    Some(RemoteRateEntry {
+        hash: get_str("hash")?,
+        last: get_f64_opt("last"),
+        rate_violations: get_u32("rate_violations"),
+        blocked_until: get_f64_opt("blocked_until"),
+        timestamps: get_timestamps("timestamps"),
+    })
+}
+
+/// Remote blackhole entry from response
+#[derive(Debug, Clone)]
+struct RemoteBlackholeEntry {
+    hash: String,
+    source: String,
+    until: Option<f64>,
+    reason: Option<String>,
+}
+
+/// Parse blackhole list response from remote
+///
+/// Response format (Python-compatible dict):
+/// {
+///   identity_hash_bytes: {
+///     "source": source_hash_bytes,
+///     "until": f64 or nil,
+///     "reason": string or nil
+///   },
+///   ...
+/// }
+fn parse_blackhole_list_response(data: &[u8]) -> Result<Vec<RemoteBlackholeEntry>, String> {
+    let response_data = remote_client::parse_response(data)
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(&response_data))
+        .map_err(|e| format!("Failed to decode inner response: {}", e))?;
+
+    let map = value.as_map().ok_or("Response is not a map")?;
+
+    let mut entries = Vec::new();
+    for (key, entry_value) in map {
+        // Key is identity hash (binary)
+        let hash = if let Some(bytes) = key.as_slice() {
+            hex::encode(bytes)
+        } else if let Some(s) = key.as_str() {
+            s.to_string()
+        } else {
+            continue;
+        };
+
+        // Value is a map with source, until, reason
+        if let Some(entry_map) = entry_value.as_map() {
+            let get_bin = |key_name: &str| -> Option<String> {
+                entry_map.iter()
+                    .find(|(k, _)| k.as_str() == Some(key_name))
+                    .and_then(|(_, v)| v.as_slice().map(hex::encode))
+            };
+
+            let get_f64_opt = |key_name: &str| -> Option<f64> {
+                entry_map.iter()
+                    .find(|(k, _)| k.as_str() == Some(key_name))
+                    .and_then(|(_, v)| if v.is_nil() { None } else { v.as_f64() })
+            };
+
+            let get_str_opt = |key_name: &str| -> Option<String> {
+                entry_map.iter()
+                    .find(|(k, _)| k.as_str() == Some(key_name))
+                    .and_then(|(_, v)| if v.is_nil() { None } else { v.as_str().map(|s| s.to_string()) })
+            };
+
+            entries.push(RemoteBlackholeEntry {
+                hash,
+                source: get_bin("source").unwrap_or_default(),
+                until: get_f64_opt("until"),
+                reason: get_str_opt("reason"),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Display blackhole list entries
+fn display_blackhole_list(args: &Args, entries: &[RemoteBlackholeEntry]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if args.json {
+        let json_entries: Vec<BlackholeJsonEntry> = entries
+            .iter()
+            .map(|e| BlackholeJsonEntry {
+                hash: e.hash.clone(),
+                until: e.until,
+                reason: e.reason.clone(),
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&json_entries) {
+            println!("{}", json);
+        }
+        return;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    if entries.is_empty() {
+        println!("No blackholed identities");
+        return;
+    }
+
+    println!("Blackholed Identities:");
+    for entry in entries {
+        let until_str = if let Some(until) = entry.until {
+            if until > now {
+                format!(" until {}", timestamp_str(until))
+            } else {
+                " (expired)".to_string()
+            }
+        } else {
+            " (indefinite)".to_string()
+        };
+
+        let reason_str = entry.reason.as_ref()
+            .map(|r| format!(" - {}", r))
+            .unwrap_or_default();
+
+        let source_str = if !entry.source.is_empty() {
+            format!(" [source: <{}>]", &entry.source)
+        } else {
+            String::new()
+        };
+
+        println!(
+            "  <{}>{}{}{}",
+            entry.hash,
+            until_str,
+            reason_str,
+            source_str,
+        );
+    }
+}
+
+/// Display path table entries (reused for both local and remote)
+fn display_path_table(args: &Args, entries: &[RemotePathEntry]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if args.json {
+        let json_entries: Vec<PathTableJsonEntry> = entries
+            .iter()
+            .map(|e| PathTableJsonEntry {
+                hash: e.hash.clone(),
+                timestamp: e.timestamp,
+                via: e.via.clone(),
+                hops: e.hops,
+                expires: e.expires.unwrap_or(0.0),
+                interface: e.interface.clone(),
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&json_entries) {
+            println!("{}", json);
+        }
+        return;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    if entries.is_empty() {
+        println!("No paths in table");
+        return;
+    }
+
+    println!("Path Table:");
+    for entry in entries {
+        let expires_in = entry.expires.map(|e| e - now).unwrap_or(0.0);
+        let expires_str = if expires_in > 0.0 {
+            format!(" expires {}", pretty_time(expires_in))
+        } else {
+            String::new()
+        };
+
+        println!(
+            "  <{}> {} hop{} via <{}>{} [{}]",
+            entry.hash,
+            entry.hops,
+            if entry.hops == 1 { "" } else { "s" },
+            entry.via,
+            expires_str,
+            entry.interface,
+        );
+    }
+}
+
+/// Display rate table entries (reused for both local and remote)
+fn display_rate_table(args: &Args, entries: &[RemoteRateEntry]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if args.json {
+        let json_entries: Vec<RateTableJsonEntry> = entries
+            .iter()
+            .map(|e| RateTableJsonEntry {
+                hash: e.hash.clone(),
+                last: e.last.unwrap_or(0.0),
+                rate_violations: e.rate_violations,
+                blocked_until: e.blocked_until.unwrap_or(0.0),
+                timestamps: e.timestamps.clone(),
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&json_entries) {
+            println!("{}", json);
+        }
+        return;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    if entries.is_empty() {
+        println!("No announce rate data");
+        return;
+    }
+
+    println!("Announce Rate Table:");
+    for entry in entries {
+        let rate = calculate_hourly_rate(&entry.timestamps, now);
+        let span = calculate_span_str(&entry.timestamps, now);
+
+        let last_str = entry.last
+            .map(|t| timestamp_str(t))
+            .unwrap_or_else(|| "never".to_string());
+
+        let blocked_str = if let Some(until) = entry.blocked_until {
+            if until > now {
+                format!(" BLOCKED until {}", timestamp_str(until))
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        println!(
+            "  <{}> {:.1}/hour over {} (last: {}, violations: {}){} ",
+            entry.hash,
+            rate,
+            span,
+            last_str,
+            entry.rate_violations,
+            blocked_str,
+        );
     }
 }
 

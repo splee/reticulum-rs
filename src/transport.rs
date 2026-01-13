@@ -55,6 +55,7 @@ pub mod path_table;
 
 // Phase 5: Transport enhancements
 pub mod blackhole;
+pub mod blackhole_info;
 pub mod path_request;
 pub mod remote_management;
 pub mod reverse_table;
@@ -424,11 +425,23 @@ impl Transport {
                                             }
                                         };
 
+                                        // Build context with transport data
+                                        let context = {
+                                            let handler = transport.lock().await;
+                                            remote_management::RemoteManagementContext {
+                                                path_table: Some(handler.path_table.get_paths(None)),
+                                                rate_table: Some(handler.announce_limits.get_rate_table()),
+                                                interface_stats: vec![], // TODO: gather interface stats
+                                                link_count: Some(handler.in_links.len() as u64),
+                                            }
+                                        };
+
                                         // Process the request
                                         if let Some(response) = service.process_request(
                                             payload.as_slice(),
                                             event.id.as_slice(),
                                             remote_identity_hash.as_ref(),
+                                            &context,
                                         ) {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
@@ -457,6 +470,132 @@ impl Transport {
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 log::info!("remote_management: event channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        dest_hash
+    }
+
+    /// Start the blackhole info service.
+    ///
+    /// This creates a public destination (ALLOW_ALL) that clients can query
+    /// to get the list of blackholed identities. This matches Python's
+    /// `--publish-blackhole` functionality.
+    ///
+    /// # Arguments
+    /// * `identity` - The transport's identity (used for the info destination)
+    /// * `cancel` - Cancellation token for graceful shutdown
+    ///
+    /// # Returns
+    /// The destination hash for the blackhole info service.
+    pub async fn start_blackhole_info_service(
+        &self,
+        identity: &PrivateIdentity,
+        cancel: CancellationToken,
+    ) -> AddressHash {
+        use crate::destination::link::{LinkEvent, LinkStatus};
+
+        let service = blackhole_info::BlackholeInfoService::new(identity);
+        let dest_hash = service.destination_hash().await;
+
+        // Register the destination with transport
+        {
+            let mut handler = self.handler.lock().await;
+            handler.single_in_destinations.insert(
+                dest_hash,
+                service.destination.clone(),
+            );
+        }
+
+        log::info!(
+            "Blackhole info service started at {}",
+            dest_hash
+        );
+
+        // Subscribe to link events for the info destination
+        let mut link_events = self.in_link_events();
+        let transport = self.handler.clone();
+
+        // Spawn handler task
+        tokio::spawn(async move {
+            log::debug!("Blackhole info event handler started");
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        log::info!("Blackhole info service shutting down");
+                        break;
+                    }
+
+                    result = link_events.recv() => {
+                        match result {
+                            Ok(event) => {
+                                // Only handle events for our destination
+                                if event.address_hash != dest_hash {
+                                    continue;
+                                }
+
+                                match &event.event {
+                                    LinkEvent::Activated => {
+                                        log::debug!("blackhole_info: link {} activated", event.id);
+                                    }
+                                    LinkEvent::Request(payload) => {
+                                        // Get the remote identity from the link
+                                        let remote_identity_hash = {
+                                            let handler = transport.lock().await;
+                                            if let Some(link) = handler.in_links.get(&event.id) {
+                                                let link = link.lock().await;
+                                                link.remote_identity_hash()
+                                            } else {
+                                                None
+                                            }
+                                        };
+
+                                        // Build context with blackhole entries
+                                        // TODO: Integrate with BlackholeManager when fully implemented
+                                        let context = blackhole_info::BlackholeInfoContext {
+                                            entries: vec![],
+                                        };
+
+                                        // Process the request
+                                        if let Some(response) = service.process_request(
+                                            payload.as_slice(),
+                                            event.id.as_slice(),
+                                            remote_identity_hash.as_ref(),
+                                            &context,
+                                        ) {
+                                            // Send the response back on the link
+                                            let handler = transport.lock().await;
+                                            if let Some(link) = handler.in_links.get(&event.id) {
+                                                let link = link.lock().await;
+                                                if link.status() == LinkStatus::Active {
+                                                    if let Ok(packet) = link.response_packet(&response) {
+                                                        handler.send_packet(packet).await;
+                                                        log::debug!(
+                                                            "blackhole_info: sent response on link {}",
+                                                            event.id
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LinkEvent::Closed => {
+                                        log::debug!("blackhole_info: link {} closed", event.id);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("blackhole_info: lagged {} events", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                log::info!("blackhole_info: event channel closed");
                                 break;
                             }
                         }

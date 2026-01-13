@@ -46,9 +46,14 @@ pub struct RateInfo {
 
 struct AnnounceLimitEntry {
     rate_limit: Option<AnnounceRateLimit>,
+    /// Current violation count (resets when grace period triggers block)
     violations: u32,
-    last_announce: Instant,
-    blocked_until: Instant,
+    /// Total violations since entry was created (never resets)
+    total_violations: u32,
+    /// Last announce time (None if this is the first announce)
+    last_announce: Option<Instant>,
+    /// When the block expires (None if not blocked)
+    blocked_until: Option<Instant>,
     /// History of announce timestamps for rate calculation
     timestamp_history: VecDeque<Instant>,
     /// When this entry was created (for unix timestamp calculation)
@@ -60,8 +65,9 @@ impl AnnounceLimitEntry {
         Self {
             rate_limit,
             violations: 0,
-            last_announce: Instant::now(),
-            blocked_until: Instant::now(),
+            total_violations: 0,
+            last_announce: None,
+            blocked_until: None,
             timestamp_history: VecDeque::with_capacity(MAX_TIMESTAMP_HISTORY),
             created_at: std::time::SystemTime::now(),
         }
@@ -91,29 +97,43 @@ impl AnnounceLimitEntry {
         }
 
         if let Some(ref rate_limit) = self.rate_limit {
-            if now < self.blocked_until {
-                self.blocked_until = now + rate_limit.target;
-                if let Some(penalty) = rate_limit.penalty {
-                    self.blocked_until += penalty;
+            // Check if currently blocked
+            if let Some(blocked) = self.blocked_until {
+                if now < blocked {
+                    // Still blocked - extend the block
+                    let mut new_blocked = now + rate_limit.target;
+                    if let Some(penalty) = rate_limit.penalty {
+                        new_blocked += penalty;
+                    }
+                    self.blocked_until = Some(new_blocked);
+                    is_blocked = true;
+                } else {
+                    // Block expired, clear it
+                    self.blocked_until = None;
                 }
-                is_blocked = true;
-            } else {
-                let next_allowed = self.last_announce + rate_limit.target;
-                if now < next_allowed {
-                    self.violations += 1;
-                    if self.violations >= rate_limit.grace {
-                        self.violations = 0;
-                        self.blocked_until = now + rate_limit.target;
-                        is_blocked = true;
+            }
+
+            // If not blocked, check for rate violations
+            if !is_blocked {
+                if let Some(last) = self.last_announce {
+                    let next_allowed = last + rate_limit.target;
+                    if now < next_allowed {
+                        self.violations += 1;
+                        self.total_violations += 1;
+                        if self.violations >= rate_limit.grace {
+                            self.violations = 0;
+                            self.blocked_until = Some(now + rate_limit.target);
+                            is_blocked = true;
+                        }
                     }
                 }
             }
         }
 
-        self.last_announce = now;
+        self.last_announce = Some(now);
 
         if is_blocked {
-            Some(self.blocked_until - now)
+            self.blocked_until.map(|blocked| blocked - now)
         } else {
             None
         }
@@ -129,12 +149,13 @@ impl AnnounceLimitEntry {
         let instant_now = Instant::now();
 
         // Convert last_announce to unix timestamp
-        let last_announce_unix = if self.last_announce <= instant_now {
-            let elapsed = self.last_announce.elapsed().as_secs_f64();
-            Some(now - elapsed)
-        } else {
-            None
-        };
+        let last_announce_unix = self.last_announce.and_then(|last| {
+            if last <= instant_now {
+                Some(now - last.elapsed().as_secs_f64())
+            } else {
+                None
+            }
+        });
 
         // Convert timestamp history to unix timestamps
         let timestamps: Vec<f64> = self
@@ -147,18 +168,20 @@ impl AnnounceLimitEntry {
             .collect();
 
         // Convert blocked_until to unix timestamp if currently blocked
-        let blocked_until_unix = if self.blocked_until > instant_now {
-            let remaining = (self.blocked_until - instant_now).as_secs_f64();
-            Some(now + remaining)
-        } else {
-            None
-        };
+        let blocked_until_unix = self.blocked_until.and_then(|blocked| {
+            if blocked > instant_now {
+                let remaining = (blocked - instant_now).as_secs_f64();
+                Some(now + remaining)
+            } else {
+                None
+            }
+        });
 
         RateInfo {
             destination: format!("{}", destination),
             last_announce: last_announce_unix,
             timestamps,
-            violations: self.violations,
+            violations: self.total_violations,
             blocked_until: blocked_until_unix,
         }
     }
@@ -225,8 +248,8 @@ impl AnnounceLimits {
             return entry.handle_announce();
         }
 
-        // Create new entry and record this announce
-        let mut entry = AnnounceLimitEntry::new(Default::default());
+        // Create new entry with default rate limits and record this announce
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));
         let result = entry.handle_announce();
         self.limits.insert(destination.clone(), entry);
 
@@ -260,9 +283,12 @@ impl AnnounceLimits {
 
     /// Remove entries that haven't been heard from in a while
     pub fn cleanup_stale(&mut self, max_age: Duration) {
-        let now = Instant::now();
-        self.limits
-            .retain(|_, entry| entry.last_announce.elapsed() <= max_age);
+        self.limits.retain(|_, entry| {
+            entry
+                .last_announce
+                .map(|last| last.elapsed() <= max_age)
+                .unwrap_or(true) // Keep entries that haven't announced yet
+        });
     }
 }
 
