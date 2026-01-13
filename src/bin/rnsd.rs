@@ -14,6 +14,7 @@ use rand_core::OsRng;
 use reticulum::config::{LogLevel, ReticulumConfig, StoragePaths};
 use reticulum::destination::request::AllowPolicy;
 use reticulum::identity::PrivateIdentity;
+use reticulum::stamper::Stamper;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::ipc::addr::ListenerAddr;
@@ -250,6 +251,7 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
             );
 
             // Start RPC server for management queries
+            // Uses Python-compatible HMAC authentication and pickle serialization
             let rpc_addr = ListenerAddr::default_rpc(
                 "default",
                 &socket_dir,
@@ -257,7 +259,28 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
             );
             log::info!("Starting RPC server on {}", rpc_addr.display());
 
-            let rpc_server = RpcServer::new(rpc_addr, transport.clone(), cancel.clone());
+            // Compute RPC authkey: use config value if present, otherwise derive from transport identity
+            let rpc_key = config.rpc_key.clone().unwrap_or_else(|| {
+                // Python uses: full_hash(transport_identity.get_private_key())
+                // Transport identity is stored separately from daemon identity
+                let transport_identity_file = config.paths.storage_path.join("transport_identity");
+                if let Ok(bytes) = fs::read(&transport_identity_file) {
+                    if bytes.len() == 64 {
+                        log::debug!("Loaded transport identity from {:?}", transport_identity_file);
+                        return Stamper::full_hash(&bytes).to_vec();
+                    }
+                }
+                // Fallback to daemon identity if transport identity doesn't exist
+                log::warn!("Transport identity not found, falling back to daemon identity for RPC key");
+                let private_key_bytes = identity.to_bytes();
+                Stamper::full_hash(&private_key_bytes).to_vec()
+            });
+            log::debug!("RPC key: {} ({})",
+                hex::encode(&rpc_key[..8.min(rpc_key.len())]),
+                if config.rpc_key.is_some() { "from config" } else { "derived from identity" }
+            );
+
+            let rpc_server = RpcServer::new(rpc_addr, transport.clone(), cancel.clone(), rpc_key);
             tokio::spawn(async move {
                 rpc_server.run().await;
             });

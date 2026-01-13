@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use sha2::Digest;
 use announce_limits::AnnounceLimits;
 use announce_table::AnnounceTable;
 use link_table::LinkTable;
@@ -29,7 +30,7 @@ use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
 
 use crate::error::RnsError;
-use crate::hash::AddressHash;
+use crate::hash::{AddressHash, Hash};
 use crate::identity::{Identity, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
@@ -285,6 +286,10 @@ impl Transport {
         let handler = PythonDiscoveryHandler::new(required_value)
             .with_storage(storage);
 
+        // Pre-compute the discovery aspect name hash for filtering
+        // Only announces for "rnstransport.discovery.interface" should be processed
+        let discovery_name = DestinationName::new("rnstransport", "discovery.interface");
+
         // Subscribe to announces
         let mut announce_rx = self.handler.lock().await.announce_tx.subscribe();
 
@@ -304,12 +309,27 @@ impl Transport {
                             Ok(event) => {
                                 // Get destination info
                                 let dest = event.destination.lock().await;
-                                let dest_hash = dest.identity.address_hash.as_slice();
-                                // Use first 16 bytes of address hash as identity hash
-                                let identity_hash = &dest_hash[..16];
 
-                                // Try to process as discovery announce
-                                // The handler will validate the format and stamp
+                                // Filter by aspect: only process announces for the discovery aspect
+                                // Compute expected destination hash for this identity + discovery aspect
+                                let identity_hash = dest.identity.address_hash.as_slice();
+                                let expected_dest_hash = AddressHash::new_from_hash(&Hash::new(
+                                    Hash::generator()
+                                        .chain_update(discovery_name.as_name_hash_slice())
+                                        .chain_update(identity_hash)
+                                        .finalize()
+                                        .into(),
+                                ));
+
+                                // Compare with actual destination hash from the announce
+                                let actual_dest_hash = dest.desc.address_hash;
+                                if expected_dest_hash.as_slice() != actual_dest_hash.as_slice() {
+                                    // Not a discovery announce, skip it
+                                    continue;
+                                }
+
+                                // This is a discovery announce - process it
+                                let dest_hash = actual_dest_hash.as_slice();
                                 let app_data = event.app_data.as_slice();
                                 let hops = 0u8; // TODO: Get actual hop count from announce
 
@@ -1527,7 +1547,8 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
 async fn handle_announce<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
-    iface: AddressHash
+    iface: AddressHash,
+    from_local_client: bool,
 ) {
     if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
         log::info!(
@@ -1576,8 +1597,11 @@ async fn handle_announce<'a>(
             );
         }
 
-        let retransmit = handler.config.retransmit;
-        if retransmit {
+        // Retransmit announces if transport is enabled OR if from local client.
+        // This matches Python behavior where local client announces are always
+        // forwarded to network interfaces even when transport is disabled.
+        let should_retransmit = handler.config.retransmit || from_local_client;
+        if should_retransmit {
             let transport_id = *handler.config.identity.address_hash();
             if let Some((recv_from, packet)) = handler.announce_table.new_packet(
                 &dest_hash,
@@ -1851,6 +1875,24 @@ async fn manage_transport(
                             continue;
                         }
 
+                        // Check if this packet came from a local client interface
+                        let from_local_client = handler.iface_manager.lock().await
+                            .is_local_client(&message.address);
+
+                        // Always forward packets to local IPC client interfaces.
+                        // This ensures local clients receive all traffic regardless of
+                        // the transport's broadcast/retransmit settings.
+                        handler.iface_manager.lock().await
+                            .send_to_local_clients(packet, Some(message.address)).await;
+
+                        // Forward packets from local clients to all network interfaces,
+                        // regardless of the broadcast setting. This matches Python behavior
+                        // where local client packets are always relayed to the network.
+                        if from_local_client && packet.header.packet_type != PacketType::Announce {
+                            handler.iface_manager.lock().await
+                                .send_from_local_client(packet, message.address).await;
+                        }
+
                         if handler.config.broadcast && packet.header.packet_type != PacketType::Announce {
                             // TODO: remove seperate handling for announces in handle_announce.
                             // Send broadcast message expect current iface address
@@ -1861,7 +1903,8 @@ async fn manage_transport(
                             PacketType::Announce => handle_announce(
                                 &packet,
                                 handler,
-                                message.address
+                                message.address,
+                                from_local_client,
                             ).await,
                             PacketType::LinkRequest => handle_link_request(
                                 &packet,
@@ -2023,7 +2066,7 @@ mod tests {
 
         assert!(handler.lock().await.filter_duplicate_packets(&announce).await);
 
-        handle_announce(&announce, handler.lock().await, next_hop_iface).await;
+        handle_announce(&announce, handler.lock().await, next_hop_iface, false).await;
 
         let mut data_packet: Packet = Default::default();
         data_packet.data = PacketDataBuffer::new_from_slice(b"foo");

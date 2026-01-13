@@ -27,6 +27,7 @@ use reticulum::ipc::addr::{IpcListener, ListenerAddr};
 use reticulum::ipc::{LocalClientInterface, LocalServerInterface};
 use reticulum::logging;
 use reticulum::rpc::RpcClient;
+use reticulum::stamper::Stamper;
 use reticulum::transport::{Transport, TransportConfig};
 
 /// Interface mode constants matching Python implementation
@@ -1145,12 +1146,55 @@ fn output_json_error(error_type: &str, message: &str) {
     println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap());
 }
 
+/// Create an RPC client for communicating with the daemon.
+///
+/// This computes the RPC authentication key in the same way as the daemon:
+/// - Use config rpc_key if specified
+/// - Otherwise derive from daemon identity using full_hash(private_key_bytes)
+fn create_rpc_client(config: &ReticulumConfig) -> Option<RpcClient> {
+    let socket_dir = config.paths.config_dir.join("sockets");
+    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
+
+    // Compute RPC key
+    let rpc_key = if let Some(ref key) = config.rpc_key {
+        key.clone()
+    } else {
+        // Load daemon identity to derive key
+        let identity_file = config.paths.identity_path.join("daemon_identity");
+        if !identity_file.exists() {
+            log::warn!("Daemon identity file not found: {:?}", identity_file);
+            return None;
+        }
+
+        let identity_bytes = match fs::read(&identity_file) {
+            Ok(bytes) if bytes.len() == 64 => bytes,
+            Ok(_) => {
+                log::warn!("Invalid daemon identity file length");
+                return None;
+            }
+            Err(e) => {
+                log::warn!("Failed to read daemon identity: {}", e);
+                return None;
+            }
+        };
+
+        // Derive RPC key: full_hash(private_key_bytes)
+        Stamper::full_hash(&identity_bytes).to_vec()
+    };
+
+    Some(RpcClient::new(rpc_addr, rpc_key))
+}
+
 /// Show discovered interfaces
 fn show_discovered_interfaces(args: &Args, config: &ReticulumConfig) {
     // Query daemon for discovered interfaces via RPC
-    let socket_dir = config.paths.config_dir.join("sockets");
-    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
-    let client = RpcClient::new(rpc_addr);
+    let client = match create_rpc_client(config) {
+        Some(c) => c,
+        None => {
+            eprintln!("Failed to create RPC client (daemon not running or identity not found)");
+            return;
+        }
+    };
 
     // Use tokio runtime to make async RPC call
     let rt = match tokio::runtime::Runtime::new() {
@@ -1330,11 +1374,9 @@ fn show_discovered_interfaces(args: &Args, config: &ReticulumConfig) {
 
 /// Try to connect to shared instance and get stats via RPC
 fn get_shared_instance_stats(config: &ReticulumConfig) -> Result<NetworkStats, String> {
-    // Create RPC client with appropriate address for this platform
-    let socket_dir = config.paths.config_dir.join("sockets");
-    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
-
-    let client = RpcClient::new(rpc_addr);
+    // Create RPC client with authentication
+    let client = create_rpc_client(config)
+        .ok_or_else(|| "Failed to create RPC client (daemon not running or identity not found)".to_string())?;
 
     // Use tokio runtime to make async RPC call
     let rt = tokio::runtime::Runtime::new()
@@ -1378,11 +1420,9 @@ fn get_shared_instance_stats(config: &ReticulumConfig) -> Result<NetworkStats, S
 
 /// Get link count from shared instance via RPC
 fn get_link_count(config: &ReticulumConfig) -> Result<u32, String> {
-    // Create RPC client with appropriate address for this platform
-    let socket_dir = config.paths.config_dir.join("sockets");
-    let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
-
-    let client = RpcClient::new(rpc_addr);
+    // Create RPC client with authentication
+    let client = create_rpc_client(config)
+        .ok_or_else(|| "Failed to create RPC client (daemon not running or identity not found)".to_string())?;
 
     // Use tokio runtime to make async RPC call
     let rt = tokio::runtime::Runtime::new()

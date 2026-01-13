@@ -34,6 +34,7 @@ hkdf = "0.12.4"
 # Hash
 hmac = "0.12.1"
 sha2 = "0.10.8"
+md-5 = "0.10"  # For legacy Python RPC auth (MD5-only clients)
 
 # Random Number generator
 rand = "0.8"
@@ -48,11 +49,13 @@ tokio-stream = "0.1.17"
 tokio-util = "0.7.15"
 futures = "0.3"
 
+# Serialization
 rmp = "0.8.14"
 rmpv = "1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1.0"
+serde-pickle = "1.2"  # Python pickle protocol for RPC compatibility
 
 # Logging
 log = "0.4.27"

@@ -89,6 +89,8 @@ struct LocalInterface {
     address: AddressHash,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
+    /// True if this is a local IPC client interface (should always receive packets)
+    is_local_client: bool,
 }
 
 pub struct InterfaceContext<T: Interface> {
@@ -120,6 +122,16 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
+        self.new_channel_impl(tx_cap, false)
+    }
+
+    /// Create a channel for a local IPC client interface.
+    /// Local client interfaces always receive packets regardless of broadcast settings.
+    pub fn new_channel_local_client(&mut self, tx_cap: usize) -> InterfaceChannel {
+        self.new_channel_impl(tx_cap, true)
+    }
+
+    fn new_channel_impl(&mut self, tx_cap: usize, is_local_client: bool) -> InterfaceChannel {
         self.counter += 1;
 
         let counter_bytes = self.counter.to_le_bytes();
@@ -127,7 +139,7 @@ impl InterfaceManager {
 
         let (tx_send, tx_recv) = InterfaceChannel::make_tx_channel(tx_cap);
 
-        log::debug!("iface: create channel {}", address);
+        log::debug!("iface: create channel {} (local_client={})", address, is_local_client);
 
         let stop = CancellationToken::new();
 
@@ -135,6 +147,7 @@ impl InterfaceManager {
             address,
             tx_send,
             stop: stop.clone(),
+            is_local_client,
         });
 
         InterfaceChannel {
@@ -146,11 +159,22 @@ impl InterfaceManager {
     }
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        let channel = self.new_channel(1);
+        self.new_context_impl(inner, false)
+    }
+
+    /// Create a context for a local IPC client interface.
+    pub fn new_context_local_client<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
+        self.new_context_impl(inner, true)
+    }
+
+    fn new_context_impl<T: Interface>(&mut self, inner: T, is_local_client: bool) -> InterfaceContext<T> {
+        let channel = if is_local_client {
+            self.new_channel_local_client(1)
+        } else {
+            self.new_channel(1)
+        };
 
         let inner = Arc::new(Mutex::new(inner));
-
-        
 
         InterfaceContext::<T> {
             inner: inner.clone(),
@@ -166,6 +190,22 @@ impl InterfaceManager {
         R::Output: Send + 'static,
     {
         let context = self.new_context(inner);
+        let address = *context.channel.address();
+
+        task::spawn(worker(context));
+
+        address
+    }
+
+    /// Spawn a local IPC client interface.
+    /// Local client interfaces always receive packets regardless of broadcast settings.
+    pub fn spawn_local_client<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        let context = self.new_context_local_client(inner);
         let address = *context.channel.address();
 
         task::spawn(worker(context));
@@ -209,6 +249,63 @@ impl InterfaceManager {
                     "iface_manager: no interface matched for direct send to {}",
                     target_addr
                 );
+            }
+        }
+    }
+
+    /// Send a packet to all local client interfaces.
+    /// This is used to forward packets from network interfaces to local IPC clients,
+    /// regardless of the transport's broadcast setting.
+    /// The `exclude_address` is typically the interface that received the packet.
+    pub async fn send_to_local_clients(&self, packet: Packet, exclude_address: Option<AddressHash>) {
+        for iface in &self.ifaces {
+            if !iface.is_local_client {
+                continue;
+            }
+
+            // Don't send back to the interface that received this packet
+            if let Some(exclude) = &exclude_address {
+                if *exclude == iface.address {
+                    continue;
+                }
+            }
+
+            if !iface.stop.is_cancelled() {
+                let _ = iface.tx_send.send(TxMessage {
+                    tx_type: TxMessageType::Broadcast(exclude_address),
+                    packet,
+                }).await;
+            }
+        }
+    }
+
+    /// Check if there are any local client interfaces connected.
+    pub fn has_local_clients(&self) -> bool {
+        self.ifaces.iter().any(|iface| iface.is_local_client && !iface.stop.is_cancelled())
+    }
+
+    /// Check if an interface address belongs to a local client interface.
+    pub fn is_local_client(&self, address: &AddressHash) -> bool {
+        self.ifaces.iter().any(|iface| &iface.address == address && iface.is_local_client)
+    }
+
+    /// Send a packet from a local client to all network interfaces.
+    /// This forwards packets from IPC clients to the actual network,
+    /// regardless of the transport's broadcast setting.
+    /// The `from_address` is the local client interface that sent the packet.
+    pub async fn send_from_local_client(&self, packet: Packet, from_address: AddressHash) {
+        for iface in &self.ifaces {
+            // Skip local client interfaces (don't send to other local clients from this path)
+            // and skip the source interface
+            if iface.is_local_client || iface.address == from_address {
+                continue;
+            }
+
+            if !iface.stop.is_cancelled() {
+                let _ = iface.tx_send.send(TxMessage {
+                    tx_type: TxMessageType::Broadcast(Some(from_address)),
+                    packet,
+                }).await;
             }
         }
     }

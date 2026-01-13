@@ -1,17 +1,25 @@
 //! RPC server implementation for daemon mode.
 //!
 //! The RPC server listens for connections from CLI utilities and handles
-//! queries about daemon state. Each connection follows a simple pattern:
-//! connect → receive request → send response → close.
+//! queries about daemon state. The protocol is compatible with Python's
+//! `multiprocessing.connection`:
+//!
+//! 1. Accept connection
+//! 2. Perform mutual HMAC authentication
+//! 3. Receive pickle-encoded request
+//! 4. Process request and send pickle-encoded response
+//! 5. Close connection
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::ipc::addr::{IpcListener, ListenerAddr};
+use crate::ipc::addr::{IpcListener, IpcStream, ListenerAddr};
 use crate::transport::Transport;
 
+use super::auth::{server_authenticate, AuthError};
+use super::framing::{recv_bytes, send_bytes};
+use super::pickle_protocol::{parse_request, serialize_response, PickleProtocolError};
 use super::protocol::{
     DiscoveredInterfaceEntry, InterfaceStats, PathEntry, RpcRequest, RpcResponse, RpcResult,
 };
@@ -19,13 +27,19 @@ use super::protocol::{
 use crate::config::ReticulumConfig;
 use crate::discovery::InterfaceDiscoveryStorage;
 
-/// Maximum size of an RPC message (16 KB should be plenty).
-const MAX_MESSAGE_SIZE: usize = 16 * 1024;
+/// Maximum size of an RPC message (1 MB should be plenty).
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
 /// RPC server that handles management queries from CLI utilities.
 ///
 /// The server listens on a Unix socket (or TCP on Windows) and processes
 /// RPC requests from local clients like rnstatus, rnpath, etc.
+///
+/// ## Authentication
+///
+/// All connections must authenticate using HMAC challenge-response.
+/// The authkey is typically derived from the transport identity's private key:
+/// `authkey = full_hash(transport_identity.private_key())`
 pub struct RpcServer {
     /// Address to listen on.
     addr: ListenerAddr,
@@ -33,6 +47,8 @@ pub struct RpcServer {
     transport: Arc<Transport>,
     /// Cancellation token for shutdown.
     cancel: CancellationToken,
+    /// Authentication key for HMAC challenge-response.
+    authkey: Vec<u8>,
 }
 
 impl RpcServer {
@@ -42,15 +58,18 @@ impl RpcServer {
     /// * `addr` - The address to listen on
     /// * `transport` - Reference to the daemon's transport
     /// * `cancel` - Cancellation token for graceful shutdown
+    /// * `authkey` - HMAC authentication key
     pub fn new(
         addr: ListenerAddr,
         transport: Arc<Transport>,
         cancel: CancellationToken,
+        authkey: Vec<u8>,
     ) -> Self {
         Self {
             addr,
             transport,
             cancel,
+            authkey,
         }
     }
 
@@ -88,10 +107,11 @@ impl RpcServer {
                                 log::debug!("rpc_server: connection from <{}>", peer_addr);
 
                                 let transport = self.transport.clone();
+                                let authkey = self.authkey.clone();
 
                                 // Handle each connection in a separate task
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_rpc_connection(stream, transport).await {
+                                    if let Err(e) = handle_rpc_connection(stream, transport, &authkey).await {
                                         log::debug!("rpc_server: client <{}> error: {}", peer_addr, e);
                                     }
                                 });
@@ -111,44 +131,37 @@ impl RpcServer {
 
 /// Handle a single RPC connection.
 ///
-/// Reads one request, processes it, sends the response, then closes.
+/// Performs authentication, reads one request, processes it, sends the response, then closes.
 async fn handle_rpc_connection(
-    stream: crate::ipc::addr::IpcStream,
+    mut stream: IpcStream,
     transport: Arc<Transport>,
+    authkey: &[u8],
 ) -> Result<(), RpcError> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    // Step 1: Perform mutual HMAC authentication
+    server_authenticate(&mut stream, authkey)
+        .await
+        .map_err(RpcError::Auth)?;
 
-    // Read request length (4-byte big-endian)
-    let mut len_bytes = [0u8; 4];
-    reader.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
+    log::debug!("rpc_server: client authenticated");
 
-    if len > MAX_MESSAGE_SIZE {
-        return Err(RpcError::MessageTooLarge(len));
-    }
+    // Step 2: Receive pickle-encoded request
+    let request_bytes = recv_bytes(&mut stream, MAX_MESSAGE_SIZE).await?;
 
-    // Read request body
-    let mut request_bytes = vec![0u8; len];
-    reader.read_exact(&mut request_bytes).await?;
-
-    // Deserialize request
-    let request: RpcRequest = rmp_serde::from_slice(&request_bytes)
-        .map_err(|e| RpcError::DeserializationError(e.to_string()))?;
+    // Step 3: Parse pickle request into RpcRequest
+    let request = parse_request(&request_bytes).map_err(RpcError::Protocol)?;
 
     log::debug!("rpc_server: received request: {}", request.name());
 
-    // Process request
+    // Step 4: Process request
     let response = process_request(request, &transport).await;
 
-    // Serialize response
-    let response_bytes = rmp_serde::to_vec(&response)
-        .map_err(|e| RpcError::SerializationError(e.to_string()))?;
+    // Step 5: Serialize response to pickle format
+    let response_bytes = serialize_response(&response).map_err(RpcError::Protocol)?;
 
-    // Send response length and body
-    let len_bytes = (response_bytes.len() as u32).to_be_bytes();
-    writer.write_all(&len_bytes).await?;
-    writer.write_all(&response_bytes).await?;
-    writer.flush().await?;
+    // Step 6: Send pickle-encoded response
+    send_bytes(&mut stream, &response_bytes).await?;
+
+    log::debug!("rpc_server: response sent");
 
     Ok(())
 }
@@ -159,8 +172,6 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
         RpcRequest::Ping => RpcResponse::success(RpcResult::Pong),
 
         RpcRequest::GetInterfaceStats => {
-            // For now, return empty stats - the interface manager doesn't track
-            // detailed statistics yet. This will be expanded when stats are added.
             let stats = get_interface_stats(transport).await;
             RpcResponse::success(RpcResult::InterfaceStats(stats))
         }
@@ -240,8 +251,6 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
 async fn get_interface_stats(_transport: &Transport) -> Vec<InterfaceStats> {
     // The current InterfaceManager doesn't track detailed statistics.
     // This is a placeholder that will be expanded when stats tracking is added.
-    //
-    // For now, we return basic info about connected interfaces.
     vec![]
 }
 
@@ -307,52 +316,50 @@ async fn get_discovered_interfaces() -> Vec<DiscoveredInterfaceEntry> {
 
     // Load and convert all discovered interfaces (no source filtering)
     match storage.list_discovered(None) {
-        Ok(interfaces) => {
-            interfaces
-                .into_iter()
-                .map(|info| {
-                    // Get status string - should be set by list_discovered
-                    let status_str = info.status
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .map(|info| {
+                let status_str = info
+                    .status
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-                    DiscoveredInterfaceEntry {
-                        name: info.name,
-                        interface_type: info.interface_type,
-                        status: status_str,
-                        transport: info.transport,
-                        hops: info.hops,
-                        discovered: info.discovered,
-                        last_heard: info.last_heard,
-                        value: info.value,
-                        transport_id: if info.transport_id.is_empty() {
-                            None
-                        } else {
-                            Some(info.transport_id)
-                        },
-                        network_id: if info.network_id.is_empty() {
-                            None
-                        } else {
-                            Some(info.network_id)
-                        },
-                        latitude: info.latitude,
-                        longitude: info.longitude,
-                        height: info.height,
-                        frequency: info.frequency,
-                        bandwidth: info.bandwidth,
-                        sf: info.sf,
-                        cr: info.cr,
-                        modulation: info.modulation,
-                        reachable_on: info.reachable_on,
-                        port: info.port,
-                        ifac_netname: info.ifac_netname,
-                        ifac_netkey: info.ifac_netkey,
-                        config_entry: info.config_entry,
-                    }
-                })
-                .collect()
-        }
+                DiscoveredInterfaceEntry {
+                    name: info.name,
+                    interface_type: info.interface_type,
+                    status: status_str,
+                    transport: info.transport,
+                    hops: info.hops,
+                    discovered: info.discovered,
+                    last_heard: info.last_heard,
+                    value: info.value,
+                    transport_id: if info.transport_id.is_empty() {
+                        None
+                    } else {
+                        Some(info.transport_id)
+                    },
+                    network_id: if info.network_id.is_empty() {
+                        None
+                    } else {
+                        Some(info.network_id)
+                    },
+                    latitude: info.latitude,
+                    longitude: info.longitude,
+                    height: info.height,
+                    frequency: info.frequency,
+                    bandwidth: info.bandwidth,
+                    sf: info.sf,
+                    cr: info.cr,
+                    modulation: info.modulation,
+                    reachable_on: info.reachable_on,
+                    port: info.port,
+                    ifac_netname: info.ifac_netname,
+                    ifac_netkey: info.ifac_netkey,
+                    config_entry: info.config_entry,
+                }
+            })
+            .collect(),
         Err(e) => {
             log::warn!("Failed to load discovered interfaces: {}", e);
             vec![]
@@ -362,26 +369,41 @@ async fn get_discovered_interfaces() -> Vec<DiscoveredInterfaceEntry> {
 
 /// Errors that can occur during RPC handling.
 #[derive(Debug)]
-enum RpcError {
+pub enum RpcError {
     /// I/O error during communication.
     Io(std::io::Error),
+    /// Authentication error.
+    Auth(AuthError),
+    /// Protocol error (pickle parsing/serialization).
+    Protocol(PickleProtocolError),
     /// Message exceeded maximum size.
     MessageTooLarge(usize),
-    /// Failed to deserialize request.
-    DeserializationError(String),
-    /// Failed to serialize response.
-    SerializationError(String),
 }
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RpcError::Io(e) => write!(f, "I/O error: {}", e),
+            RpcError::Auth(e) => write!(f, "Authentication error: {}", e),
+            RpcError::Protocol(e) => write!(f, "Protocol error: {}", e),
             RpcError::MessageTooLarge(size) => {
-                write!(f, "Message too large: {} bytes (max {})", size, MAX_MESSAGE_SIZE)
+                write!(
+                    f,
+                    "Message too large: {} bytes (max {})",
+                    size, MAX_MESSAGE_SIZE
+                )
             }
-            RpcError::DeserializationError(e) => write!(f, "Deserialization error: {}", e),
-            RpcError::SerializationError(e) => write!(f, "Serialization error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for RpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RpcError::Io(e) => Some(e),
+            RpcError::Auth(e) => Some(e),
+            RpcError::Protocol(e) => Some(e),
+            _ => None,
         }
     }
 }

@@ -200,32 +200,30 @@ impl Config {
             // Calculate indent level for subsection detection
             let line_indent = line.len() - line.trim_start().len();
 
-            // Section header
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                let section_name = &trimmed[1..trimmed.len() - 1];
-
-                // Check if this is a subsection (indented section header)
-                if line_indent > indent_level && current_section.is_some() {
-                    // This is a subsection of the current section
-                    current_subsection = Some(section_name.to_string());
-                    if let Some(ref section) = current_section {
-                        config
-                            .sections
-                            .entry(section.clone())
-                            .or_default()
-                            .subsections
-                            .insert(section_name.to_string(), ConfigSection::default());
-                    }
-                } else {
-                    // This is a top-level section
-                    current_section = Some(section_name.to_string());
-                    current_subsection = None;
-                    indent_level = line_indent;
+            // Section header - check for double brackets [[name]] (subsection) or single [name] (section)
+            if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+                // Double brackets: subsection (e.g., [[Interface Name]])
+                let subsection_name = &trimmed[2..trimmed.len() - 2];
+                current_subsection = Some(subsection_name.to_string());
+                if let Some(ref section) = current_section {
                     config
                         .sections
-                        .entry(section_name.to_string())
-                        .or_default();
+                        .entry(section.clone())
+                        .or_default()
+                        .subsections
+                        .insert(subsection_name.to_string(), ConfigSection::default());
                 }
+                continue;
+            } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                // Single brackets: top-level section (e.g., [interfaces])
+                let section_name = &trimmed[1..trimmed.len() - 1];
+                current_section = Some(section_name.to_string());
+                current_subsection = None;
+                indent_level = line_indent;
+                config
+                    .sections
+                    .entry(section_name.to_string())
+                    .or_default();
                 continue;
             }
 
@@ -331,6 +329,10 @@ pub struct ReticulumConfig {
     pub link_mtu_discovery: bool,
     /// Whether panic on interface error
     pub panic_on_interface_error: bool,
+    /// Optional RPC authentication key (hex string in config).
+    /// If not set, derived from transport identity's private key.
+    /// Used for HMAC authentication with Python's multiprocessing.connection protocol.
+    pub rpc_key: Option<Vec<u8>>,
 }
 
 impl ReticulumConfig {
@@ -389,6 +391,11 @@ impl ReticulumConfig {
             .and_then(|s| s.get_bool("panic_on_interface_error"))
             .unwrap_or(false);
 
+        // Parse optional RPC key (hex string)
+        let rpc_key = reticulum_section
+            .and_then(|s| s.get("rpc_key"))
+            .and_then(|hex_str| hex::decode(hex_str).ok());
+
         Self {
             paths,
             config,
@@ -401,6 +408,7 @@ impl ReticulumConfig {
             log_level: LogLevel::Notice,
             link_mtu_discovery: true,
             panic_on_interface_error,
+            rpc_key,
         }
     }
 
@@ -456,7 +464,9 @@ impl ReticulumConfig {
                         .get("type")
                         .unwrap_or("TCPClientInterface")
                         .to_string(),
-                    enabled: subsection.get_bool("interface_enabled").unwrap_or(true),
+                    enabled: subsection.get_bool("enabled")
+                        .or_else(|| subsection.get_bool("interface_enabled"))
+                        .unwrap_or(true),
                     target_host: subsection.get("target_host").map(|s| s.to_string()),
                     target_port: subsection.get_int("target_port").map(|p| p as u16),
                     listen_ip: subsection.get("listen_ip").map(|s| s.to_string()),

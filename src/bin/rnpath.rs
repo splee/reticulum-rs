@@ -12,6 +12,8 @@ use clap::Parser;
 use rand_core::OsRng;
 use serde::Serialize;
 
+use std::fs;
+
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
@@ -21,6 +23,7 @@ use reticulum::remote_client::{
     self, RemoteClient, RemoteClientConfig, BLACKHOLE_INFO_ASPECT, REMOTE_MANAGEMENT_ASPECT,
 };
 use reticulum::rpc::RpcClient;
+use reticulum::stamper::Stamper;
 use reticulum::transport::{Transport, TransportConfig};
 use reticulum::transport::blackhole::BlackholeManager;
 
@@ -245,28 +248,64 @@ async fn create_transport(_config: &ReticulumConfig) -> Transport {
     Transport::new(transport_config)
 }
 
-/// Create an RPC client for daemon communication
-fn create_rpc_client(config: &ReticulumConfig) -> RpcClient {
+/// Create an RPC client for daemon communication with authentication.
+///
+/// Returns None if the daemon identity cannot be loaded.
+fn create_rpc_client(config: &ReticulumConfig) -> Option<RpcClient> {
     let socket_dir = config.paths.config_dir.join("sockets");
     let rpc_addr = ListenerAddr::default_rpc("default", &socket_dir, config.control_port);
-    RpcClient::new(rpc_addr)
+
+    // Compute RPC key
+    let rpc_key = if let Some(ref key) = config.rpc_key {
+        key.clone()
+    } else {
+        // Load daemon identity to derive key
+        let identity_file = config.paths.identity_path.join("daemon_identity");
+        if !identity_file.exists() {
+            log::debug!("Daemon identity file not found: {:?}", identity_file);
+            return None;
+        }
+
+        let identity_bytes = match fs::read(&identity_file) {
+            Ok(bytes) if bytes.len() == 64 => bytes,
+            Ok(_) => {
+                log::debug!("Invalid daemon identity file length");
+                return None;
+            }
+            Err(e) => {
+                log::debug!("Failed to read daemon identity: {}", e);
+                return None;
+            }
+        };
+
+        // Derive RPC key: full_hash(private_key_bytes)
+        Stamper::full_hash(&identity_bytes).to_vec()
+    };
+
+    Some(RpcClient::new(rpc_addr, rpc_key))
 }
 
 /// Check if a daemon is running
 #[allow(dead_code)]
 async fn is_daemon_running(config: &ReticulumConfig) -> bool {
-    let client = create_rpc_client(config);
-    client.is_daemon_running().await
+    if let Some(client) = create_rpc_client(config) {
+        client.is_daemon_running().await
+    } else {
+        false
+    }
 }
 
 /// Handle path table display (-t)
 async fn handle_path_table(args: &Args, config: &ReticulumConfig) -> i32 {
     // Try RPC first if daemon is running
-    let client = create_rpc_client(config);
-    let rpc_paths = client
-        .get_path_table(args.max_hops.map(|h| h as u32))
-        .await
-        .ok();
+    let rpc_paths = if let Some(client) = create_rpc_client(config) {
+        client
+            .get_path_table(args.max_hops.map(|h| h as u32))
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     // Convert RPC paths to internal format or fall back to transport
     let paths = if let Some(rpc_paths) = rpc_paths {
@@ -590,16 +629,19 @@ async fn handle_drop_path(args: &Args, config: &ReticulumConfig) -> i32 {
     };
 
     // Try RPC first if daemon is running
-    let client = create_rpc_client(config);
-    let rpc_result = client.drop_path(dest_hash.as_slice()).await;
-
-    let success = match rpc_result {
-        Ok(()) => true,
-        Err(_) => {
-            // Fall back to local transport
-            let transport = create_transport(config).await;
-            transport.drop_path(&dest_hash).await
+    let success = if let Some(client) = create_rpc_client(config) {
+        match client.drop_path(dest_hash.as_slice()).await {
+            Ok(()) => true,
+            Err(_) => {
+                // Fall back to local transport
+                let transport = create_transport(config).await;
+                transport.drop_path(&dest_hash).await
+            }
         }
+    } else {
+        // Fall back to local transport
+        let transport = create_transport(config).await;
+        transport.drop_path(&dest_hash).await
     };
 
     if success {
@@ -638,10 +680,13 @@ async fn handle_drop_via(args: &Args, config: &ReticulumConfig) -> i32 {
     };
 
     // Try RPC first if daemon is running
-    let client = create_rpc_client(config);
-    let rpc_result = client.drop_all_via(transport_hash.as_slice()).await;
+    let rpc_success = if let Some(client) = create_rpc_client(config) {
+        client.drop_all_via(transport_hash.as_slice()).await.is_ok()
+    } else {
+        false
+    };
 
-    if rpc_result.is_err() {
+    if !rpc_success {
         // Fall back to local transport
         let transport = create_transport(config).await;
         let count = transport.drop_via(&transport_hash).await;
@@ -666,13 +711,8 @@ async fn handle_drop_via(args: &Args, config: &ReticulumConfig) -> i32 {
 
 /// Handle drop announces (-D)
 async fn handle_drop_announces(args: &Args, config: &ReticulumConfig) -> i32 {
-    // Try RPC first if daemon is running
-    let client = create_rpc_client(config);
-    if client.is_daemon_running().await {
-        // RPC doesn't have a dedicated drop_announce_queues method yet,
-        // so we fall back to local transport
-    }
-
+    // RPC doesn't have a dedicated drop_announce_queues method yet,
+    // so we always use local transport
     let transport = create_transport(config).await;
     transport.drop_announce_queues().await;
 

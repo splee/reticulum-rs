@@ -20,12 +20,12 @@ info() {
 
 success() {
     echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
+    ((++TESTS_PASSED)) || true
 }
 
 fail() {
     echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
+    ((++TESTS_FAILED)) || true
 }
 
 # Wait for a container to be healthy

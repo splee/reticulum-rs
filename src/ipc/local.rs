@@ -124,8 +124,10 @@ impl LocalServerInterface {
 
                                 let mut iface_manager = iface_manager.lock().await;
 
-                                // Spawn a client interface to handle this connection
-                                iface_manager.spawn(
+                                // Spawn a local client interface to handle this connection.
+                                // Local client interfaces always receive packets regardless
+                                // of the transport's broadcast setting.
+                                iface_manager.spawn_local_client(
                                     LocalClientInterface::new_from_stream(peer_addr, stream),
                                     LocalClientInterface::spawn,
                                 );
@@ -299,7 +301,7 @@ impl LocalClientInterface {
                                                         &mut InputBuffer::new(output.as_slice())
                                                     ) {
                                                         if PACKET_TRACE {
-                                                            log::trace!(
+                                                            log::debug!(
                                                                 "local_client: rx << ({}) {}",
                                                                 iface_address,
                                                                 packet
@@ -365,7 +367,7 @@ impl LocalClientInterface {
                             Some(message) = tx_channel.recv() => {
                                 let packet = message.packet;
                                 if PACKET_TRACE {
-                                    log::trace!("local_client: tx >> ({}) {}", iface_address, packet);
+                                    log::debug!("local_client: tx >> ({}) {}", iface_address, packet);
                                 }
 
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
