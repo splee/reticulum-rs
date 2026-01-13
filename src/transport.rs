@@ -70,6 +70,11 @@ use path_request::{PathRequestManager, PathRequestTagCache};
 const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
 
+// Announce retransmission parameters (matches Python Transport.py lines 67-69)
+const PATHFINDER_R: u8 = 1;           // Retransmit retries
+const PATHFINDER_G: u64 = 5;          // Retry grace period (seconds)
+const PATHFINDER_RW: f64 = 0.5;       // Random window for announce rebroadcast
+
 const INTERVAL_LINKS_CHECK: Duration = Duration::from_secs(1);
 const INTERVAL_INPUT_LINK_CLEANUP: Duration = Duration::from_secs(20);
 const INTERVAL_OUTPUT_LINK_RESTART: Duration = Duration::from_secs(60);
@@ -1623,6 +1628,7 @@ async fn handle_announce<'a>(
                 packet,
                 dest_hash,
                 iface,
+                from_local_client,
             );
 
             handler.path_table.handle_announce(

@@ -23,12 +23,26 @@ impl AnnounceEntry {
         &mut self,
         transport_id: &AddressHash,
     ) -> Option<(AddressHash, Packet)> {
-        if self.retries == 0 || Instant::now() >= self.timeout {
+        // Don't retransmit if timeout hasn't expired yet
+        if Instant::now() < self.timeout {
             return None;
         }
 
+        // Don't retransmit if no retries left
+        if self.retries == 0 {
+            return None;
+        }
+
+        // Decrement retry counter
         self.retries = self.retries.saturating_sub(1);
 
+        // Update timeout for next retransmit (if retries > 0 after decrement)
+        let random_delay = rand::random::<f64>() * super::PATHFINDER_RW;
+        self.timeout = Instant::now()
+            + Duration::from_secs(super::PATHFINDER_G)
+            + Duration::from_secs_f64(random_delay);
+
+        // Create retransmit packet
         let new_packet = Packet {
             header: Header {
                 ifac_flag: IfacFlag::Open,
@@ -39,7 +53,7 @@ impl AnnounceEntry {
                 hops: self.hops,
             },
             ifac: None,
-            destination: self.packet.destination, // TODO
+            destination: self.packet.destination,
             transport: Some(*transport_id),
             context: PacketContext::None,
             data: self.packet.data,
@@ -66,7 +80,8 @@ impl AnnounceTable {
         &mut self,
         announce: &Packet,
         destination: AddressHash,
-        received_from: AddressHash
+        received_from: AddressHash,
+        from_local_client: bool,
     ) {
         if self.map.contains_key(&destination) {
             return;
@@ -75,12 +90,21 @@ impl AnnounceTable {
         let now = Instant::now();
         let hops = announce.header.hops + 1;
 
+        // Match Python behavior: local clients get immediate retransmit,
+        // network announces get random delay for collision avoidance
+        let (timeout, retries) = if from_local_client {
+            (now, super::PATHFINDER_R)  // Immediate, retransmit once
+        } else {
+            let random_delay = rand::random::<f64>() * super::PATHFINDER_RW;
+            (now + Duration::from_secs_f64(random_delay), 0)
+        };
+
         let entry = AnnounceEntry {
             packet: *announce,
             timestamp: now,
-            timeout: now + Duration::from_secs(60), // TODO
+            timeout,
             received_from,
-            retries: 20, // TODO
+            retries,
             hops,
         };
 
