@@ -563,14 +563,14 @@ loglevel = 4
 # Example TCP Server Interface
   [[TCP Server]]
     type = TCPServerInterface
-    interface_enabled = true
+    enabled = true
     listen_ip = 0.0.0.0
     listen_port = 4242
 
 # Example TCP Client Interface
   [[TCP Client]]
     type = TCPClientInterface
-    interface_enabled = false
+    enabled = false
     target_host = 192.168.1.100
     target_port = 4242
 "#);

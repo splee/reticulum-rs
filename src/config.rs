@@ -458,6 +458,26 @@ impl ReticulumConfig {
 
         if let Some(section) = self.config.section("interfaces") {
             for (name, subsection) in &section.subsections {
+                // Parse interface mode with backwards compatibility
+                // Python checks "interface_mode" first, then falls back to "mode"
+                let mode = subsection.get("interface_mode")
+                    .or_else(|| subsection.get("mode"))
+                    .and_then(|s| crate::iface::InterfaceMode::from_str(s));
+
+                // Parse network name with backwards compatibility
+                // Python checks "networkname" first, then "network_name" (which takes precedence)
+                let network_name = subsection.get("network_name")
+                    .or_else(|| subsection.get("networkname"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                // Parse passphrase with backwards compatibility
+                // Python checks "passphrase" first, then "pass_phrase" (which takes precedence)
+                let passphrase = subsection.get("pass_phrase")
+                    .or_else(|| subsection.get("passphrase"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
                 interfaces.push(InterfaceConfig {
                     name: name.clone(),
                     interface_type: subsection
@@ -467,6 +487,9 @@ impl ReticulumConfig {
                     enabled: subsection.get_bool("enabled")
                         .or_else(|| subsection.get_bool("interface_enabled"))
                         .unwrap_or(true),
+                    mode,
+                    network_name,
+                    passphrase,
                     target_host: subsection.get("target_host").map(|s| s.to_string()),
                     target_port: subsection.get_int("target_port").map(|p| p as u16),
                     listen_ip: subsection.get("listen_ip").map(|s| s.to_string()),
@@ -491,6 +514,12 @@ pub struct InterfaceConfig {
     pub interface_type: String,
     /// Whether the interface is enabled
     pub enabled: bool,
+    /// Interface operating mode (full, gateway, access_point, etc.)
+    pub mode: Option<crate::iface::InterfaceMode>,
+    /// Network name for IFAC (Interface Access Code) authentication
+    pub network_name: Option<String>,
+    /// Passphrase for IFAC (Interface Access Code) authentication
+    pub passphrase: Option<String>,
     /// Target host for client interfaces
     pub target_host: Option<String>,
     /// Target port for client interfaces
@@ -561,5 +590,183 @@ mod tests {
             paths.storage_path,
             PathBuf::from("/tmp/test_reticulum/storage")
         );
+    }
+
+    #[test]
+    fn test_interface_enabled_backwards_compatibility() {
+        // Test that both "enabled" and "interface_enabled" work
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[Interface1]]
+    type = TCPServerInterface
+    enabled = true
+
+  [[Interface2]]
+    type = TCPClientInterface
+    interface_enabled = false
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 2);
+
+        let iface1 = interfaces.iter().find(|i| i.name == "Interface1").unwrap();
+        let iface2 = interfaces.iter().find(|i| i.name == "Interface2").unwrap();
+
+        assert_eq!(iface1.enabled, true);
+        assert_eq!(iface2.enabled, false);
+    }
+
+    #[test]
+    fn test_interface_mode_backwards_compatibility() {
+        // Test that both "mode" and "interface_mode" work, and support all aliases
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[Interface1]]
+    type = TCPServerInterface
+    mode = gateway
+
+  [[Interface2]]
+    type = TCPClientInterface
+    interface_mode = access_point
+
+  [[Interface3]]
+    type = TCPServerInterface
+    mode = ap
+
+  [[Interface4]]
+    type = TCPServerInterface
+    interface_mode = pointtopoint
+
+  [[Interface5]]
+    type = TCPServerInterface
+    mode = ptp
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 5);
+
+        // Debug output to see actual order
+        for (i, iface) in interfaces.iter().enumerate() {
+            eprintln!("Interface {}: name={}, mode={:?}", i, iface.name, iface.mode);
+        }
+
+        // HashMap doesn't preserve insertion order, so we need to find interfaces by name
+        let iface1 = interfaces.iter().find(|i| i.name == "Interface1").unwrap();
+        let iface2 = interfaces.iter().find(|i| i.name == "Interface2").unwrap();
+        let iface3 = interfaces.iter().find(|i| i.name == "Interface3").unwrap();
+        let iface4 = interfaces.iter().find(|i| i.name == "Interface4").unwrap();
+        let iface5 = interfaces.iter().find(|i| i.name == "Interface5").unwrap();
+
+        assert_eq!(iface1.mode, Some(crate::iface::InterfaceMode::Gateway));
+        assert_eq!(iface2.mode, Some(crate::iface::InterfaceMode::AccessPoint));
+        assert_eq!(iface3.mode, Some(crate::iface::InterfaceMode::AccessPoint));
+        assert_eq!(iface4.mode, Some(crate::iface::InterfaceMode::PointToPoint));
+        assert_eq!(iface5.mode, Some(crate::iface::InterfaceMode::PointToPoint));
+    }
+
+    #[test]
+    fn test_network_name_backwards_compatibility() {
+        // Test that both "network_name" and "networkname" work
+        // Python gives precedence to "network_name"
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[Interface1]]
+    type = TCPServerInterface
+    network_name = test_network
+
+  [[Interface2]]
+    type = TCPClientInterface
+    networkname = legacy_network
+
+  [[Interface3]]
+    type = TCPServerInterface
+    networkname = will_be_overridden
+    network_name = canonical_network
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 3);
+
+        let iface1 = interfaces.iter().find(|i| i.name == "Interface1").unwrap();
+        let iface2 = interfaces.iter().find(|i| i.name == "Interface2").unwrap();
+        let iface3 = interfaces.iter().find(|i| i.name == "Interface3").unwrap();
+
+        assert_eq!(iface1.network_name, Some("test_network".to_string()));
+        assert_eq!(iface2.network_name, Some("legacy_network".to_string()));
+        assert_eq!(iface3.network_name, Some("canonical_network".to_string()));
+    }
+
+    #[test]
+    fn test_passphrase_backwards_compatibility() {
+        // Test that both "passphrase" and "pass_phrase" work
+        // Python gives precedence to "pass_phrase"
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[Interface1]]
+    type = TCPServerInterface
+    passphrase = test_pass
+
+  [[Interface2]]
+    type = TCPClientInterface
+    pass_phrase = legacy_pass
+
+  [[Interface3]]
+    type = TCPServerInterface
+    passphrase = will_be_overridden
+    pass_phrase = canonical_pass
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 3);
+
+        let iface1 = interfaces.iter().find(|i| i.name == "Interface1").unwrap();
+        let iface2 = interfaces.iter().find(|i| i.name == "Interface2").unwrap();
+        let iface3 = interfaces.iter().find(|i| i.name == "Interface3").unwrap();
+
+        assert_eq!(iface1.passphrase, Some("test_pass".to_string()));
+        assert_eq!(iface2.passphrase, Some("legacy_pass".to_string()));
+        assert_eq!(iface3.passphrase, Some("canonical_pass".to_string()));
+    }
+
+    #[test]
+    fn test_empty_network_name_and_passphrase_ignored() {
+        // Test that empty strings are filtered out
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[Interface1]]
+    type = TCPServerInterface
+    network_name =
+    passphrase =
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].network_name, None);
+        assert_eq!(interfaces[0].passphrase, None);
     }
 }
