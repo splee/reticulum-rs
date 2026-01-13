@@ -76,6 +76,9 @@ ctrlc = "3.4"
 # Hex encoding (for test binaries)
 hex = "0.4"
 
+# Base32/Base64 encoding
+data-encoding = "2.6"
+
 [features]
 default = ["alloc"]
 alloc = []
