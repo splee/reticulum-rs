@@ -7,6 +7,12 @@ pub mod tcp_client;
 pub mod tcp_server;
 pub mod udp;
 
+pub mod registry;
+pub mod stats;
+
+pub use registry::{InterfaceRegistry, InterfaceStatsSnapshot};
+pub use stats::{InterfaceMetadata, InterfaceMode};
+
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -97,6 +103,9 @@ pub struct InterfaceContext<T: Interface> {
     pub inner: Arc<Mutex<T>>,
     pub channel: InterfaceChannel,
     pub cancel: CancellationToken,
+    /// Optional interface registry for stats tracking.
+    /// When set, interfaces should register themselves and track rx/tx bytes.
+    pub interface_registry: Option<Arc<InterfaceRegistry>>,
 }
 
 pub struct InterfaceManager {
@@ -105,6 +114,8 @@ pub struct InterfaceManager {
     rx_send: InterfaceRxSender,
     cancel: CancellationToken,
     ifaces: Vec<LocalInterface>,
+    /// Optional interface registry for stats tracking
+    interface_registry: Option<Arc<InterfaceRegistry>>,
 }
 
 impl InterfaceManager {
@@ -118,7 +129,18 @@ impl InterfaceManager {
             rx_send,
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
+            interface_registry: None,
         }
+    }
+
+    /// Set the interface registry for stats tracking.
+    pub fn set_interface_registry(&mut self, registry: Arc<InterfaceRegistry>) {
+        self.interface_registry = Some(registry);
+    }
+
+    /// Get the interface registry if set.
+    pub fn interface_registry(&self) -> Option<Arc<InterfaceRegistry>> {
+        self.interface_registry.clone()
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
@@ -180,6 +202,7 @@ impl InterfaceManager {
             inner: inner.clone(),
             channel,
             cancel: self.cancel.clone(),
+            interface_registry: self.interface_registry.clone(),
         }
     }
 

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::RxMessage;
+use crate::iface::stats::InterfaceMetadata;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -46,6 +47,20 @@ impl TcpClient {
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().unwrap().stream.take() };
 
+        // Create interface metadata for stats tracking
+        let metadata = Arc::new(InterfaceMetadata::new(
+            format!("TCPInterface[{}]", addr),
+            "TCPClient",
+            "TCPClientInterface",
+            addr.clone(),
+        ));
+
+        // Register with interface registry if available
+        let registry = context.interface_registry.clone();
+        if let Some(ref reg) = registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
+
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -69,6 +84,7 @@ impl TcpClient {
 
             if stream.is_err() {
                 log::info!("tcp_client: couldn't connect to <{}>", addr);
+                metadata.set_online(false);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -79,6 +95,8 @@ impl TcpClient {
             let stream = stream.unwrap();
             let (read_stream, write_stream) = stream.into_split();
 
+            // Mark interface as online
+            metadata.set_online(true);
             log::info!("tcp_client connected to <{}>", addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
@@ -89,6 +107,7 @@ impl TcpClient {
                 let stop = stop.clone();
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
+                let metadata = metadata.clone();
 
                 tokio::spawn(async move {
                     let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
@@ -111,6 +130,9 @@ impl TcpClient {
                                             break;
                                         }
                                         Ok(n) => {
+                                            // Track received bytes for stats
+                                            metadata.add_rx_bytes(n as u64);
+
                                             // TCP stream may contain several or partial HDLC frames
                                             for &byte in tcp_buffer.iter().take(n) {
                                                 // Push new byte from the end of buffer
@@ -159,6 +181,7 @@ impl TcpClient {
                 let cancel = cancel.clone();
                 let tx_channel = tx_channel.clone();
                 let mut stream = write_stream;
+                let metadata = metadata.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -189,7 +212,12 @@ impl TcpClient {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
                                     if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
-                                        let _ = stream.write_all(hdlc_output.as_slice()).await;
+                                        let hdlc_slice = hdlc_output.as_slice();
+
+                                        // Track transmitted bytes for stats
+                                        metadata.add_tx_bytes(hdlc_slice.len() as u64);
+
+                                        let _ = stream.write_all(hdlc_slice).await;
                                         let _ = stream.flush().await;
                                     }
                                 }
@@ -202,7 +230,14 @@ impl TcpClient {
             tx_task.await.unwrap();
             rx_task.await.unwrap();
 
+            // Mark interface as offline when disconnected
+            metadata.set_online(false);
             log::info!("tcp_client: disconnected from <{}>", addr);
+        }
+
+        // Unregister from interface registry on exit
+        if let Some(ref reg) = registry {
+            reg.unregister(&iface_address).await;
         }
 
         iface_stop.cancel();

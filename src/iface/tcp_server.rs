@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::error::RnsError;
+use crate::iface::stats::InterfaceMetadata;
 
 use super::tcp_client::TcpClient;
 use super::{Interface, InterfaceContext, InterfaceManager};
@@ -26,8 +27,23 @@ impl TcpServer {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let addr = { context.inner.lock().unwrap().addr.clone() };
+        let iface_address = context.channel.address;
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+
+        // Create interface metadata for stats tracking
+        let metadata = Arc::new(InterfaceMetadata::new(
+            format!("TCPServerInterface[{}]", addr),
+            "TCPServer",
+            "TCPServerInterface",
+            addr.clone(),
+        ));
+
+        // Register with interface registry if available
+        let registry = context.interface_registry.clone();
+        if let Some(ref reg) = registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -43,10 +59,13 @@ impl TcpServer {
 
             if listener.is_err() {
                 log::warn!("tcp_server: couldn't bind to <{}>", addr);
+                metadata.set_online(false);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
 
+            // Mark interface as online when listening
+            metadata.set_online(true);
             log::info!("tcp_server: listen on <{}>", addr);
 
             let listener = listener.unwrap();
@@ -106,6 +125,11 @@ impl TcpServer {
             }
 
             let _ = tokio::join!(tx_task);
+        }
+
+        // Unregister from interface registry on exit
+        if let Some(ref reg) = registry {
+            reg.unregister(&iface_address).await;
         }
     }
 }

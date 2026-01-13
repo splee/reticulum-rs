@@ -34,7 +34,9 @@ use crate::hash::{AddressHash, Hash};
 use crate::identity::{Identity, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
+use crate::iface::InterfaceRegistry;
 use crate::iface::InterfaceRxReceiver;
+use crate::iface::InterfaceStatsSnapshot;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
 use crate::iface::TxMessageType;
@@ -139,6 +141,7 @@ pub struct Transport {
     iface_messages_tx: broadcast::Sender<RxMessage>,
     handler: Arc<Mutex<TransportHandler>>,
     iface_manager: Arc<Mutex<InterfaceManager>>,
+    interface_registry: Arc<InterfaceRegistry>,
     cancel: CancellationToken,
 }
 
@@ -179,13 +182,34 @@ impl Transport {
         let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
         let (iface_messages_tx, _) = tokio::sync::broadcast::channel(16);
 
-        let iface_manager = InterfaceManager::new(16);
+        // Create interface registry for stats tracking
+        let interface_registry = Arc::new(InterfaceRegistry::new());
+
+        let mut iface_manager = InterfaceManager::new(16);
+        iface_manager.set_interface_registry(interface_registry.clone());
 
         let rx_receiver = iface_manager.receiver();
 
         let iface_manager = Arc::new(Mutex::new(iface_manager));
 
         let cancel = CancellationToken::new();
+
+        // Spawn background task for calculating interface speeds (like Python's count_traffic_loop)
+        {
+            let registry = interface_registry.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            registry.update_speeds().await;
+                        }
+                    }
+                }
+            });
+        }
         let name = config.name.clone();
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
@@ -219,6 +243,7 @@ impl Transport {
         Self {
             name,
             iface_manager,
+            interface_registry,
             link_in_event_tx,
             link_out_event_tx,
             received_data_tx,
@@ -246,6 +271,16 @@ impl Transport {
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
         self.iface_manager.clone()
+    }
+
+    /// Get the interface registry for stats tracking.
+    pub fn interface_registry(&self) -> Arc<InterfaceRegistry> {
+        self.interface_registry.clone()
+    }
+
+    /// Get interface statistics for all registered interfaces.
+    pub async fn get_interface_stats(&self) -> Vec<InterfaceStatsSnapshot> {
+        self.interface_registry.get_all_stats().await
     }
 
     pub fn iface_rx(&self) -> broadcast::Receiver<RxMessage> {

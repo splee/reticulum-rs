@@ -248,10 +248,23 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
 }
 
 /// Get interface statistics from the transport.
-async fn get_interface_stats(_transport: &Transport) -> Vec<InterfaceStats> {
-    // The current InterfaceManager doesn't track detailed statistics.
-    // This is a placeholder that will be expanded when stats tracking is added.
-    vec![]
+async fn get_interface_stats(transport: &Transport) -> Vec<InterfaceStats> {
+    transport
+        .get_interface_stats()
+        .await
+        .into_iter()
+        .map(|s| InterfaceStats {
+            name: s.name,
+            interface_type: s.interface_type,
+            online: s.online,
+            rx_packets: 0, // TODO: Add packet counting if needed
+            tx_packets: 0,
+            rx_bytes: s.rx_bytes,
+            tx_bytes: s.tx_bytes,
+            bitrate: s.bitrate,
+            address: s.endpoint_address,
+        })
+        .collect()
 }
 
 /// Get the path table from the transport.
