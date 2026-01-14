@@ -88,13 +88,13 @@ def main():
         host, port = args.tcp_client.rsplit(':', 1)
         config_content = f"""
 [reticulum]
-enable_transport = false
-share_instance = false
+enable_transport = No
+share_instance = No
 
 [interfaces]
   [[TCP Client]]
     type = TCPClientInterface
-    interface_enabled = true
+    interface_enabled = True
     target_host = {host}
     target_port = {port}
 """
@@ -110,7 +110,7 @@ share_instance = false
         reticulum = RNS.Reticulum()
 
     # Check if we're using a shared instance
-    if RNS.Transport.owner is not None:
+    if RNS.Transport.owner and RNS.Transport.owner.is_connected_to_shared_instance:
         RNS.log("Connected to shared Reticulum instance", RNS.LOG_INFO)
     else:
         RNS.log("Running standalone Reticulum instance", RNS.LOG_INFO)

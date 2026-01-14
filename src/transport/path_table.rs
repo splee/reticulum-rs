@@ -298,12 +298,25 @@ impl PathTable {
         // without transport header. This matches Python's behavior.
         if entry.hops == 1 {
             // Keep the original packet format (HEADER_1) since destination is direct
+            log::debug!(
+                "path_table: routing {} hops=1 direct, iface={}",
+                original_packet.destination,
+                entry.iface,
+            );
             (*original_packet, Some(entry.iface))
         } else {
+            log::debug!(
+                "path_table: routing {} via transport {} (hops={}), iface={}",
+                original_packet.destination,
+                entry.received_from,
+                entry.hops,
+                entry.iface,
+            );
             (
                 Packet {
                     header: Header {
-                        ifac_flag: IfacFlag::Authenticated,
+                        // Preserve original ifac_flag - Python expects Open for Type2 packets
+                        ifac_flag: original_packet.header.ifac_flag,
                         header_type: HeaderType::Type2,
                         // Type2 packets must use Transport propagation type for Python compatibility
                         // Python expects bit 4 = 1 (transport_type=TRANSPORT) for routed packets

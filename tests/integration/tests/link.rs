@@ -12,20 +12,22 @@ fn test_rust_client_to_python_server_link() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
     // Start Python hub
-    let _hub = ctx
+    let hub = ctx
         .start_python_hub()
         .expect("Failed to start Python hub");
 
-    // Start Python link server
+    // Start Python link server - connect via TCP to hub
     let server = ctx
         .run_python_helper(
             "python_link_server.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "pythonserver",
                 "-i", "5",  // announce interval
                 "-n", "1",  // exit after 1 link
                 "-t", "40", // timeout
+                "-v",       // verbose logging
             ],
         )
         .expect("Failed to start Python link server");
@@ -50,11 +52,12 @@ fn test_rust_client_to_python_server_link() {
         .run_rust_binary(
             "test_link_client",
             &[
-                "--tcp-client", &format!("127.0.0.1:{}", _hub.port()),
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "--wait-announce",
                 "-a", "test_app",
                 "-A", "pythonserver",
                 "-t", "25",
+                "-v",  // verbose logging
             ],
         )
         .expect("Failed to start Rust link client");
@@ -62,14 +65,16 @@ fn test_rust_client_to_python_server_link() {
     // Wait for link activation
     let _ = client_output.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
 
-    // Also wait for server to complete
-    std::thread::sleep(Duration::from_secs(2));
+    // Also wait for server to complete (Python needs time to process the link callback)
+    std::thread::sleep(Duration::from_secs(5));
 
     let server_output = server.output();
     let client_output_str = client_output.output();
+    let hub_output = hub.process.output();
 
     eprintln!("Rust client output:\n{}", client_output_str);
     eprintln!("Python server output:\n{}", server_output);
+    eprintln!("Python hub output:\n{}", hub_output);
 
     // Check results
     let client_parsed = TestOutput::parse(&client_output_str);
@@ -208,11 +213,12 @@ fn test_python_client_to_rust_server_link() {
     // Wait for announce to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Start Python link client
+    // Start Python link client - must connect via TCP to the same hub
     let python_client = ctx
         .run_python_helper(
             "python_link_client.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-d", dest_hash,
                 "-a", "test_app",
                 "-A", "rustserver",

@@ -46,6 +46,8 @@ def main():
     parser.add_argument('-i', '--announce-interval', type=int, default=30, help='Announce interval in seconds')
     parser.add_argument('-n', '--link-count', type=int, default=0, help='Exit after N links (0=infinite)')
     parser.add_argument('-t', '--timeout', type=int, default=0, help='Exit after N seconds (0=infinite)')
+    parser.add_argument('-c', '--configdir', help='Config directory (default: ~/.reticulum)')
+    parser.add_argument('--tcp-client', help='TCP client target host:port (e.g., 127.0.0.1:4242)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
     args = parser.parse_args()
 
@@ -55,8 +57,51 @@ def main():
     else:
         RNS.loglevel = RNS.LOG_INFO
 
-    # Initialize Reticulum
-    reticulum = RNS.Reticulum()
+    # If TCP client is specified, create a temporary config directory for standalone operation
+    temp_configdir = None
+    if args.tcp_client and not args.configdir:
+        import tempfile
+        import os
+        temp_configdir = tempfile.mkdtemp(prefix="rns_server_")
+        RNS.log(f"Using temporary config directory: {temp_configdir}", RNS.LOG_INFO)
+
+        # Create minimal config with TCP client interface
+        host, port = args.tcp_client.rsplit(':', 1)
+        config_content = f"""
+[reticulum]
+enable_transport = No
+share_instance = No
+
+[interfaces]
+  [[TCP Client]]
+    type = TCPClientInterface
+    interface_enabled = True
+    target_host = {host}
+    target_port = {port}
+"""
+        config_path = os.path.join(temp_configdir, "config")
+        with open(config_path, "w") as f:
+            f.write(config_content)
+
+        # Initialize Reticulum with the temporary config
+        reticulum = RNS.Reticulum(configdir=temp_configdir)
+    elif args.configdir:
+        reticulum = RNS.Reticulum(configdir=args.configdir)
+    else:
+        reticulum = RNS.Reticulum()
+
+    # Check if we're using a shared instance
+    if RNS.Transport.owner and RNS.Transport.owner.is_connected_to_shared_instance:
+        RNS.log("Connected to shared Reticulum instance", RNS.LOG_INFO)
+    else:
+        RNS.log("Running standalone Reticulum instance", RNS.LOG_INFO)
+        # Log interfaces for debugging
+        RNS.log(f"Active interfaces: {len(RNS.Transport.interfaces)}", RNS.LOG_DEBUG)
+        for iface in RNS.Transport.interfaces:
+            RNS.log(f"  Interface: {iface}", RNS.LOG_DEBUG)
+
+    # Wait for interfaces to initialize
+    time.sleep(2)
 
     # Create identity
     identity = RNS.Identity()

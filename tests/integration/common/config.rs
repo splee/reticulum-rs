@@ -51,7 +51,7 @@ impl TestConfig {
 
 [reticulum]
   enable_transport = Yes
-  share_instance = No
+  share_instance = Yes
   shared_instance_port = {shared_port}
   instance_control_port = {control_port}
   panic_on_interface_error = No

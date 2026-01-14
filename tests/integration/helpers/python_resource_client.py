@@ -49,6 +49,8 @@ def resource_concluded(resource):
     resource_done = True
 
 def main():
+    import tempfile
+
     parser = argparse.ArgumentParser(description="Python resource client for testing")
     parser.add_argument("-d", "--destination", required=True, help="Destination hash (hex)")
     parser.add_argument("-a", "--app-name", default="test_app", help="Application name")
@@ -57,6 +59,8 @@ def main():
     parser.add_argument("-f", "--send-file", help="File path to send as resource")
     parser.add_argument("-m", "--metadata", help="Metadata filename")
     parser.add_argument("-t", "--timeout", type=int, default=60, help="Timeout in seconds")
+    parser.add_argument("-c", "--configdir", help="Config directory (default: ~/.reticulum)")
+    parser.add_argument("--tcp-client", help="TCP client target host:port (e.g., 127.0.0.1:4242)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -70,8 +74,39 @@ def main():
     else:
         RNS.loglevel = RNS.LOG_ERROR
 
-    # Initialize Reticulum
-    reticulum = RNS.Reticulum()
+    # If TCP client is specified, create a temporary config directory for standalone operation
+    temp_configdir = None
+    if args.tcp_client and not args.configdir:
+        temp_configdir = tempfile.mkdtemp(prefix="rns_resclient_")
+        RNS.log(f"Using temporary config directory: {temp_configdir}", RNS.LOG_INFO)
+
+        # Create minimal config with TCP client interface
+        host, port = args.tcp_client.rsplit(':', 1)
+        config_content = f"""
+[reticulum]
+enable_transport = No
+share_instance = No
+
+[interfaces]
+  [[TCP Client]]
+    type = TCPClientInterface
+    interface_enabled = True
+    target_host = {host}
+    target_port = {port}
+"""
+        config_path = os.path.join(temp_configdir, "config")
+        with open(config_path, "w") as f:
+            f.write(config_content)
+
+        # Initialize Reticulum with the temporary config
+        reticulum = RNS.Reticulum(configdir=temp_configdir)
+    elif args.configdir:
+        reticulum = RNS.Reticulum(configdir=args.configdir)
+    else:
+        reticulum = RNS.Reticulum()
+
+    # Wait for interfaces to initialize
+    time.sleep(2)
 
     # Parse destination hash
     try:

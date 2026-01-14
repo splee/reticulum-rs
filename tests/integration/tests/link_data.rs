@@ -17,10 +17,12 @@ fn test_rust_sends_data_to_python() {
         .expect("Failed to start Python hub");
 
     // Start Python link server (infinite links, timeout-based exit)
+    // Must connect via TCP to the same hub as the Rust client
     let server = ctx
         .run_python_helper(
             "python_link_server.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "dataserver",
                 "-n", "0",  // infinite links
@@ -155,10 +157,12 @@ fn test_python_sends_data_to_rust() {
     let test_data_hex = "48656c6c6f2066726f6d20507974686f6e21";
 
     // Start Python link client with data to send
+    // Must connect via TCP to the same hub as the Rust server
     let client = ctx
         .run_python_helper(
             "python_link_client.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-d", dest_hash,
                 "-a", "test_app",
                 "-A", "rustdataserver",

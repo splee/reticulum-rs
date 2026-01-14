@@ -188,7 +188,10 @@ fn main() {
 
             // Check if we've reached link limit
             if args.link_count > 0 && link_count >= args.link_count {
-                log::info!("Reached link limit ({}), exiting", args.link_count);
+                log::info!("Reached link limit ({}), waiting before exit", args.link_count);
+                // Wait for link handshake to complete on both sides
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                log::info!("Exiting after link limit reached");
                 println!("STATUS=LINK_LIMIT_REACHED");
                 break;
             }

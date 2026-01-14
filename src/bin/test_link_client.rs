@@ -288,6 +288,9 @@ fn main() {
             return 1;
         }
 
+        // Brief delay to allow RTT packet to be sent (completes Python handshake)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         // Send data if configured
         if let Some(data_hex) = &args.send_data {
             let data = match hex::decode(data_hex) {

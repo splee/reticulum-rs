@@ -52,11 +52,12 @@ fn test_python_sends_resource_to_rust() {
     // Test data to send (hex encoded "Hello Resource!")
     let test_data_hex = "48656c6c6f205265736f7572636521";
 
-    // Start Python resource client
+    // Start Python resource client - must connect via TCP to the same hub
     let python_client = ctx
         .run_python_helper(
             "python_resource_client.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-d", dest_hash,
                 "-a", "test_app",
                 "-A", "resourceserver",
@@ -154,11 +155,12 @@ fn test_python_sends_larger_resource_to_rust() {
     // 100 bytes of 'A' (hex encoded)
     let larger_data_hex = "41".repeat(100);
 
-    // Start Python resource client
+    // Start Python resource client - must connect via TCP to the same hub
     let python_client = ctx
         .run_python_helper(
             "python_resource_client.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-d", dest_hash,
                 "-a", "test_app",
                 "-A", "resourceserver2",
@@ -221,11 +223,12 @@ fn test_rust_sends_resource_to_python() {
         .start_python_hub()
         .expect("Failed to start Python hub");
 
-    // Start Python resource server
+    // Start Python resource server - must connect via TCP to the hub
     let python_server = ctx
         .run_python_helper(
             "python_resource_server.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "resourceserver",
                 "-i", "5",  // announce interval
@@ -341,11 +344,12 @@ fn test_rust_sends_larger_resource_to_python() {
         .start_python_hub()
         .expect("Failed to start Python hub");
 
-    // Start Python resource server
+    // Start Python resource server - must connect via TCP to the hub
     let python_server = ctx
         .run_python_helper(
             "python_resource_server.py",
             &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "resourceserver2",
                 "-i", "5",  // announce interval
