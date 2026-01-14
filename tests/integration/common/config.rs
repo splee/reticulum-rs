@@ -141,19 +141,34 @@ impl TestConfig {
     ///
     /// Connects to the specified hub port as a client and runs its own
     /// TCP server for other nodes to connect to. Used in multi-hop tests.
+    /// Transport is enabled by default.
     pub fn rust_relay(hub_port: u16) -> io::Result<Self> {
+        Self::rust_relay_with_transport(hub_port, true)
+    }
+
+    /// Create configuration for a Rust relay node with configurable transport.
+    ///
+    /// Like `rust_relay`, but allows controlling whether transport (routing)
+    /// is enabled. When `enable_transport` is false, the node will not
+    /// forward packets to other destinations.
+    ///
+    /// This is useful for testing:
+    /// - Nodes that should not participate in routing
+    /// - Verify that non-transport nodes don't forward announces
+    pub fn rust_relay_with_transport(hub_port: u16, enable_transport: bool) -> io::Result<Self> {
         let ports = allocate_ports(3);
         let tcp_port = ports[0]; // Port for other nodes to connect to
         let shared_port = ports[1];
         let control_port = ports[2];
 
+        let transport_setting = if enable_transport { "Yes" } else { "No" };
         let dir = TempDir::new()?;
 
         let config_content = format!(
             r#"# Rust Relay Configuration (generated for integration test)
 
 [reticulum]
-  enable_transport = Yes
+  enable_transport = {transport_setting}
   share_instance = No
   shared_instance_port = {shared_port}
   instance_control_port = {control_port}

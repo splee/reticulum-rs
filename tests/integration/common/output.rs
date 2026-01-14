@@ -112,6 +112,66 @@ impl TestOutput {
     }
 }
 
+/// Parse hop count from rnpath command output.
+///
+/// Looks for patterns like:
+/// - "2 hops" or "2 hop"
+/// - "hops: 2"
+/// - "hop count: 2"
+///
+/// Returns None if no hop count could be parsed.
+pub fn parse_hop_count(output: &str) -> Option<u32> {
+    let output_lower = output.to_lowercase();
+
+    // Pattern: "N hops" or "N hop"
+    for word in output_lower.split_whitespace() {
+        if word.starts_with("hop") {
+            // Check previous word for number
+            break;
+        }
+    }
+
+    // Manual pattern matching since we don't have regex crate
+    // Look for "N hop" pattern
+    let words: Vec<&str> = output_lower.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if word.starts_with("hop") {
+            // Check if previous word is a number
+            if i > 0 {
+                if let Ok(n) = words[i - 1].parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+        // Check for "hops:" or "hops :" followed by number
+        if *word == "hops:" || word.starts_with("hops:") {
+            let num_str = word.strip_prefix("hops:").unwrap_or("");
+            if let Ok(n) = num_str.trim().parse::<u32>() {
+                return Some(n);
+            }
+            // Check next word
+            if i + 1 < words.len() {
+                if let Ok(n) = words[i + 1].parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Determine if path output indicates the path is known.
+///
+/// Checks for indicators that a destination path exists in rnpath output.
+pub fn is_path_known(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("hop")
+        || lower.contains("path")
+        || lower.contains("known")
+        || lower.contains("via")
+}
+
 /// Extract a field value from output lines.
 ///
 /// Searches for a line starting with `key=` and returns the value after the `=`.

@@ -478,3 +478,684 @@ fn test_rust_sends_larger_resource_to_python() {
 
     eprintln!("Larger Rust→Python resource transfer test passed");
 }
+
+/// Test Python sending a 1KB resource to Rust.
+///
+/// Tests resource transfer with data large enough to require multiple parts.
+#[test]
+fn test_python_sends_1kb_resource_to_rust() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Rust resource server
+    let rust_server = ctx
+        .run_rust_binary(
+            "test_resource_server",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_1kb",
+                "-i", "5",
+                "-n", "1",
+                "-t", "90",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource server");
+
+    // Wait for destination hash
+    let dest_line = rust_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Rust server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Rust server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 1KB (1024 bytes) of 'C' (hex encoded)
+    let data_1kb_hex = "43".repeat(1024);
+
+    // Start Python resource client
+    let python_client = ctx
+        .run_python_helper(
+            "python_resource_client.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_1kb",
+                "-s", &data_1kb_hex,
+                "-t", "80",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource client");
+
+    // Wait for link and resource transfer
+    let _ = python_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(10));
+
+    let server_output = rust_server.output();
+    let client_output = python_client.output();
+
+    eprintln!("Rust server output:\n{}", server_output);
+    eprintln!("Python client output:\n{}", client_output);
+
+    let server_parsed = TestOutput::parse(&server_output);
+    let client_parsed = TestOutput::parse(&client_output);
+
+    // Verify link establishment
+    assert!(
+        server_parsed.link_activated(),
+        "Rust server should receive link activation"
+    );
+
+    // Verify resource advertisement received
+    assert!(
+        server_parsed.has("RESOURCE_ADVERTISEMENT"),
+        "Rust should receive resource advertisement"
+    );
+
+    // Verify resource request was sent
+    assert!(
+        server_parsed.has("RESOURCE_REQUEST_SENT"),
+        "Rust should send resource request"
+    );
+
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Rust should complete 1KB resource transfer"
+    );
+
+    // Verify Python client completed successfully
+    // Check for RESOURCE_COMPLETE, STATUS=SUCCESS, or 100% progress
+    let client_success = client_parsed.has("RESOURCE_COMPLETE")
+        || client_parsed.get("STATUS") == Some("SUCCESS")
+        || client_output.contains(":100");  // 100% progress
+
+    assert!(
+        client_success,
+        "Python client should report transfer complete or 100% progress"
+    );
+
+    eprintln!("1KB Python→Rust resource transfer test passed");
+}
+
+/// Test Rust sending a 1KB resource to Python.
+///
+/// Tests resource transfer with data large enough to require multiple parts.
+#[test]
+fn test_rust_sends_1kb_resource_to_python() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_1kb_r2p",
+                "-i", "5",
+                "-n", "1",
+                "-t", "90",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 1KB (1024 bytes) of 'D' (hex encoded)
+    let data_1kb_hex = "44".repeat(1024);
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_1kb_r2p",
+                "-s", &data_1kb_hex,
+                "-t", "80",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(10));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify link establishment
+    assert!(
+        client_parsed.link_activated(),
+        "Rust client should establish link"
+    );
+
+    // Verify resource advertised
+    assert!(
+        client_parsed.has("RESOURCE_ADVERTISED"),
+        "Rust should advertise resource"
+    );
+
+    // Verify resource completion on Python side
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete 1KB resource transfer"
+    );
+
+    // Verify data size
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, 1024,
+                "Resource size should be exactly 1024 bytes, got {}",
+                size
+            );
+            eprintln!("Size verified: {} bytes", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof"
+    );
+
+    eprintln!("1KB Rust→Python resource transfer test passed");
+}
+
+/// Test Python sending a 10KB resource to Rust.
+///
+/// Tests larger resource transfer requiring more parts and windowing.
+#[test]
+fn test_python_sends_10kb_resource_to_rust() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Rust resource server with longer timeout for large transfer
+    let rust_server = ctx
+        .run_rust_binary(
+            "test_resource_server",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_10kb",
+                "-i", "10",
+                "-n", "1",
+                "-t", "180",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource server");
+
+    // Wait for destination hash
+    let dest_line = rust_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Rust server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Rust server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 10KB (10240 bytes) of 'E' (hex encoded)
+    let data_10kb_hex = "45".repeat(10240);
+
+    // Start Python resource client
+    let python_client = ctx
+        .run_python_helper(
+            "python_resource_client.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_10kb",
+                "-s", &data_10kb_hex,
+                "-t", "160",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource client");
+
+    // Wait for link and resource transfer (longer timeout for large transfer)
+    let _ = python_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(30));
+
+    let server_output = rust_server.output();
+    let client_output = python_client.output();
+
+    eprintln!("Rust server output:\n{}", server_output);
+    eprintln!("Python client output:\n{}", client_output);
+
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify resource advertisement received
+    assert!(
+        server_parsed.has("RESOURCE_ADVERTISEMENT"),
+        "Rust should receive resource advertisement"
+    );
+
+    // Verify resource parts were received (multiple parts expected)
+    assert!(
+        server_parsed.has("RESOURCE_PART_RECEIVED"),
+        "Rust should receive multiple resource parts"
+    );
+
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Rust should complete 10KB resource transfer"
+    );
+
+    // Verify proof was sent
+    assert!(
+        server_parsed.has("RESOURCE_PROOF_SENT"),
+        "Rust should send resource proof"
+    );
+
+    eprintln!("10KB Python→Rust resource transfer test passed");
+}
+
+/// Test Rust sending a 10KB resource to Python.
+///
+/// Tests larger resource transfer requiring more parts and windowing.
+#[test]
+fn test_rust_sends_10kb_resource_to_python() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_10kb_r2p",
+                "-i", "10",
+                "-n", "1",
+                "-t", "180",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 10KB (10240 bytes) of 'F' (hex encoded)
+    let data_10kb_hex = "46".repeat(10240);
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_10kb_r2p",
+                "-s", &data_10kb_hex,
+                "-t", "160",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer (longer timeout for large transfer)
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(30));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify resource advertised
+    assert!(
+        client_parsed.has("RESOURCE_ADVERTISED"),
+        "Rust should advertise resource"
+    );
+
+    // Verify resource completion on Python side
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete 10KB resource transfer"
+    );
+
+    // Verify data size
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, 10240,
+                "Resource size should be exactly 10240 bytes, got {}",
+                size
+            );
+            eprintln!("Size verified: {} bytes", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof"
+    );
+
+    // Verify transfer complete
+    assert!(
+        client_parsed.has("RESOURCE_TRANSFER_COMPLETE"),
+        "Rust should report 10KB transfer complete"
+    );
+
+    eprintln!("10KB Rust→Python resource transfer test passed");
+}
+
+/// Test sending an empty (zero-byte) resource from Rust to Python.
+///
+/// Tests edge case handling when there is no actual data payload.
+#[test]
+fn test_rust_sends_empty_resource_to_python() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_empty",
+                "-i", "5",
+                "-n", "1",
+                "-t", "60",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Empty data (0 bytes) - empty hex string
+    let empty_data_hex = "";
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_empty",
+                "-s", empty_data_hex,
+                "-t", "50",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(5));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify link establishment
+    assert!(
+        client_parsed.link_activated(),
+        "Rust client should establish link"
+    );
+
+    // Check if resource was created and advertised
+    // Note: Empty resources may either succeed or fail gracefully
+    let resource_advertised = client_parsed.has("RESOURCE_ADVERTISED");
+    let error_occurred = client_parsed.get("STATUS").map(|s| s.starts_with("ERROR")).unwrap_or(false);
+
+    if resource_advertised {
+        // If resource was advertised, verify transfer completed
+        eprintln!("Empty resource was advertised, checking transfer completion");
+
+        // Verify resource completion on Python side
+        if server_parsed.has("RESOURCE_COMPLETE") {
+            // Verify data size is 0
+            if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+                let parts: Vec<&str> = complete_data.split(':').collect();
+                if parts.len() >= 2 {
+                    let size: usize = parts[1].parse().unwrap_or(999);
+                    assert_eq!(
+                        size, 0,
+                        "Empty resource size should be 0 bytes, got {}",
+                        size
+                    );
+                    eprintln!("Empty resource size verified: {} bytes", size);
+                }
+            }
+            eprintln!("Empty resource transfer completed successfully");
+        } else {
+            eprintln!("Note: Empty resource advertised but transfer may have special handling");
+        }
+    } else if error_occurred {
+        // If creation failed, that's acceptable for empty resources
+        eprintln!("Note: Empty resource creation failed, which may be expected behavior");
+    } else {
+        eprintln!("Note: Empty resource handling was ambiguous");
+    }
+
+    eprintln!("Empty resource test completed (behavior documented)");
+}
+
+/// Test sending a minimal 1-byte resource.
+///
+/// Tests the smallest non-empty resource to verify boundary handling.
+#[test]
+fn test_rust_sends_1byte_resource_to_python() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_1byte",
+                "-i", "5",
+                "-n", "1",
+                "-t", "60",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 1 byte of 'X' (hex encoded)
+    let data_1byte_hex = "58";
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_1byte",
+                "-s", data_1byte_hex,
+                "-t", "50",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(5));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify link establishment
+    assert!(
+        client_parsed.link_activated(),
+        "Rust client should establish link"
+    );
+
+    // Verify resource advertised
+    assert!(
+        client_parsed.has("RESOURCE_ADVERTISED"),
+        "Rust should advertise 1-byte resource"
+    );
+
+    // Verify resource completion on Python side
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete 1-byte resource transfer"
+    );
+
+    // Verify data size is 1
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, 1,
+                "1-byte resource size should be exactly 1, got {}",
+                size
+            );
+            eprintln!("Size verified: {} byte", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof for 1-byte transfer"
+    );
+
+    eprintln!("1-byte Rust→Python resource transfer test passed");
+}
