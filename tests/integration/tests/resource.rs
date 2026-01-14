@@ -188,24 +188,44 @@ fn test_python_sends_larger_resource_to_rust() {
         "Rust should receive resource advertisement"
     );
 
-    // Check for resource request being sent
-    if server_parsed.has("RESOURCE_REQUEST_SENT") {
-        eprintln!("Rust sent resource request to Python");
-    }
+    // Verify resource request was sent
+    assert!(
+        server_parsed.has("RESOURCE_REQUEST_SENT"),
+        "Rust should send resource request to Python"
+    );
 
-    // Check for resource parts being received
-    if server_parsed.has("RESOURCE_PART_RECEIVED") {
-        eprintln!("Rust received resource data parts");
-    }
+    // Verify resource parts were received
+    assert!(
+        server_parsed.has("RESOURCE_PART_RECEIVED"),
+        "Rust should receive resource data parts"
+    );
 
-    // Check for resource completion
-    if server_parsed.has("RESOURCE_COMPLETE") {
-        eprintln!("Rust completed resource transfer");
-    }
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Rust should complete resource transfer"
+    );
 
-    // Check for proof being sent
-    if server_parsed.has("RESOURCE_PROOF_SENT") {
-        eprintln!("Rust sent resource proof to Python");
+    // Verify proof was sent
+    assert!(
+        server_parsed.has("RESOURCE_PROOF_SENT"),
+        "Rust should send resource proof to Python"
+    );
+
+    // Verify data size in RESOURCE_COMPLETE output
+    // Format: RESOURCE_COMPLETE=link_id:hash:size
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 3 {
+            let size: usize = parts[2].parse().unwrap_or(0);
+            // Compressed data may be slightly different, but should be close to 100 bytes
+            assert!(
+                size >= 50 && size <= 200,
+                "Resource size should be approximately 100 bytes (got {} compressed)",
+                size
+            );
+            eprintln!("Resource size verified: {} bytes", size);
+        }
     }
 
     eprintln!("Larger resource transfer test passed");
@@ -311,25 +331,37 @@ fn test_rust_sends_resource_to_python() {
         "Python should start resource transfer"
     );
 
-    // Check for resource completion
-    if server_parsed.has("RESOURCE_COMPLETE") {
-        eprintln!("Python completed resource transfer");
+    // Verify resource completion on Python side
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete resource transfer"
+    );
 
-        // Verify the data content if available
-        if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
-            eprintln!("Resource complete: {}", complete_data);
+    // Verify data content matches
+    // Python outputs: RESOURCE_COMPLETE=hash:size:hex_data
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 3 {
+            let received_hex = parts[2];
+            assert_eq!(
+                received_hex, test_data_hex,
+                "Received data should match sent data"
+            );
+            eprintln!("Data content verified: {} bytes match", parts[1]);
         }
     }
 
-    // Check for proof received by Rust
-    if client_parsed.has("RESOURCE_PROOF_RECEIVED") {
-        eprintln!("Rust received resource proof from Python");
-    }
+    // Verify proof received by Rust
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof from Python"
+    );
 
-    // Check overall success
-    if client_parsed.has("RESOURCE_TRANSFER_COMPLETE") {
-        eprintln!("Rust→Python resource transfer complete");
-    }
+    // Verify overall transfer completion
+    assert!(
+        client_parsed.has("RESOURCE_TRANSFER_COMPLETE"),
+        "Rust should report transfer complete"
+    );
 
     eprintln!("Rust→Python resource transfer test passed");
 }
@@ -417,20 +449,32 @@ fn test_rust_sends_larger_resource_to_python() {
         "Rust should advertise resource"
     );
 
-    // Check for resource completion on Python side
-    if server_parsed.has("RESOURCE_COMPLETE") {
-        eprintln!("Python completed larger resource transfer");
+    // Verify resource completion on Python side
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete larger resource transfer"
+    );
 
-        // Try to verify size
-        if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
-            eprintln!("Resource complete: {}", complete_data);
+    // Verify data size
+    // Python outputs: RESOURCE_COMPLETE=hash:size:hex_data
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, 500,
+                "Resource size should be exactly 500 bytes, got {}",
+                size
+            );
+            eprintln!("Size verified: {} bytes", size);
         }
     }
 
-    // Check overall success
-    if client_parsed.has("RESOURCE_TRANSFER_COMPLETE") {
-        eprintln!("Rust completed larger resource transfer");
-    }
+    // Verify overall transfer completion
+    assert!(
+        client_parsed.has("RESOURCE_TRANSFER_COMPLETE"),
+        "Rust should report larger transfer complete"
+    );
 
     eprintln!("Larger Rust→Python resource transfer test passed");
 }

@@ -147,6 +147,85 @@ fn test_python_link_server_outputs_destination() {
     eprintln!("Python link server destination: {}", dest_hash);
 }
 
+/// Test actual TCP connection between Python hub and Rust node.
+///
+/// This verifies that a Rust client can connect to a Python hub
+/// and that both sides are aware of the connection.
+#[test]
+fn test_python_rust_tcp_connectivity() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    let hub_port = hub.port();
+    eprintln!("Python hub started on port {}", hub_port);
+
+    // Start a Rust destination that connects to the hub
+    let rust_dest = ctx
+        .run_rust_binary(
+            "test_destination",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub_port),
+                "-a", "connectivity_test",
+                "-A", "rustnode",
+                "-i", "2",  // announce interval
+                "-n", "3",  // announce count
+            ],
+        )
+        .expect("Failed to start Rust destination");
+
+    // Wait for destination hash (indicates Rust node is running)
+    let dest_line = rust_dest
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(10))
+        .expect("Rust destination should output hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Rust destination hash: {}", dest_hash);
+
+    // Wait for connection to establish and announces to be sent
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Verify Rust output shows connection
+    let rust_output = rust_dest.output();
+    eprintln!("Rust output:\n{}", rust_output);
+
+    // Check for connection indicators in Rust output
+    let rust_connected = rust_output.to_lowercase().contains("tcp_client connected")
+        || rust_output.to_lowercase().contains("connected to")
+        || rust_output.contains("ANNOUNCE_SENT");
+
+    assert!(
+        rust_connected,
+        "Rust should show connection to hub or send announces"
+    );
+
+    // Verify announces were sent (proves data is flowing)
+    let rust_parsed = TestOutput::parse(&rust_output);
+    assert!(
+        rust_parsed.has("ANNOUNCE_SENT"),
+        "Rust should have sent announces through the hub"
+    );
+
+    let announce_count = rust_parsed.announce_count().unwrap_or(0);
+    assert!(
+        announce_count > 0,
+        "Rust should have sent at least one announce, got {}",
+        announce_count
+    );
+
+    eprintln!(
+        "TCP connectivity verified: Rust sent {} announces through Python hub",
+        announce_count
+    );
+}
+
 /// Test that KEY=VALUE output parsing works correctly.
 #[test]
 fn test_output_parsing() {

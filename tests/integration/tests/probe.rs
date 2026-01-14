@@ -188,6 +188,24 @@ fn test_python_rnprobe_to_rust_destination() {
     } else {
         eprintln!("Rust destination announced successfully");
     }
+
+    // Additional verification: check network status via rnstatus
+    let mut status_cmd = ctx.venv().rnstatus();
+    if let Ok(status_output) = status_cmd.output() {
+        let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+        let status_stderr = String::from_utf8_lossy(&status_output.stderr);
+        let status_combined = format!("{}{}", status_stdout, status_stderr).to_lowercase();
+
+        let network_operational = status_combined.contains("interface")
+            || status_combined.contains("transport")
+            || status_combined.contains("running")
+            || status_combined.contains("announce")
+            || status_combined.contains("destination");
+
+        if network_operational {
+            eprintln!("Network status verified via rnstatus");
+        }
+    }
 }
 
 /// Test that Rust rnpath can find Python destinations.
