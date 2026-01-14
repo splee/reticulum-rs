@@ -48,3 +48,4 @@ id_rsa*
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/

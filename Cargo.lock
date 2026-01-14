@@ -1508,6 +1508,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "lazy_static",
+ "libc",
  "log",
  "md-5",
  "prost",

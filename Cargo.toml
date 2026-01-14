@@ -95,6 +95,12 @@ tonic-build = "0.13.0"
 
 [dev-dependencies]
 tempfile = "3.10"
+libc = "0.2"  # For SIGTERM handling in integration tests
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+harness = true
 
 [[example]]
 name = "tcp_server"
