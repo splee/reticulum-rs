@@ -1159,3 +1159,327 @@ fn test_rust_sends_1byte_resource_to_python() {
 
     eprintln!("1-byte Rust→Python resource transfer test passed");
 }
+
+// =============================================================================
+// MTU Boundary Tests
+// =============================================================================
+// These tests verify resource handling at segment size boundaries.
+// PACKET_MDU = 2048, SDU = PACKET_MDU - 64 = 1984 bytes per segment
+
+/// Test resource at exactly one segment size (SDU = 1984 bytes).
+///
+/// This should fit in exactly 1 part with no overflow.
+#[test]
+fn test_resource_at_exact_sdu_boundary() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_sdu",
+                "-i", "5",
+                "-n", "1",
+                "-t", "90",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // SDU size = 1984 bytes (PACKET_MDU - 64 = 2048 - 64)
+    // Use 'G' (0x47) as the fill byte
+    let sdu_size = 1984;
+    let data_sdu_hex = "47".repeat(sdu_size);
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_sdu",
+                "-s", &data_sdu_hex,
+                "-t", "80",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(10));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete SDU-boundary resource transfer"
+    );
+
+    // Verify data size matches SDU
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, sdu_size,
+                "Resource size should be exactly {} bytes (1 SDU), got {}",
+                sdu_size, size
+            );
+            eprintln!("SDU boundary size verified: {} bytes", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof"
+    );
+
+    eprintln!("SDU boundary (1984 bytes) Rust→Python resource transfer test passed");
+}
+
+/// Test resource just over one segment (SDU + 1 = 1985 bytes).
+///
+/// This should require 2 parts since it exceeds the single segment capacity.
+#[test]
+fn test_resource_over_sdu_boundary() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_sdu_plus",
+                "-i", "5",
+                "-n", "1",
+                "-t", "90",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // SDU + 1 = 1985 bytes - should require 2 parts
+    // Use 'H' (0x48) as the fill byte
+    let sdu_plus_size = 1985;
+    let data_sdu_plus_hex = "48".repeat(sdu_plus_size);
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_sdu_plus",
+                "-s", &data_sdu_plus_hex,
+                "-t", "80",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(10));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete SDU+1 resource transfer"
+    );
+
+    // Verify data size
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, sdu_plus_size,
+                "Resource size should be exactly {} bytes (SDU+1), got {}",
+                sdu_plus_size, size
+            );
+            eprintln!("SDU+1 boundary size verified: {} bytes", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof"
+    );
+
+    eprintln!("SDU+1 boundary (1985 bytes) Rust→Python resource transfer test passed");
+}
+
+/// Test resource at exactly two segments (2 * SDU = 3968 bytes).
+///
+/// This should fit in exactly 2 parts.
+#[test]
+fn test_resource_at_two_sdu_boundary() {
+    let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
+
+    // Start Python hub
+    let hub = ctx
+        .start_python_hub()
+        .expect("Failed to start Python hub");
+
+    // Start Python resource server
+    let python_server = ctx
+        .run_python_helper(
+            "python_resource_server.py",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-a", "test_app",
+                "-A", "resourceserver_2sdu",
+                "-i", "5",
+                "-n", "1",
+                "-t", "90",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Python resource server");
+
+    // Wait for destination hash
+    let dest_line = python_server
+        .wait_for_output("DESTINATION_HASH=", Duration::from_secs(15))
+        .expect("Python server should output destination hash");
+
+    let parsed = TestOutput::parse(&dest_line);
+    let dest_hash = parsed
+        .destination_hash()
+        .expect("Should have destination hash");
+
+    eprintln!("Python server destination hash: {}", dest_hash);
+
+    // Wait for announce to propagate
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 2 * SDU = 3968 bytes
+    // Use 'I' (0x49) as the fill byte
+    let two_sdu_size = 3968;
+    let data_2sdu_hex = "49".repeat(two_sdu_size);
+
+    // Start Rust resource client
+    let rust_client = ctx
+        .run_rust_binary(
+            "test_resource_client",
+            &[
+                "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
+                "-d", dest_hash,
+                "-a", "test_app",
+                "-A", "resourceserver_2sdu",
+                "-s", &data_2sdu_hex,
+                "-t", "80",
+                "-v",
+            ],
+        )
+        .expect("Failed to start Rust resource client");
+
+    // Wait for link and resource transfer
+    let _ = rust_client.wait_for_output("LINK_ACTIVATED=", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(10));
+
+    let client_output = rust_client.output();
+    let server_output = python_server.output();
+
+    eprintln!("Rust client output:\n{}", client_output);
+    eprintln!("Python server output:\n{}", server_output);
+
+    let client_parsed = TestOutput::parse(&client_output);
+    let server_parsed = TestOutput::parse(&server_output);
+
+    // Verify resource completion
+    assert!(
+        server_parsed.has("RESOURCE_COMPLETE"),
+        "Python should complete 2-SDU resource transfer"
+    );
+
+    // Verify data size
+    if let Some(complete_data) = server_parsed.get("RESOURCE_COMPLETE") {
+        let parts: Vec<&str> = complete_data.split(':').collect();
+        if parts.len() >= 2 {
+            let size: usize = parts[1].parse().unwrap_or(0);
+            assert_eq!(
+                size, two_sdu_size,
+                "Resource size should be exactly {} bytes (2 SDUs), got {}",
+                two_sdu_size, size
+            );
+            eprintln!("2-SDU boundary size verified: {} bytes", size);
+        }
+    }
+
+    // Verify proof received
+    assert!(
+        client_parsed.has("RESOURCE_PROOF_RECEIVED"),
+        "Rust should receive resource proof"
+    );
+
+    eprintln!("2-SDU boundary (3968 bytes) Rust→Python resource transfer test passed");
+}
