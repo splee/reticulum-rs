@@ -237,6 +237,15 @@ impl IntegrationTestContext {
         self.venv
     }
 
+    /// Get the path to the helpers directory.
+    pub fn helpers_dir(&self) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests");
+        path.push("integration");
+        path.push("helpers");
+        path
+    }
+
     /// Create a Python hub configuration without starting it.
     pub fn create_python_hub_config(&mut self) -> Result<TestConfig, TestError> {
         let config = TestConfig::python_hub()?;
