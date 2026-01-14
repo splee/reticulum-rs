@@ -53,14 +53,25 @@ echo -e "${NC}"
 BUILD_SENTINEL="/tmp/reticulum-test-images-built"
 export BUILD_SENTINEL
 
+# Check if sentinel already exists (indicates concurrent run or unclean exit)
+if [ -f "$BUILD_SENTINEL" ]; then
+    echo -e "${RED}ERROR: Build sentinel file exists: $BUILD_SENTINEL${NC}"
+    echo -e "${RED}This means either:${NC}"
+    echo -e "${RED}  1. Another test run is already in progress${NC}"
+    echo -e "${RED}  2. A previous run did not clean up properly${NC}"
+    echo -e "${RED}To fix: rm -f $BUILD_SENTINEL${NC}"
+    exit 1
+fi
+
 # Create sentinel to indicate we're managing builds
 touch "$BUILD_SENTINEL"
 trap "rm -f '$BUILD_SENTINEL'" EXIT INT TERM
 
-# Build and start containers (only builds once)
+# Build and start containers (only builds once, with --no-cache for fresh build)
 echo -e "${YELLOW}Building and starting containers...${NC}"
 cd "$DOCKER_DIR"
-docker compose up -d --build 2>&1 | grep -v "^$"
+docker compose build --no-cache 2>&1 | grep -v "^$"
+docker compose up -d 2>&1 | grep -v "^$"
 cd - > /dev/null
 
 # Wait for containers to be healthy

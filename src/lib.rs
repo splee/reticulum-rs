@@ -41,6 +41,9 @@ pub mod rpc;
 // Remote management client utilities
 pub mod remote_client;
 
+// CLI shared utilities
+pub mod cli;
+
 // Internal modules
 mod utils;
 mod serde;

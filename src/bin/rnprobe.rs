@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use rand_core::{OsRng, RngCore};
 
+use reticulum::cli::hash::parse_destination;
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::destination::{DestinationName, SingleOutputDestination};
 use reticulum::hash::AddressHash;
@@ -103,26 +104,6 @@ async fn main() {
     // Run the probe
     let exit_code = run_probe(&args, &config, &dest_hash).await;
     std::process::exit(exit_code);
-}
-
-/// Parse a destination hash string
-fn parse_destination(dest_str: &str) -> Result<AddressHash, String> {
-    let clean = dest_str
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim_start_matches('/')
-        .trim_end_matches('/');
-
-    if clean.len() != 32 {
-        return Err(format!(
-            "Invalid hash length: expected 32 hex characters, got {}",
-            clean.len()
-        ));
-    }
-
-    AddressHash::new_from_hex_string(clean)
-        .map_err(|_| "Invalid hexadecimal string".to_string())
 }
 
 /// Create and configure transport with interfaces

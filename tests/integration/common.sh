@@ -98,8 +98,9 @@ build_containers() {
         info "Using existing images (build sentinel detected)"
         docker compose up -d --no-build
     else
-        info "Building Docker images..."
-        docker compose up -d --build
+        info "Building Docker images (--no-cache to ensure fresh build)..."
+        docker compose build --no-cache
+        docker compose up -d
 
         # Create sentinel if it doesn't exist
         if [ ! -f "$BUILD_SENTINEL" ]; then

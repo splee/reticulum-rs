@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use std::fs;
 
+use reticulum::cli::format::{format_hash_hex, format_time};
+use reticulum::cli::hash::parse_destination;
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
@@ -219,28 +221,6 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
-/// Parse a destination hash string
-fn parse_destination(dest_str: &str) -> Result<AddressHash, String> {
-    // Remove any / prefix/suffix if present
-    let clean = dest_str
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim_start_matches('/')
-        .trim_end_matches('/');
-
-    // Validate length (should be 32 hex chars = 16 bytes)
-    if clean.len() != 32 {
-        return Err(format!(
-            "Invalid hash length: expected 32 hex characters, got {}",
-            clean.len()
-        ));
-    }
-
-    AddressHash::new_from_hex_string(clean)
-        .map_err(|_| "Invalid hexadecimal string".to_string())
-}
-
 /// Create a transport instance for querying
 async fn create_transport(_config: &ReticulumConfig) -> Transport {
     let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -440,7 +420,7 @@ async fn handle_rate_table(args: &Args, config: &ReticulumConfig) -> i32 {
     for rate in &rates {
         let last_str = if let Some(last) = rate.last_announce {
             let ago = now - last;
-            pretty_time(ago)
+            format_time(ago)
         } else {
             "never".to_string()
         };
@@ -467,7 +447,7 @@ async fn handle_rate_table(args: &Args, config: &ReticulumConfig) -> i32 {
                 let remaining = blocked_until - now;
                 suffix.push_str(&format!(
                     ", new announces allowed in {}",
-                    pretty_time(remaining)
+                    format_time(remaining)
                 ));
             }
         }
@@ -786,7 +766,7 @@ async fn handle_blackholed_list(args: &Args, config: &ReticulumConfig) -> i32 {
         let until_str = if let Some(ref e) = entry {
             if let Some(exp) = e.expires_at {
                 let remaining = exp.saturating_duration_since(std::time::Instant::now());
-                format!("for {}", pretty_time(remaining.as_secs_f64()))
+                format!("for {}", format_time(remaining.as_secs_f64()))
             } else {
                 "indefinitely".to_string()
             }
@@ -1551,7 +1531,7 @@ fn display_path_table(args: &Args, entries: &[RemotePathEntry]) {
     for entry in entries {
         let expires_in = entry.expires.map(|e| e - now).unwrap_or(0.0);
         let expires_str = if expires_in > 0.0 {
-            format!(" expires {}", pretty_time(expires_in))
+            format!(" expires {}", format_time(expires_in))
         } else {
             String::new()
         };
@@ -1639,63 +1619,6 @@ fn pretty_hash(hash: &AddressHash) -> String {
     format!("<{}>", format_hash_hex(hash))
 }
 
-/// Format an AddressHash as a plain hex string
-fn format_hash_hex(hash: &AddressHash) -> String {
-    hash.as_slice()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
-}
-
-/// Format seconds as human-readable time
-fn pretty_time(seconds: f64) -> String {
-    if seconds < 60.0 {
-        format!("{:.0} seconds", seconds)
-    } else if seconds < 3600.0 {
-        let mins = seconds / 60.0;
-        if mins < 2.0 {
-            "1 minute".to_string()
-        } else {
-            format!("{:.0} minutes", mins)
-        }
-    } else if seconds < 86400.0 {
-        let hours = seconds / 3600.0;
-        if hours < 2.0 {
-            "1 hour".to_string()
-        } else {
-            format!("{:.0} hours", hours)
-        }
-    } else if seconds < 604800.0 {
-        let days = seconds / 86400.0;
-        if days < 2.0 {
-            "1 day".to_string()
-        } else {
-            format!("{:.0} days", days)
-        }
-    } else if seconds < 2592000.0 {
-        let weeks = seconds / 604800.0;
-        if weeks < 2.0 {
-            "1 week".to_string()
-        } else {
-            format!("{:.0} weeks", weeks)
-        }
-    } else if seconds < 31536000.0 {
-        let months = seconds / 2592000.0;
-        if months < 2.0 {
-            "1 month".to_string()
-        } else {
-            format!("{:.0} months", months)
-        }
-    } else {
-        let years = seconds / 31536000.0;
-        if years < 2.0 {
-            "1 year".to_string()
-        } else {
-            format!("{:.0} years", years)
-        }
-    }
-}
-
 /// Format a Unix timestamp as a human-readable string
 fn timestamp_str(ts: f64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1711,9 +1634,9 @@ fn timestamp_str(ts: f64) -> String {
 
     let diff = ts - now;
     if diff > 0.0 {
-        format!("in {}", pretty_time(diff))
+        format!("in {}", format_time(diff))
     } else {
-        format!("{} ago", pretty_time(-diff))
+        format!("{} ago", format_time(-diff))
     }
 }
 
@@ -1760,5 +1683,5 @@ fn calculate_span_str(timestamps: &[f64], now: f64) -> String {
     let oldest = **recent.first().unwrap();
     let span = now - oldest;
 
-    pretty_time(span)
+    format_time(span)
 }
