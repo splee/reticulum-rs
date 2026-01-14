@@ -137,6 +137,57 @@ impl TestConfig {
         })
     }
 
+    /// Create configuration for a Rust relay node (TCP client + server).
+    ///
+    /// Connects to the specified hub port as a client and runs its own
+    /// TCP server for other nodes to connect to. Used in multi-hop tests.
+    pub fn rust_relay(hub_port: u16) -> io::Result<Self> {
+        let ports = allocate_ports(3);
+        let tcp_port = ports[0]; // Port for other nodes to connect to
+        let shared_port = ports[1];
+        let control_port = ports[2];
+
+        let dir = TempDir::new()?;
+
+        let config_content = format!(
+            r#"# Rust Relay Configuration (generated for integration test)
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = No
+  shared_instance_port = {shared_port}
+  instance_control_port = {control_port}
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 5
+
+[interfaces]
+
+  [[TCP Client Interface]]
+    type = TCPClientInterface
+    enabled = True
+    target_host = 127.0.0.1
+    target_port = {hub_port}
+
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    enabled = True
+    listen_ip = 127.0.0.1
+    listen_port = {tcp_port}
+"#
+        );
+
+        fs::write(dir.path().join("config"), config_content)?;
+
+        Ok(Self {
+            dir,
+            tcp_port,
+            shared_port,
+            control_port,
+        })
+    }
+
     /// Create a minimal configuration with no interfaces.
     ///
     /// Useful for testing CLI tools that don't need network connectivity.

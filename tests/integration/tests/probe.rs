@@ -46,9 +46,9 @@ fn test_python_rnpath_finds_rust_destination() {
     // Wait for announces to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Use Python rnpath to check if path is known
+    // Use Python rnpath to check if path is known (with timeout)
     let mut cmd = ctx.venv().rnpath();
-    cmd.arg(dest_hash);
+    cmd.args(["-w", "5", dest_hash]);
 
     let output = cmd.output().expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -129,9 +129,9 @@ fn test_python_rnprobe_to_rust_destination() {
     // Wait for announces to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // First verify path is known via rnpath
+    // First verify path is known via rnpath (with timeout)
     let mut path_cmd = ctx.venv().rnpath();
-    path_cmd.arg(dest_hash);
+    path_cmd.args(["-w", "5", dest_hash]);
     let path_output = path_cmd.output().expect("Failed to run rnpath");
     let path_stdout = String::from_utf8_lossy(&path_output.stdout);
     eprintln!("rnpath check: {}", path_stdout);

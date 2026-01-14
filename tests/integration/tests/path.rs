@@ -46,9 +46,9 @@ fn test_python_discovers_rust_path() {
     // Wait for announces to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Query path with rnpath
+    // Query path with rnpath (with timeout)
     let mut cmd = ctx.venv().rnpath();
-    cmd.args([dest_hash]);
+    cmd.args(["-w", "5", dest_hash]);
 
     let output = cmd.output().expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -98,8 +98,9 @@ fn test_multiple_destinations_path_discovery() {
         .start_python_hub()
         .expect("Failed to start Python hub");
 
-    // Create multiple Rust destinations
+    // Create multiple Rust destinations - keep them alive in a Vec
     let mut dest_hashes = Vec::new();
+    let mut destinations = Vec::new();
     for i in 1..=3 {
         let rust_dest = ctx
             .run_rust_binary(
@@ -122,16 +123,18 @@ fn test_multiple_destinations_path_discovery() {
                 dest_hashes.push(hash.to_string());
             }
         }
+        // Keep the process alive
+        destinations.push(rust_dest);
     }
 
     // Wait for announces to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Check how many paths Python knows
+    // Check how many paths Python knows (with timeout to prevent hanging)
     let mut found_paths = 0;
     for hash in &dest_hashes {
         let mut cmd = ctx.venv().rnpath();
-        cmd.args([hash.as_str()]);
+        cmd.args(["-w", "5", hash.as_str()]); // 5 second timeout per path lookup
 
         let output = cmd.output().expect("Failed to run rnpath");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -176,6 +179,9 @@ fn test_multiple_destinations_path_discovery() {
         "Should find at least one path or have created destinations"
     );
 
+    // Keep destinations alive until test completes
+    drop(destinations);
+
     eprintln!("Multiple destinations path discovery test passed");
 }
 
@@ -218,9 +224,9 @@ fn test_path_request() {
     // Wait for some announces
     std::thread::sleep(Duration::from_secs(4));
 
-    // Request path using rnpath -r (if supported)
+    // Request path using rnpath -r (if supported) with timeout
     let mut cmd = ctx.venv().rnpath();
-    cmd.args(["-r", dest_hash]);
+    cmd.args(["-w", "5", "-r", dest_hash]);
 
     let output = cmd.output().expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);

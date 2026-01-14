@@ -132,9 +132,9 @@ fn test_rust_destination_discoverable_by_python() {
     // Wait for announces to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Use Python rnpath to check if the destination is reachable
+    // Use Python rnpath to check if the destination is reachable (with timeout)
     let mut cmd = ctx.venv().rnpath();
-    cmd.args(["-d", dest_hash]);
+    cmd.args(["-w", "5", "-d", dest_hash]);
 
     let output = cmd.output().expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);

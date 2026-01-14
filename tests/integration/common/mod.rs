@@ -246,6 +246,14 @@ impl IntegrationTestContext {
         path
     }
 
+    /// Get the path to the integration test directory.
+    pub fn integration_test_dir(&self) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests");
+        path.push("integration");
+        path
+    }
+
     /// Create a Python hub configuration without starting it.
     pub fn create_python_hub_config(&mut self) -> Result<TestConfig, TestError> {
         let config = TestConfig::python_hub()?;
