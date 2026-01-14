@@ -3,10 +3,12 @@
 //! Each module contains tests for a specific area of functionality.
 
 mod connectivity;
+mod identity_interop;
+mod link;
+mod link_data;
+mod probe;
+
 // Future test modules:
-// mod identity_interop;
-// mod link;
-// mod link_data;
-// mod resource;
-// mod probe;
 // mod path;
+// mod resource;
+// mod resource_rust_to_python;

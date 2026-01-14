@@ -37,7 +37,7 @@ struct Args {
     aspect: String,
 
     /// Identity name (seed for deterministic identity)
-    #[arg(short, long)]
+    #[arg(short = 'I', long)]
     identity_name: Option<String>,
 
     /// TCP server to listen on (e.g., "0.0.0.0:4243")
