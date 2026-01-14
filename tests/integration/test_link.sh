@@ -75,7 +75,7 @@ sleep 3
 # Start Rust link client - use --wait-announce to catch the next announce
 info "Rust connecting to Python destination (waiting for announce)..."
 RUST_CLIENT_OUTPUT=$(docker exec reticulum-rust-node timeout 30 test_link_client \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --wait-announce \
     --app-name test_app \
     --aspect pythonserver \
@@ -120,7 +120,7 @@ mkfifo "$RUST_SERVER_FIFO"
 
 # Run Rust destination announcer
 (docker exec reticulum-rust-node timeout 30 test_destination \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --app-name test_app \
     --aspect rustdest \
     --announce-interval 3 \

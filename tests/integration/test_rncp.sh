@@ -121,7 +121,7 @@ info "Python test file checksum: $PYTHON_CHECKSUM"
 
 # Start Rust rncp listener (connects to Python's TCP server so both share the network)
 RUST_OUTPUT=$(mktemp)
-exec_rust sh -c "rm -f /tmp/received_* /tmp/*.txt; timeout 60 rncp -l -n -s /tmp --tcp-client python-hub:4242 -b 0 -i 5" > "$RUST_OUTPUT" 2>&1 &
+exec_rust sh -c "rm -f /tmp/received_* /tmp/*.txt; timeout 60 rncp -l -n -s /tmp --tcp-client python-hub:14242 -b 0 -i 5" > "$RUST_OUTPUT" 2>&1 &
 RUST_PID=$!
 sleep 5
 
@@ -216,7 +216,7 @@ else
 
     # Send file from Rust to Python (Rust connects to Python's TCP server on port 4242)
     info "Rust sending file to Python..."
-    exec_rust timeout 45 rncp /tmp/$TEST_FILE_NAME2 $PYTHON_HASH --tcp-client python-hub:4242 -S -v 2>&1 || true
+    exec_rust timeout 45 rncp /tmp/$TEST_FILE_NAME2 $PYTHON_HASH --tcp-client python-hub:14242 -S -v 2>&1 || true
 
     sleep 8
 

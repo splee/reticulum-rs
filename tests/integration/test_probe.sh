@@ -30,7 +30,7 @@ mkfifo "$RUST_DEST_FIFO"
 
 # Run Rust destination announcer (longer timeout for probe test)
 (docker exec reticulum-rust-node timeout 45 test_destination \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --app-name probe_test \
     --aspect destination \
     --announce-interval 3 \

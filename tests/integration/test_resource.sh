@@ -21,7 +21,7 @@ info "Test 1: Python sends resource advertisement to Rust"
 # Start Rust resource server in background
 RUST_SERVER_OUTPUT=$(mktemp)
 timeout 60 docker exec reticulum-rust-node test_resource_server \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     -a test_app -A resourceserver \
     -n 1 -t 50 -i 5 \
     > "$RUST_SERVER_OUTPUT" 2>&1 &
@@ -148,7 +148,7 @@ info "Test 2: Verify resource data packet reception"
 # Start Rust resource server again
 RUST_SERVER_OUTPUT2=$(mktemp)
 timeout 60 docker exec reticulum-rust-node test_resource_server \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     -a test_app -A resourceserver2 \
     -n 1 -t 50 -i 5 -v \
     > "$RUST_SERVER_OUTPUT2" 2>&1 &

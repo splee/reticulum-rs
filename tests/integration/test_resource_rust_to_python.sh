@@ -59,7 +59,7 @@ info "Sending resource from Rust..."
 # Rust client connects and sends resource
 RUST_CLIENT_OUTPUT=$(mktemp)
 timeout 60 docker exec reticulum-rust-node test_resource_client \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     -d "$PYTHON_DEST" \
     -a test_app -A resourceserver \
     -s "$TEST_DATA_HEX" \
@@ -191,7 +191,7 @@ info "Sending larger resource from Rust..."
 
 RUST_CLIENT_OUTPUT2=$(mktemp)
 timeout 60 docker exec reticulum-rust-node test_resource_client \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     -d "$PYTHON_DEST2" \
     -a test_app -A resourceserver2 \
     -s "$LARGER_DATA_HEX" \

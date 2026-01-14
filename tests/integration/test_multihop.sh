@@ -78,7 +78,7 @@ info "Test 1: Announce propagation through relay"
 
 # Create destination on endpoint
 ENDPOINT_DEST_OUTPUT=$(docker exec reticulum-rust-endpoint timeout 20 test_destination \
-    --tcp-client rust-relay:4243 \
+    --tcp-client rust-relay:14243 \
     --app-name multihop \
     --aspect endpoint \
     --announce-interval 3 \
@@ -130,7 +130,7 @@ if [ -n "$HUB_HASH" ]; then
     # Check if endpoint can reach hub destination via relay
     # Use Rust test_link_client to check connectivity
     ENDPOINT_CHECK=$(docker exec reticulum-rust-endpoint timeout 15 test_link_client \
-        --tcp-client rust-relay:4243 \
+        --tcp-client rust-relay:14243 \
         --wait-announce \
         --timeout 12 \
         2>&1 || true)
@@ -172,7 +172,7 @@ info "Test 3: Verify hop count in path"
 
 # Create fresh destination on endpoint
 FRESH_OUTPUT=$(docker exec reticulum-rust-endpoint timeout 15 test_destination \
-    --tcp-client rust-relay:4243 \
+    --tcp-client rust-relay:14243 \
     --app-name multihop \
     --aspect hoptest \
     --announce-interval 2 \

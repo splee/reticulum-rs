@@ -55,7 +55,7 @@ info "Sending test data from Rust..."
 # Rust client connects and sends data
 RUST_OUTPUT=$(mktemp)
 docker exec reticulum-rust-node test_link_client \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --destination "$PYTHON_DEST" \
     --send-data "$TEST_DATA_HEX" \
     -t 20 \
@@ -118,7 +118,7 @@ info "Test 2: Python client sends data to Rust server"
 # Use -n 0 (infinite) and timeout for proper data handling
 RUST_SERVER_OUTPUT=$(mktemp)
 timeout 50 docker exec reticulum-rust-node test_link_server \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     -a test_app -A rustdataserver \
     -n 0 -t 45 -i 5 \
     > "$RUST_SERVER_OUTPUT" 2>&1 &

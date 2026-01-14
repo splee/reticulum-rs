@@ -29,7 +29,7 @@ RUST_DEST_FIFO=$(mktemp -u)
 mkfifo "$RUST_DEST_FIFO"
 
 (docker exec reticulum-rust-node timeout 30 test_destination \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --app-name path_test \
     --aspect discovery \
     --announce-interval 3 \
@@ -102,7 +102,7 @@ DEST_HASHES=""
 for i in 1 2 3; do
     info "Creating destination $i..."
     DEST_OUTPUT=$(docker exec reticulum-rust-node timeout 15 test_destination \
-        --tcp-client python-hub:4242 \
+        --tcp-client python-hub:14242 \
         --app-name path_test \
         --aspect "dest$i" \
         --announce-interval 2 \
@@ -154,7 +154,7 @@ info "Test 3: Path request mechanism"
 
 # Create a new destination
 DEST_OUTPUT=$(docker exec reticulum-rust-node timeout 15 test_destination \
-    --tcp-client python-hub:4242 \
+    --tcp-client python-hub:14242 \
     --app-name path_test \
     --aspect pathreq \
     --announce-interval 2 \
