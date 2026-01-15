@@ -38,6 +38,9 @@ pub mod testing;
 pub mod ipc;
 pub mod rpc;
 
+// Top-level SDK entry point
+pub mod reticulum;
+
 // Remote management client utilities
 pub mod remote_client;
 

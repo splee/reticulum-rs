@@ -276,7 +276,7 @@ async fn get_path_table(_transport: &Transport, _max_hops: Option<u32>) -> Vec<P
 
 /// Get the number of active links.
 async fn get_link_count(_transport: &Transport) -> u64 {
-    // Access to link count requires exposing it through Transport.
+    // TODO: Access to link count requires exposing it through Transport.
     // This is a placeholder.
     0
 }
