@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::common::IntegrationTestContext;
+use crate::common::{unregister_pid, IntegrationTestContext};
 
 /// Test that Rust rnsd can start and create a daemon identity.
 #[test]
@@ -34,19 +34,21 @@ share_instance = false
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, config_content).expect("Failed to write config");
 
-    // Start rnsd briefly to create identity
-    let rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    // Start rnsd briefly to create identity (tracked for cleanup)
+    let rnsd = ctx.spawn_child(
+        std::process::Command::new(ctx.rust_binary("rnsd"))
+            .args(["--config", config_dir.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    );
 
-    if let Ok(mut child) = rnsd {
+    if let Ok((mut child, pid)) = rnsd {
         // Wait briefly for identity creation
         std::thread::sleep(Duration::from_secs(3));
 
         // Kill the daemon
         let _ = child.kill();
+        unregister_pid(pid);
         let _ = child.wait();
 
         // Check if identity was created
@@ -112,12 +114,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start and create identity
@@ -149,12 +153,13 @@ shared_instance_port = {}
     if !rpc_socket.exists() {
         // Clean up and skip if socket not found
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let _ = rnsd.wait();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
     }
 
-    // Run Python RPC client test
+    // Run Python RPC client test (tracked for cleanup)
     let test_script = ctx.integration_test_dir().join("helpers/test_rpc_client.py");
     assert!(test_script.exists(), "test_rpc_client.py should exist");
 
@@ -165,7 +170,9 @@ shared_instance_port = {}
         identity_file.to_str().unwrap(),
     ]);
 
-    let output = python_cmd.output().expect("Failed to run Python RPC client");
+    let output = ctx
+        .run_to_completion(&mut python_cmd)
+        .expect("Failed to run Python RPC client");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -175,6 +182,7 @@ shared_instance_port = {}
 
     // Clean up daemon
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     // Assert successful connection and authentication
@@ -225,12 +233,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start
@@ -251,12 +261,13 @@ shared_instance_port = {}
 
     if !rpc_socket.exists() {
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let _ = rnsd.wait();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
     }
 
-    // Run Python RPC client test
+    // Run Python RPC client test (tracked for cleanup)
     let test_script = ctx.integration_test_dir().join("helpers/test_rpc_client.py");
 
     let mut python_cmd = ctx.venv().python_command();
@@ -266,7 +277,9 @@ shared_instance_port = {}
         identity_file.to_str().unwrap(),
     ]);
 
-    let output = python_cmd.output().expect("Failed to run Python RPC client");
+    let output = ctx
+        .run_to_completion(&mut python_cmd)
+        .expect("Failed to run Python RPC client");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -276,6 +289,7 @@ shared_instance_port = {}
 
     // Clean up daemon
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     // Assert get_path_table test passed
@@ -319,12 +333,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start
@@ -332,6 +348,7 @@ shared_instance_port = {}
 
     // Verify daemon is still running
     if rnsd.try_wait().unwrap().is_some() {
+        unregister_pid(rnsd_pid);
         eprintln!("Note: rnsd exited early, skipping test");
         return;
     }
@@ -341,6 +358,7 @@ shared_instance_port = {}
 
     if !rpc_socket.exists() {
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let _ = rnsd.wait();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
@@ -351,7 +369,7 @@ shared_instance_port = {}
     let fake_identity: [u8; 64] = [0xAB; 64]; // Definitely wrong key
     std::fs::write(&fake_identity_file, fake_identity).expect("Failed to write fake identity");
 
-    // Run Python RPC client test with wrong identity
+    // Run Python RPC client test with wrong identity (tracked for cleanup)
     let test_script = ctx.integration_test_dir().join("helpers/test_rpc_client.py");
 
     let mut python_cmd = ctx.venv().python_command();
@@ -361,7 +379,9 @@ shared_instance_port = {}
         fake_identity_file.to_str().unwrap(),
     ]);
 
-    let output = python_cmd.output().expect("Failed to run Python RPC client");
+    let output = ctx
+        .run_to_completion(&mut python_cmd)
+        .expect("Failed to run Python RPC client");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -371,6 +391,7 @@ shared_instance_port = {}
 
     // Clean up daemon
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     // Should NOT contain "Connected and authenticated" - it should fail
@@ -421,12 +442,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start
@@ -452,6 +475,7 @@ shared_instance_port = {}
 
     if !rpc_socket.exists() {
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let _ = rnsd.wait();
         eprintln!("Note: RPC socket not found at {:?}", rpc_socket);
         // List what's in socket dir
@@ -465,7 +489,7 @@ shared_instance_port = {}
 
     eprintln!("RPC socket found at {:?}", rpc_socket);
 
-    // Run Python RPC client test
+    // Run Python RPC client test (tracked for cleanup)
     let test_script = ctx.integration_test_dir().join("helpers/test_rpc_client.py");
     assert!(test_script.exists(), "test_rpc_client.py should exist");
 
@@ -476,7 +500,9 @@ shared_instance_port = {}
         identity_file.to_str().unwrap(),
     ]);
 
-    let output = python_cmd.output().expect("Failed to run Python RPC client");
+    let output = ctx
+        .run_to_completion(&mut python_cmd)
+        .expect("Failed to run Python RPC client");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -486,6 +512,7 @@ shared_instance_port = {}
 
     // Clean up daemon
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     // Assert all tests passed
@@ -508,9 +535,8 @@ shared_instance_port = {}
 fn test_rnsd_help() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnsd")).args(["--help"]))
         .expect("Failed to run rnsd --help");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -534,9 +560,10 @@ fn test_rnsd_help() {
 fn test_rnsd_version() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--version"])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnsd")).args(["--version"]),
+        )
         .expect("Failed to run rnsd --version");
 
     let stdout = String::from_utf8_lossy(&output.stdout);

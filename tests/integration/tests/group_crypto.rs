@@ -3,9 +3,7 @@
 //! Tests that verify AES-256-CBC encryption/decryption compatibility
 //! between Python and Rust implementations.
 
-use std::process::Command;
-
-use crate::common::IntegrationTestContext;
+use crate::common::{unregister_pid, IntegrationTestContext};
 
 /// Fixed 64-byte key for reproducibility (128 hex chars)
 const TEST_KEY: &str = "5ea11018b20f83455bf49ae8e2b7a1315ea11018b20f83455bf49ae8e2b7a1315ea11018b20f83455bf49ae8e2b7a1315ea11018b20f83455bf49ae8e2b7a131";
@@ -18,22 +16,29 @@ const TEST_PLAINTEXT: &str = "48656c6c6f2c2047524f555020776f726c6421";
 fn test_python_encrypts_rust_decrypts() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    // Python encrypt
+    // Python encrypt (tracked for cleanup)
     let python_input = format!("encrypt\n{}\n{}\n", TEST_KEY, TEST_PLAINTEXT);
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd
-        .arg(ctx.helpers_dir().join("python_group_crypto.py"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut python_child = python_cmd.spawn().expect("Failed to spawn Python");
+    let (mut python_child, python_pid) = ctx
+        .spawn_child(
+            ctx.venv()
+                .python_command()
+                .arg(ctx.helpers_dir().join("python_group_crypto.py"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("Failed to spawn Python");
     {
         use std::io::Write;
         let stdin = python_child.stdin.as_mut().expect("Failed to get stdin");
-        stdin.write_all(python_input.as_bytes()).expect("Failed to write to stdin");
+        stdin
+            .write_all(python_input.as_bytes())
+            .expect("Failed to write to stdin");
     }
-    let python_output = python_child.wait_with_output().expect("Failed to get Python output");
+    let python_output = python_child
+        .wait_with_output()
+        .expect("Failed to get Python output");
+    unregister_pid(python_pid);
 
     let stdout = String::from_utf8_lossy(&python_output.stdout);
     let stderr = String::from_utf8_lossy(&python_output.stderr);
@@ -50,21 +55,27 @@ fn test_python_encrypts_rust_decrypts() {
 
     eprintln!("Python ciphertext: {}...", &python_ciphertext[..32.min(python_ciphertext.len())]);
 
-    // Rust decrypt
+    // Rust decrypt (tracked for cleanup)
     let rust_input = format!("decrypt\n{}\n{}\n", TEST_KEY, python_ciphertext);
-    let mut rust_cmd = Command::new(ctx.rust_binary("test_group_crypto"));
-    rust_cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut rust_child = rust_cmd.spawn().expect("Failed to spawn Rust");
+    let (mut rust_child, rust_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("test_group_crypto"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("Failed to spawn Rust");
     {
         use std::io::Write;
         let stdin = rust_child.stdin.as_mut().expect("Failed to get stdin");
-        stdin.write_all(rust_input.as_bytes()).expect("Failed to write to stdin");
+        stdin
+            .write_all(rust_input.as_bytes())
+            .expect("Failed to write to stdin");
     }
-    let rust_output = rust_child.wait_with_output().expect("Failed to get Rust output");
+    let rust_output = rust_child
+        .wait_with_output()
+        .expect("Failed to get Rust output");
+    unregister_pid(rust_pid);
 
     let stdout = String::from_utf8_lossy(&rust_output.stdout);
     let stderr = String::from_utf8_lossy(&rust_output.stderr);
@@ -94,21 +105,27 @@ fn test_python_encrypts_rust_decrypts() {
 fn test_rust_encrypts_python_decrypts() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    // Rust encrypt
+    // Rust encrypt (tracked for cleanup)
     let rust_input = format!("encrypt\n{}\n{}\n", TEST_KEY, TEST_PLAINTEXT);
-    let mut rust_cmd = Command::new(ctx.rust_binary("test_group_crypto"));
-    rust_cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut rust_child = rust_cmd.spawn().expect("Failed to spawn Rust");
+    let (mut rust_child, rust_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("test_group_crypto"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("Failed to spawn Rust");
     {
         use std::io::Write;
         let stdin = rust_child.stdin.as_mut().expect("Failed to get stdin");
-        stdin.write_all(rust_input.as_bytes()).expect("Failed to write to stdin");
+        stdin
+            .write_all(rust_input.as_bytes())
+            .expect("Failed to write to stdin");
     }
-    let rust_output = rust_child.wait_with_output().expect("Failed to get Rust output");
+    let rust_output = rust_child
+        .wait_with_output()
+        .expect("Failed to get Rust output");
+    unregister_pid(rust_pid);
 
     let stdout = String::from_utf8_lossy(&rust_output.stdout);
     let stderr = String::from_utf8_lossy(&rust_output.stderr);
@@ -125,22 +142,29 @@ fn test_rust_encrypts_python_decrypts() {
 
     eprintln!("Rust ciphertext: {}...", &rust_ciphertext[..32.min(rust_ciphertext.len())]);
 
-    // Python decrypt
+    // Python decrypt (tracked for cleanup)
     let python_input = format!("decrypt\n{}\n{}\n", TEST_KEY, rust_ciphertext);
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd
-        .arg(ctx.helpers_dir().join("python_group_crypto.py"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut python_child = python_cmd.spawn().expect("Failed to spawn Python");
+    let (mut python_child, python_pid) = ctx
+        .spawn_child(
+            ctx.venv()
+                .python_command()
+                .arg(ctx.helpers_dir().join("python_group_crypto.py"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("Failed to spawn Python");
     {
         use std::io::Write;
         let stdin = python_child.stdin.as_mut().expect("Failed to get stdin");
-        stdin.write_all(python_input.as_bytes()).expect("Failed to write to stdin");
+        stdin
+            .write_all(python_input.as_bytes())
+            .expect("Failed to write to stdin");
     }
-    let python_output = python_child.wait_with_output().expect("Failed to get Python output");
+    let python_output = python_child
+        .wait_with_output()
+        .expect("Failed to get Python output");
+    unregister_pid(python_pid);
 
     let stdout = String::from_utf8_lossy(&python_output.stdout);
     let stderr = String::from_utf8_lossy(&python_output.stderr);

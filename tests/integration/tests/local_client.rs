@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use crate::common::{IntegrationTestContext, TestOutput};
+use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
 
 /// Test that Rust destination announces via shared instance are received by Python.
 ///
@@ -73,10 +73,9 @@ fn test_rust_local_client_announce_to_python() {
     eprintln!("Rust sent {} announces", announce_count);
 
     // Use Python rnpath to check if the destination is known (with timeout)
-    let mut cmd = ctx.venv().rnpath();
-    cmd.args(["-w", "5", dest_hash]);
-
-    let output = cmd.output().expect("Failed to run rnpath");
+    let output = ctx
+        .run_to_completion(ctx.venv().rnpath().args(["-w", "5", dest_hash]))
+        .expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -149,9 +148,10 @@ fn test_python_local_client_announce_to_rust() {
     std::thread::sleep(Duration::from_secs(5));
 
     // Use Rust rnpath to check if the destination is known (with timeout)
-    let output = std::process::Command::new(ctx.rust_binary("rnpath"))
-        .args(["-w", "5", dest_hash])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnpath")).args(["-w", "5", dest_hash]),
+        )
         .expect("Failed to run Rust rnpath");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -235,12 +235,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start
@@ -248,6 +250,7 @@ shared_instance_port = {}
 
     // Check if daemon is still running
     if rnsd.try_wait().unwrap().is_some() {
+        unregister_pid(rnsd_pid);
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -270,6 +273,7 @@ shared_instance_port = {}
 
     // Clean up
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     if socket_exists {
@@ -331,12 +335,14 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start Rust rnsd with shared instance
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start Rust rnsd with shared instance (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for rnsd to start
@@ -344,6 +350,7 @@ shared_instance_port = {}
 
     // Check if rnsd is running
     if rnsd.try_wait().unwrap().is_some() {
+        unregister_pid(rnsd_pid);
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -380,10 +387,7 @@ shared_instance_port = {}
                 std::thread::sleep(Duration::from_secs(5));
 
                 // Check if Python hub received the announce
-                let mut cmd = ctx.venv().rnpath();
-                cmd.args(["-w", "5", &hash]);
-
-                let output = cmd.output();
+                let output = ctx.run_to_completion(ctx.venv().rnpath().args(["-w", "5", &hash]));
                 if let Ok(output) = output {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -411,6 +415,7 @@ shared_instance_port = {}
 
     // Clean up
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     eprintln!("Shared instance announce forwarding test completed");
@@ -456,18 +461,21 @@ shared_instance_port = {}
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start Rust rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start Rust rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for rnsd to start
     std::thread::sleep(Duration::from_secs(5));
 
     if rnsd.try_wait().unwrap().is_some() {
+        unregister_pid(rnsd_pid);
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -532,10 +540,11 @@ except Exception as e:
         ),
     ]);
 
-    let python_output = python_cmd.output();
+    let python_output = ctx.run_to_completion(&mut python_cmd);
 
     // Clean up rnsd
     let _ = rnsd.kill();
+    unregister_pid(rnsd_pid);
     let _ = rnsd.wait();
 
     if let Ok(output) = python_output {

@@ -47,10 +47,9 @@ fn test_python_rnpath_finds_rust_destination() {
     std::thread::sleep(Duration::from_secs(5));
 
     // Use Python rnpath to check if path is known (with timeout)
-    let mut cmd = ctx.venv().rnpath();
-    cmd.args(["-w", "5", dest_hash]);
-
-    let output = cmd.output().expect("Failed to run rnpath");
+    let output = ctx
+        .run_to_completion(ctx.venv().rnpath().args(["-w", "5", dest_hash]))
+        .expect("Failed to run rnpath");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -130,17 +129,16 @@ fn test_python_rnprobe_to_rust_destination() {
     std::thread::sleep(Duration::from_secs(5));
 
     // First verify path is known via rnpath (with timeout)
-    let mut path_cmd = ctx.venv().rnpath();
-    path_cmd.args(["-w", "5", dest_hash]);
-    let path_output = path_cmd.output().expect("Failed to run rnpath");
+    let path_output = ctx
+        .run_to_completion(ctx.venv().rnpath().args(["-w", "5", dest_hash]))
+        .expect("Failed to run rnpath");
     let path_stdout = String::from_utf8_lossy(&path_output.stdout);
     eprintln!("rnpath check: {}", path_stdout);
 
     // Try rnprobe
-    let mut probe_cmd = ctx.venv().rnprobe();
-    probe_cmd.arg(dest_hash);
-
-    let output = probe_cmd.output().expect("Failed to run rnprobe");
+    let output = ctx
+        .run_to_completion(ctx.venv().rnprobe().arg(dest_hash))
+        .expect("Failed to run rnprobe");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -190,8 +188,7 @@ fn test_python_rnprobe_to_rust_destination() {
     }
 
     // Additional verification: check network status via rnstatus
-    let mut status_cmd = ctx.venv().rnstatus();
-    if let Ok(status_output) = status_cmd.output() {
+    if let Ok(status_output) = ctx.run_to_completion(&mut ctx.venv().rnstatus()) {
         let status_stdout = String::from_utf8_lossy(&status_output.stdout);
         let status_stderr = String::from_utf8_lossy(&status_output.stderr);
         let status_combined = format!("{}{}", status_stdout, status_stderr).to_lowercase();
@@ -248,9 +245,10 @@ fn test_rust_rnpath_finds_python_destination() {
     std::thread::sleep(Duration::from_secs(5));
 
     // Use Rust rnpath to check if path is known
-    let output = std::process::Command::new(ctx.rust_binary("rnpath"))
-        .args(["-d", dest_hash])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnpath")).args(["-d", dest_hash]),
+        )
         .expect("Failed to run Rust rnpath");
 
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -2,12 +2,88 @@
 //!
 //! Provides managed process spawning with output capture, timeout handling,
 //! and automatic cleanup on drop.
+//!
+//! All spawned processes are registered in a global registry and will be
+//! killed when the test process exits (via atexit handler).
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Global registry of all spawned process PIDs for cleanup.
+    /// This ensures processes are killed even if tests panic or exit unexpectedly.
+    static ref PROCESS_REGISTRY: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+}
+
+/// One-time registration of the atexit cleanup handler.
+static CLEANUP_REGISTERED: Once = Once::new();
+
+/// Register a process PID for cleanup on exit.
+pub fn register_pid(pid: u32) {
+    // Ensure cleanup handler is registered
+    ensure_cleanup_registered();
+
+    if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
+        registry.push(pid);
+    }
+}
+
+/// Unregister a PID (called when process exits normally or is killed).
+pub fn unregister_pid(pid: u32) {
+    if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
+        registry.retain(|&p| p != pid);
+    }
+}
+
+/// Kill all registered processes.
+/// Called automatically on process exit via atexit handler.
+pub fn kill_all_registered() {
+    if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
+        for pid in registry.drain(..) {
+            #[cfg(unix)]
+            {
+                // Send SIGKILL to ensure process dies
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix, we can't do much here without the Child handle
+                let _ = pid;
+            }
+        }
+    }
+}
+
+/// Ensure the atexit cleanup handler is registered.
+/// This is called automatically when the first process is registered.
+pub fn ensure_cleanup_registered() {
+    CLEANUP_REGISTERED.call_once(|| {
+        #[cfg(unix)]
+        {
+            extern "C" fn cleanup() {
+                // Note: We can't use the full kill_all_registered here because
+                // lazy_static may have been cleaned up. Do minimal cleanup.
+                if let Ok(registry) = PROCESS_REGISTRY.lock() {
+                    for &pid in registry.iter() {
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+            unsafe {
+                libc::atexit(cleanup);
+            }
+        }
+    });
+}
 
 /// Error type for process operations.
 #[derive(Debug)]
@@ -49,13 +125,17 @@ impl ManagedProcess {
     /// Spawn a new process with output capture.
     ///
     /// The command's stdout and stderr will be merged and captured
-    /// in a buffer for later inspection.
+    /// in a buffer for later inspection. The process is automatically
+    /// registered in the global registry for cleanup on exit.
     pub fn spawn(name: &str, cmd: &mut Command) -> Result<Self, ProcessError> {
         // Configure command to capture output
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+
+        // Register PID for cleanup on exit
+        register_pid(child.id());
 
         // Take ownership of stdout and stderr
         let stdout = child.stdout.take();
@@ -197,6 +277,7 @@ impl ManagedProcess {
     /// Kill the process gracefully (SIGTERM on Unix, terminate on Windows).
     ///
     /// If the process doesn't exit within the timeout, it will be forcefully killed.
+    /// The process is automatically unregistered from the global cleanup registry.
     pub fn kill(&mut self) {
         if self.killed {
             return;
@@ -204,6 +285,9 @@ impl ManagedProcess {
         self.killed = true;
 
         if let Some(ref mut child) = self.child {
+            // Unregister from global cleanup since we're handling it here
+            unregister_pid(child.id());
+
             // Try graceful shutdown first
             #[cfg(unix)]
             {
@@ -319,12 +403,21 @@ impl Drop for ProcessGroup {
 /// Run a command and capture its output (blocking).
 ///
 /// Useful for short-lived commands where you just want the final output.
+/// The process is registered for cleanup while running.
 pub fn run_command(cmd: &mut Command, _timeout: Duration) -> Result<String, ProcessError> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Register for cleanup in case we're interrupted
+    register_pid(pid);
+
     let output = child.wait_with_output()?;
+
+    // Unregister since process has exited
+    unregister_pid(pid);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -336,6 +429,19 @@ pub fn run_command(cmd: &mut Command, _timeout: Duration) -> Result<String, Proc
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(stdout)
+}
+
+/// Spawn a raw command and register it for cleanup.
+///
+/// This is a lower-level function for cases where you need direct access
+/// to the Child process. The PID is registered for cleanup on exit.
+///
+/// Returns the spawned Child and its PID.
+pub fn spawn_tracked(cmd: &mut Command) -> Result<(Child, u32), ProcessError> {
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    register_pid(pid);
+    Ok((child, pid))
 }
 
 #[cfg(test)]

@@ -12,7 +12,9 @@ pub mod venv;
 pub use config::TestConfig;
 pub use output::TestOutput;
 pub use ports::{allocate_port, allocate_ports};
-pub use process::{ManagedProcess, ProcessError, ProcessGroup};
+pub use process::{
+    register_pid, spawn_tracked, unregister_pid, ManagedProcess, ProcessError, ProcessGroup,
+};
 pub use venv::{PythonVenv, VenvError};
 
 use std::path::PathBuf;
@@ -265,6 +267,41 @@ impl IntegrationTestContext {
     pub fn create_rust_node_config(&mut self, hub_port: u16) -> Result<TestConfig, TestError> {
         let config = TestConfig::rust_node(hub_port, None)?;
         Ok(config)
+    }
+
+    /// Spawn a command as a tracked ManagedProcess.
+    ///
+    /// Use this instead of `std::process::Command::new().spawn()` to ensure
+    /// the process is registered for cleanup on test exit.
+    pub fn spawn_managed(&self, name: &str, cmd: &mut Command) -> Result<ManagedProcess, TestError> {
+        let process = ManagedProcess::spawn(name, cmd)?;
+        Ok(process)
+    }
+
+    /// Spawn a raw command and register it for cleanup.
+    ///
+    /// Use this when you need direct access to the Child process.
+    /// The process is automatically registered in the global cleanup registry.
+    pub fn spawn_child(
+        &self,
+        cmd: &mut Command,
+    ) -> Result<(std::process::Child, u32), TestError> {
+        let (child, pid) = spawn_tracked(cmd)?;
+        Ok((child, pid))
+    }
+
+    /// Run a command to completion and return its output.
+    ///
+    /// The process is registered for cleanup while running.
+    /// Note: This configures stdout/stderr as piped to capture output.
+    pub fn run_to_completion(&self, cmd: &mut Command) -> Result<std::process::Output, TestError> {
+        // Configure pipes to capture output (required for wait_with_output)
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let (child, pid) = spawn_tracked(cmd)?;
+        let output = child.wait_with_output()?;
+        unregister_pid(pid);
+        Ok(output)
     }
 }
 

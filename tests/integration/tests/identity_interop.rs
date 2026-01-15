@@ -3,8 +3,6 @@
 //! Tests that verify identity format compatibility between
 //! Python and Rust implementations.
 
-use std::process::Command;
-
 use crate::common::IntegrationTestContext;
 
 /// Test that Rust rnid can generate an identity with correct format.
@@ -16,9 +14,11 @@ fn test_rust_identity_generation() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let identity_path = temp_dir.path().join("test_identity.dat");
 
-    let output = Command::new(ctx.rust_binary("rnid"))
-        .args(["-g", identity_path.to_str().unwrap()])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnid"))
+                .args(["-g", identity_path.to_str().unwrap()]),
+        )
         .expect("Failed to run rnid");
 
     assert!(output.status.success(), "rnid -g should succeed");
@@ -62,10 +62,9 @@ fn test_python_identity_generation() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let identity_path = temp_dir.path().join("python_identity.dat");
 
-    let mut cmd = ctx.venv().rnid();
-    cmd.args(["-g", identity_path.to_str().unwrap()]);
-
-    let output = cmd.output().expect("Failed to run Python rnid");
+    let output = ctx
+        .run_to_completion(ctx.venv().rnid().args(["-g", identity_path.to_str().unwrap()]))
+        .expect("Failed to run Python rnid");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -105,9 +104,11 @@ fn test_rust_identity_readable_by_python() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let identity_path = temp_dir.path().join("rust_identity.dat");
 
-    let output = Command::new(ctx.rust_binary("rnid"))
-        .args(["-g", identity_path.to_str().unwrap()])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnid"))
+                .args(["-g", identity_path.to_str().unwrap()]),
+        )
         .expect("Failed to run rnid");
 
     assert!(output.status.success(), "Rust rnid should succeed");
@@ -141,10 +142,9 @@ print("ADDRESS=" + identity.hexhash)
         identity_path.to_str().unwrap()
     );
 
-    let mut cmd = ctx.venv().python_command();
-    cmd.args(["-c", &python_script]);
-
-    let output = cmd.output().expect("Failed to run Python");
+    let output = ctx
+        .run_to_completion(ctx.venv().python_command().args(["-c", &python_script]))
+        .expect("Failed to run Python");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -195,10 +195,9 @@ print("ADDRESS=" + identity.hexhash)
         identity_path.to_str().unwrap()
     );
 
-    let mut cmd = ctx.venv().python_command();
-    cmd.args(["-c", &python_script]);
-
-    let output = cmd.output().expect("Failed to run Python");
+    let output = ctx
+        .run_to_completion(ctx.venv().python_command().args(["-c", &python_script]))
+        .expect("Failed to run Python");
     assert!(output.status.success(), "Python should generate identity");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -219,9 +218,11 @@ print("ADDRESS=" + identity.hexhash)
     eprintln!("Python identity address: {}", python_address);
 
     // Read identity with Rust rnid
-    let output = Command::new(ctx.rust_binary("rnid"))
-        .args(["-i", identity_path.to_str().unwrap(), "-p"])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnid"))
+                .args(["-i", identity_path.to_str().unwrap(), "-p"]),
+        )
         .expect("Failed to run Rust rnid");
 
     let stdout = String::from_utf8_lossy(&output.stdout);

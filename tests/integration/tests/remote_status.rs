@@ -8,16 +8,15 @@
 
 use std::time::Duration;
 
-use crate::common::{IntegrationTestContext, TestOutput};
+use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
 
 /// Test that rnstatus --help works.
 #[test]
 fn test_rnstatus_help() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnstatus"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnstatus")).args(["--help"]))
         .expect("Failed to run rnstatus --help");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -41,9 +40,10 @@ fn test_rnstatus_help() {
 fn test_rnstatus_version() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnstatus"))
-        .args(["--version"])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnstatus")).args(["--version"]),
+        )
         .expect("Failed to run rnstatus --version");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -69,9 +69,8 @@ fn test_rnstatus_json_format() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
     // Test --json flag exists and produces valid output structure
-    let output = std::process::Command::new(ctx.rust_binary("rnstatus"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnstatus")).args(["--help"]))
         .expect("Failed to run rnstatus --help");
 
     let help_text = String::from_utf8_lossy(&output.stdout);
@@ -95,10 +94,10 @@ fn test_python_rnstatus() {
         .start_python_hub()
         .expect("Failed to start Python hub");
 
-    // Run Python rnstatus
-    let mut cmd = ctx.venv().rnstatus();
-
-    let output = cmd.output().expect("Failed to run Python rnstatus");
+    // Run Python rnstatus (tracked for cleanup)
+    let output = ctx
+        .run_to_completion(&mut ctx.venv().rnstatus())
+        .expect("Failed to run Python rnstatus");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -116,9 +115,8 @@ fn test_python_rnstatus() {
 fn test_rnstatus_remote_flag() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnstatus"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnstatus")).args(["--help"]))
         .expect("Failed to run rnstatus --help");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -150,13 +148,12 @@ fn test_management_identity_creation() {
     let helper_script = ctx.integration_test_dir().join("helpers/create_identity.py");
 
     if helper_script.exists() {
-        let mut cmd = ctx.venv().python_command();
-        cmd.args([
-            helper_script.to_str().unwrap(),
-            identity_path.to_str().unwrap(),
-        ]);
-
-        let output = cmd.output().expect("Failed to run create_identity.py");
+        let output = ctx
+            .run_to_completion(ctx.venv().python_command().args([
+                helper_script.to_str().unwrap(),
+                identity_path.to_str().unwrap(),
+            ]))
+            .expect("Failed to run create_identity.py");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -225,12 +222,14 @@ enable_remote_management = true
     let config_file = config_dir.join("config");
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
-    // Start rnsd
-    let mut rnsd = std::process::Command::new(ctx.rust_binary("rnsd"))
-        .args(["--config", config_dir.to_str().unwrap(), "-v"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Start rnsd (tracked for cleanup)
+    let (mut rnsd, rnsd_pid) = ctx
+        .spawn_child(
+            std::process::Command::new(ctx.rust_binary("rnsd"))
+                .args(["--config", config_dir.to_str().unwrap(), "-v"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
         .expect("Failed to start rnsd");
 
     // Wait for daemon to start
@@ -238,6 +237,7 @@ enable_remote_management = true
 
     // Check if daemon is still running
     if rnsd.try_wait().unwrap().is_some() {
+        unregister_pid(rnsd_pid);
         eprintln!("Note: rnsd exited early (remote management may not be implemented)");
         return;
     }
@@ -250,6 +250,7 @@ enable_remote_management = true
         // Read stderr to check for remote management output
         // Note: This is a best-effort check since we're reading piped stderr
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let output = rnsd.wait_with_output();
 
         if let Ok(output) = output {
@@ -268,6 +269,7 @@ enable_remote_management = true
         }
     } else {
         let _ = rnsd.kill();
+        unregister_pid(rnsd_pid);
         let _ = rnsd.wait();
         eprintln!("Note: Daemon identity not created at expected location");
     }
@@ -297,13 +299,12 @@ fn test_python_remote_status_server_setup() {
     let helper_script = ctx.integration_test_dir().join("helpers/create_identity.py");
     assert!(helper_script.exists(), "create_identity.py should exist");
 
-    let mut cmd = ctx.venv().python_command();
-    cmd.args([
-        helper_script.to_str().unwrap(),
-        identity_path.to_str().unwrap(),
-    ]);
-
-    let output = cmd.output().expect("Failed to run create_identity.py");
+    let output = ctx
+        .run_to_completion(ctx.venv().python_command().args([
+            helper_script.to_str().unwrap(),
+            identity_path.to_str().unwrap(),
+        ]))
+        .expect("Failed to run create_identity.py");
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("Identity creation output: {}", stdout);
 
@@ -396,13 +397,12 @@ fn test_rnstatus_remote_query_full_flow() {
 
     let helper_script = ctx.integration_test_dir().join("helpers/create_identity.py");
 
-    let mut cmd = ctx.venv().python_command();
-    cmd.args([
-        helper_script.to_str().unwrap(),
-        identity_path.to_str().unwrap(),
-    ]);
-
-    let output = cmd.output().expect("Failed to run create_identity.py");
+    let output = ctx
+        .run_to_completion(ctx.venv().python_command().args([
+            helper_script.to_str().unwrap(),
+            identity_path.to_str().unwrap(),
+        ]))
+        .expect("Failed to run create_identity.py");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let parsed = TestOutput::parse(&stdout);
@@ -463,14 +463,19 @@ share_instance = false
     std::fs::write(rnstatus_config_dir.path().join("config"), &rnstatus_config)
         .expect("Failed to write config");
 
-    let rnstatus_output = std::process::Command::new(ctx.rust_binary("rnstatus"))
-        .args([
-            "-R", &transport_hash,
-            "-i", identity_path.to_str().unwrap(),
-            "--config", rnstatus_config_dir.path().to_str().unwrap(),
-            "-w", "30",  // 30 second timeout
-        ])
-        .output()
+    let rnstatus_output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnstatus")).args([
+                "-R",
+                &transport_hash,
+                "-i",
+                identity_path.to_str().unwrap(),
+                "--config",
+                rnstatus_config_dir.path().to_str().unwrap(),
+                "-w",
+                "30", // 30 second timeout
+            ]),
+        )
         .expect("Failed to run rnstatus");
 
     let stdout = String::from_utf8_lossy(&rnstatus_output.stdout);
@@ -515,10 +520,14 @@ fn test_remote_management_access_control() {
 
     let helper_script = ctx.integration_test_dir().join("helpers/create_identity.py");
 
-    // Create allowed identity
-    let mut cmd = ctx.venv().python_command();
-    cmd.args([helper_script.to_str().unwrap(), allowed_identity_path.to_str().unwrap()]);
-    let output = cmd.output().expect("Failed to create allowed identity");
+    // Create allowed identity (tracked for cleanup)
+    let output = ctx
+        .run_to_completion(
+            ctx.venv()
+                .python_command()
+                .args([helper_script.to_str().unwrap(), allowed_identity_path.to_str().unwrap()]),
+        )
+        .expect("Failed to create allowed identity");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = TestOutput::parse(&stdout);
     let allowed_hash = parsed
@@ -526,10 +535,14 @@ fn test_remote_management_access_control() {
         .expect("Should get allowed identity hash")
         .to_string();
 
-    // Create denied identity
-    let mut cmd = ctx.venv().python_command();
-    cmd.args([helper_script.to_str().unwrap(), denied_identity_path.to_str().unwrap()]);
-    let output = cmd.output().expect("Failed to create denied identity");
+    // Create denied identity (tracked for cleanup)
+    let output = ctx
+        .run_to_completion(
+            ctx.venv()
+                .python_command()
+                .args([helper_script.to_str().unwrap(), denied_identity_path.to_str().unwrap()]),
+        )
+        .expect("Failed to create denied identity");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = TestOutput::parse(&stdout);
     let denied_hash = parsed

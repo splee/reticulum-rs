@@ -11,17 +11,18 @@
 
 use std::time::Duration;
 
-use crate::common::{IntegrationTestContext, TestOutput};
+use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
 
 /// Test that Rust rnx identity is persisted between runs.
 #[test]
 fn test_rnx_identity_persistence() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    // First run - should create new identity
-    let output1 = std::process::Command::new(ctx.rust_binary("rnx"))
-        .args(["--print-identity"])
-        .output()
+    // First run - should create new identity (tracked for cleanup)
+    let output1 = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnx")).args(["--print-identity"]),
+        )
         .expect("Failed to run rnx");
 
     let stdout1 = String::from_utf8_lossy(&output1.stdout);
@@ -40,10 +41,11 @@ fn test_rnx_identity_persistence() {
     let first_hash = first_hash.unwrap();
     eprintln!("First hash: {}", first_hash);
 
-    // Second run - should load same identity
-    let output2 = std::process::Command::new(ctx.rust_binary("rnx"))
-        .args(["--print-identity"])
-        .output()
+    // Second run - should load same identity (tracked for cleanup)
+    let output2 = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rnx")).args(["--print-identity"]),
+        )
         .expect("Failed to run rnx second time");
 
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
@@ -72,9 +74,8 @@ fn test_rnx_identity_persistence() {
 fn test_rnx_cli_arguments() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnx"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnx")).args(["--help"]))
         .expect("Failed to run rnx --help");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -115,9 +116,8 @@ fn test_rnx_cli_arguments() {
 fn test_rnx_version() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rnx"))
-        .args(["--version"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rnx")).args(["--version"]))
         .expect("Failed to run rnx --version");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -246,18 +246,20 @@ fn test_rnx_listen_tcp_server_mode() {
 
     let tcp_port = crate::common::allocate_port();
 
-    // Start rnx in listen mode with TCP server
-    let output = std::process::Command::new(ctx.rust_binary("rnx"))
-        .args([
-            "--listen",
-            "--noauth",
-            "--tcp-server", &format!("127.0.0.1:{}", tcp_port),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    // Start rnx in listen mode with TCP server (tracked for cleanup)
+    let result = ctx.spawn_child(
+        std::process::Command::new(ctx.rust_binary("rnx"))
+            .args([
+                "--listen",
+                "--noauth",
+                "--tcp-server",
+                &format!("127.0.0.1:{}", tcp_port),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    );
 
-    if let Ok(mut child) = output {
+    if let Ok((mut child, child_pid)) = result {
         // Wait briefly for startup
         std::thread::sleep(Duration::from_secs(3));
 
@@ -268,6 +270,7 @@ fn test_rnx_listen_tcp_server_mode() {
 
         // Clean up
         let _ = child.kill();
+        unregister_pid(child_pid);
         let output = child.wait_with_output();
 
         if let Ok(output) = output {
@@ -360,17 +363,18 @@ share_instance = false
     // Try to connect with Python rnx client
     // Note: This requires rnx to support client mode properly
     // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rnx",
-        "--config", python_config_dir.path().to_str().unwrap(),
-        "-w", "30",  // path request timeout
-        &rust_hash,
-        "echo", "test123",
-    ]);
-
     eprintln!("Executing command via Python rnx client...");
-    let python_output = python_cmd.output();
+    let python_output = ctx.run_to_completion(ctx.venv().python_command().args([
+        "-m",
+        "RNS.Utilities.rnx",
+        "--config",
+        python_config_dir.path().to_str().unwrap(),
+        "-w",
+        "30", // path request timeout
+        &rust_hash,
+        "echo",
+        "test123",
+    ]));
 
     if let Ok(output) = python_output {
         let stdout = String::from_utf8_lossy(&output.stdout);

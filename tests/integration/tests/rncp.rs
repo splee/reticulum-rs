@@ -15,10 +15,11 @@ use crate::common::{IntegrationTestContext, TestOutput};
 fn test_rncp_identity_persistence() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    // First run - should create new identity
-    let output1 = std::process::Command::new(ctx.rust_binary("rncp"))
-        .args(["--print-identity"])
-        .output()
+    // First run - should create new identity (tracked for cleanup)
+    let output1 = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rncp")).args(["--print-identity"]),
+        )
         .expect("Failed to run rncp");
 
     let stdout1 = String::from_utf8_lossy(&output1.stdout);
@@ -37,10 +38,11 @@ fn test_rncp_identity_persistence() {
     let first_hash = first_hash.unwrap();
     eprintln!("First hash: {}", first_hash);
 
-    // Second run - should load same identity
-    let output2 = std::process::Command::new(ctx.rust_binary("rncp"))
-        .args(["--print-identity"])
-        .output()
+    // Second run - should load same identity (tracked for cleanup)
+    let output2 = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rncp")).args(["--print-identity"]),
+        )
         .expect("Failed to run rncp second time");
 
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
@@ -69,9 +71,8 @@ fn test_rncp_identity_persistence() {
 fn test_rncp_cli_arguments() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rncp"))
-        .args(["--help"])
-        .output()
+    let output = ctx
+        .run_to_completion(std::process::Command::new(ctx.rust_binary("rncp")).args(["--help"]))
         .expect("Failed to run rncp --help");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -114,9 +115,10 @@ fn test_rncp_cli_arguments() {
 fn test_rncp_version() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    let output = std::process::Command::new(ctx.rust_binary("rncp"))
-        .args(["--version"])
-        .output()
+    let output = ctx
+        .run_to_completion(
+            std::process::Command::new(ctx.rust_binary("rncp")).args(["--version"]),
+        )
         .expect("Failed to run rncp --version");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -277,18 +279,20 @@ share_instance = false
     // Send file using Python rncp
     // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
     // (Python RNS doesn't recognize the env var)
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rncp",
-        "--config", python_config_dir.path().to_str().unwrap(),
-        "-w", "30",  // path request timeout
-        "-v",  // verbose for debugging
-        test_file_path.to_str().unwrap(),
-        &rust_hash,
-    ]);
-
     eprintln!("Sending file with Python rncp...");
-    let python_output = python_cmd.output().expect("Failed to run Python rncp");
+    let python_output = ctx
+        .run_to_completion(ctx.venv().python_command().args([
+            "-m",
+            "RNS.Utilities.rncp",
+            "--config",
+            python_config_dir.path().to_str().unwrap(),
+            "-w",
+            "30", // path request timeout
+            "-v", // verbose for debugging
+            test_file_path.to_str().unwrap(),
+            &rust_hash,
+        ]))
+        .expect("Failed to run Python rncp");
 
     let stdout = String::from_utf8_lossy(&python_output.stdout);
     let stderr = String::from_utf8_lossy(&python_output.stderr);
@@ -578,18 +582,20 @@ share_instance = false
 
     // Send file using Python rncp
     // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rncp",
-        "--config", python_config_dir.path().to_str().unwrap(),
-        "-w", "60",  // longer timeout for large file
-        "-v",
-        test_file_path.to_str().unwrap(),
-        &rust_hash,
-    ]);
-
     eprintln!("Sending large file with Python rncp...");
-    let python_output = python_cmd.output().expect("Failed to run Python rncp");
+    let python_output = ctx
+        .run_to_completion(ctx.venv().python_command().args([
+            "-m",
+            "RNS.Utilities.rncp",
+            "--config",
+            python_config_dir.path().to_str().unwrap(),
+            "-w",
+            "60", // longer timeout for large file
+            "-v",
+            test_file_path.to_str().unwrap(),
+            &rust_hash,
+        ]))
+        .expect("Failed to run Python rncp");
 
     let stdout = String::from_utf8_lossy(&python_output.stdout);
     let stderr = String::from_utf8_lossy(&python_output.stderr);
