@@ -16,6 +16,11 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest as Sha2Digest};
 
+use reticulum::cli::format::{
+    format_frequency, format_size, format_time_ago, format_time_compact,
+    format_transfer_rate, format_with_commas, speed_str,
+};
+use reticulum::cli::hash::parse_destination;
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::destination::{DestinationName, SingleOutputDestination};
 use reticulum::destination::link::{LinkEvent, LinkStatus};
@@ -817,25 +822,9 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
 
 /// Parse a transport identity hash from hex string.
 fn parse_transport_hash(hash_str: &str) -> Result<[u8; 16], String> {
-    let clean = hash_str
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim_start_matches('/')
-        .trim_end_matches('/');
-
-    if clean.len() != 32 {
-        return Err(format!(
-            "Invalid transport hash length: expected 32 hex characters, got {}",
-            clean.len()
-        ));
-    }
-
-    let bytes = hex::decode(clean)
-        .map_err(|_| "Invalid hexadecimal string".to_string())?;
-
+    let address_hash = parse_destination(hash_str)?;
     let mut hash = [0u8; 16];
-    hash.copy_from_slice(&bytes);
+    hash.copy_from_slice(address_hash.as_slice());
     Ok(hash)
 }
 
@@ -1477,8 +1466,8 @@ fn show_discovered_interfaces(args: &Args, config: &ReticulumConfig) {
                 iface.hops,
                 if iface.hops == 1 { "" } else { "s" }
             );
-            println!("Discovered   : {} ago", pretty_time(iface.discovered));
-            println!("Last Heard   : {} ago", pretty_time(iface.last_heard));
+            println!("Discovered   : {} ago", format_time_compact(iface.discovered));
+            println!("Last Heard   : {} ago", format_time_compact(iface.last_heard));
 
             if let (Some(lat), Some(lon)) = (iface.latitude, iface.longitude) {
                 let height_str = iface
@@ -1693,11 +1682,11 @@ fn display_stats(args: &Args, stats: &NetworkStats, link_count: Option<u32>) {
 
     // Display traffic totals if requested
     if args.totals {
-        let rx_str = format!("↓{}", pretty_size(stats.rxb));
-        let tx_str = format!("↑{}", pretty_size(stats.txb));
+        let rx_str = format!("↓{}", format_size(stats.rxb));
+        let tx_str = format!("↑{}", format_size(stats.txb));
 
-        let rx_speed = pretty_speed(stats.rxs).to_string();
-        let tx_speed = pretty_speed(stats.txs).to_string();
+        let rx_speed = format_transfer_rate(stats.rxs).to_string();
+        let tx_speed = format_transfer_rate(stats.txs).to_string();
 
         // Pad to align
         let max_len = rx_str.len().max(tx_str.len());
@@ -1726,7 +1715,7 @@ fn display_stats(args: &Args, stats: &NetworkStats, link_count: Option<u32>) {
         }
 
         if let Some(uptime) = stats.transport_uptime {
-            println!(" Uptime is {}{}", pretty_time(uptime), link_str);
+            println!(" Uptime is {}{}", format_time_compact(uptime), link_str);
         }
     } else if !link_str.is_empty() {
         println!();
@@ -1885,7 +1874,7 @@ fn display_interface(iface: &InterfaceStats, args: &Args) {
                 format!(
                     "\n    Intrfrnc. : {} dBm {} ago",
                     dbm,
-                    pretty_time(ago)
+                    format_time_compact(ago)
                 )
             } else {
                 ", no interference".to_string()
@@ -1979,142 +1968,33 @@ fn display_interface(iface: &InterfaceStats, args: &Args) {
 
         println!(
             "    Announces : {}↑",
-            pretty_frequency(iface.outgoing_announce_frequency)
+            format_frequency(iface.outgoing_announce_frequency)
         );
         println!(
             "                {}↓",
-            pretty_frequency(iface.incoming_announce_frequency)
+            format_frequency(iface.incoming_announce_frequency)
         );
     }
 
     // Traffic
-    let rx_str = format!("↓{}", pretty_size(iface.rxb));
-    let tx_str = format!("↑{}", pretty_size(iface.txb));
+    let rx_str = format!("↓{}", format_size(iface.rxb));
+    let tx_str = format!("↑{}", format_size(iface.txb));
 
     // Pad to align
     let max_len = rx_str.len().max(tx_str.len());
     let rx_padded = format!("{:width$}", rx_str, width = max_len);
     let tx_padded = format!("{:width$}", tx_str, width = max_len);
 
-    let rx_speed = pretty_speed(iface.rxs);
-    let tx_speed = pretty_speed(iface.txs);
+    let rx_speed = format_transfer_rate(iface.rxs);
+    let tx_speed = format_transfer_rate(iface.txs);
 
     println!("    Traffic   : {}  {}", tx_padded, tx_speed);
     println!("                {}  {}", rx_padded, rx_speed);
 }
 
 // ============================================================================
-// Formatting utilities
+// Formatting utilities (unique to rnstatus; shared utilities imported from reticulum::cli)
 // ============================================================================
-
-/// Format bytes as human-readable size
-fn pretty_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["", "K", "M", "G", "T", "P", "E", "Z"];
-    let mut size = bytes as f64;
-
-    for unit in UNITS {
-        if size.abs() < 1000.0 {
-            return if unit.is_empty() {
-                format!("{:.0} B", size)
-            } else {
-                format!("{:.2} {}B", size, unit)
-            };
-        }
-        size /= 1000.0;
-    }
-
-    format!("{:.2} YB", size)
-}
-
-/// Format speed in bytes/sec as human-readable
-fn pretty_speed(bytes_per_sec: f64) -> String {
-    const UNITS: &[&str] = &["", "K", "M", "G", "T", "P", "E", "Z"];
-    let mut speed = bytes_per_sec;
-
-    for unit in UNITS {
-        if speed.abs() < 1000.0 {
-            return if unit.is_empty() {
-                format!("{:.0} B/s", speed)
-            } else {
-                format!("{:.2} {}B/s", speed, unit)
-            };
-        }
-        speed /= 1000.0;
-    }
-
-    format!("{:.2} YB/s", speed)
-}
-
-/// Format bitrate in bits/sec as human-readable
-fn speed_str(bits_per_sec: f64) -> String {
-    const UNITS: &[&str] = &["", "k", "M", "G", "T", "P", "E", "Z"];
-    let mut speed = bits_per_sec;
-
-    for unit in UNITS {
-        if speed.abs() < 1000.0 {
-            return format!("{:.2} {}bps", speed, unit);
-        }
-        speed /= 1000.0;
-    }
-
-    format!("{:.2} Ybps", speed)
-}
-
-/// Format frequency as human-readable
-fn pretty_frequency(freq: f64) -> String {
-    if freq < 0.001 {
-        return "never".to_string();
-    }
-
-    let period = 1.0 / freq;
-    if period < 60.0 {
-        format!("{:.1}/s", freq)
-    } else if period < 3600.0 {
-        format!("{:.1}/min", freq * 60.0)
-    } else if period < 86400.0 {
-        format!("{:.1}/h", freq * 3600.0)
-    } else {
-        format!("{:.2}/day", freq * 86400.0)
-    }
-}
-
-/// Format seconds as human-readable time
-fn pretty_time(seconds: f64) -> String {
-    if seconds < 60.0 {
-        format!("{:.0}s", seconds)
-    } else if seconds < 3600.0 {
-        let mins = seconds / 60.0;
-        format!("{:.0}m", mins)
-    } else if seconds < 86400.0 {
-        let hours = seconds / 3600.0;
-        format!("{:.1}h", hours)
-    } else if seconds < 604800.0 {
-        let days = seconds / 86400.0;
-        format!("{:.1}d", days)
-    } else {
-        let weeks = seconds / 604800.0;
-        format!("{:.1}w", weeks)
-    }
-}
-
-/// Format time ago from current time
-fn format_time_ago(last_heard: f64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let diff = now - last_heard;
-
-    if diff < 60.0 {
-        "Just now".to_string()
-    } else if diff < 3600.0 {
-        format!("{}m ago", (diff / 60.0) as i32)
-    } else if diff < 86400.0 {
-        format!("{}h ago", (diff / 3600.0) as i32)
-    } else {
-        format!("{}d ago", (diff / 86400.0) as i32)
-    }
-}
 
 /// Format status string with indicator
 fn format_status(status: &str) -> String {
@@ -2129,17 +2009,4 @@ fn format_status(status: &str) -> String {
 /// Format a hex string with angle brackets
 fn pretty_hex(hex: &str) -> String {
     format!("<{}>", hex)
-}
-
-/// Format a number with comma separators (e.g., 1000000 -> "1,000,000")
-fn format_with_commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
 }

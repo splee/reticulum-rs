@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rand_core::OsRng;
+use reticulum::cli::hash::parse_identity_hash;
 use reticulum::config::{LogLevel, ReticulumConfig, StoragePaths};
 use reticulum::destination::request::AllowPolicy;
 use reticulum::identity::PrivateIdentity;
@@ -530,18 +531,6 @@ fn create_remote_management_config(allowed_hashes: &[String]) -> RemoteManagemen
             }
         }
     }
-}
-
-/// Parse a hex string to a 16-byte identity hash.
-fn parse_identity_hash(hex_str: &str) -> Result<[u8; 16], String> {
-    let hex_str = hex_str.trim();
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {}", e))?;
-    if bytes.len() != 16 {
-        return Err(format!("expected 16 bytes, got {}", bytes.len()));
-    }
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(&bytes);
-    Ok(hash)
 }
 
 fn print_example_config() {

@@ -17,6 +17,7 @@ use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
+use reticulum::cli::format::{format_hash, spinner_char};
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::crypt::fernet::{Fernet, PlainText, Token};
 use reticulum::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
@@ -371,8 +372,6 @@ async fn request_identity_from_network(
     let timeout = Duration::from_secs_f64(args.timeout);
     let start = std::time::Instant::now();
 
-    // Spinner characters for visual feedback
-    let spinner = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
     let mut spinner_idx = 0;
 
     // Request path and wait for identity
@@ -388,10 +387,7 @@ async fn request_identity_from_network(
         //     return Ok(IdentityType::Public(identity));
         // }
 
-        print!(
-            "\rRequesting identity {} ",
-            spinner[spinner_idx % spinner.len()]
-        );
+        print!("\rRequesting identity {} ", spinner_char(spinner_idx));
         io::stdout().flush().ok();
         spinner_idx += 1;
 
@@ -1151,16 +1147,6 @@ fn load_identity_from_file(path: &PathBuf) -> Result<PrivateIdentity, String> {
         .map_err(|e| format!("Failed to parse identity: {:?}", e))
 }
 
-fn format_hash(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2 + 2);
-    hex.push('<');
-    for byte in bytes {
-        hex.push_str(&format!("{:02x}", byte));
-    }
-    hex.push('>');
-    hex
-}
-
 fn print_usage() {
     eprintln!("No action specified. Use --help for usage information.");
     eprintln!();
@@ -1488,24 +1474,6 @@ mod tests {
             dest1.desc.address_hash.as_slice(),
             dest2.desc.address_hash.as_slice()
         );
-    }
-
-    // ==========================================================================
-    // Format Hash Tests
-    // ==========================================================================
-
-    #[test]
-    fn test_format_hash() {
-        let bytes = [0xde, 0xad, 0xbe, 0xef];
-        let formatted = format_hash(&bytes);
-        assert_eq!(formatted, "<deadbeef>");
-    }
-
-    #[test]
-    fn test_format_hash_empty() {
-        let bytes: [u8; 0] = [];
-        let formatted = format_hash(&bytes);
-        assert_eq!(formatted, "<>");
     }
 
     // ==========================================================================
