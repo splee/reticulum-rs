@@ -20,284 +20,30 @@ use crate::error::RnsError;
 use crate::hash::Hash;
 use crate::packet::PACKET_MDU;
 
-/// Length of the map hash for each part
-pub const MAPHASH_LEN: usize = 4;
-/// Length of the random hash prepended to data
-pub const RANDOM_HASH_SIZE: usize = 4;
+// Submodules
+mod advertising;
+mod compression;
+mod config;
+pub mod constants;
+mod parts;
+mod status;
 
-/// The initial window size at beginning of transfer
-pub const WINDOW_INITIAL: usize = 4;
-/// Absolute minimum window size during transfer
-pub const WINDOW_MIN: usize = 2;
-/// The maximum window size for transfers on slow links
-pub const WINDOW_MAX_SLOW: usize = 10;
-/// The maximum window size for transfers on very slow links
-pub const WINDOW_MAX_VERY_SLOW: usize = 4;
-/// The maximum window size for transfers on fast links
-pub const WINDOW_MAX_FAST: usize = 75;
-/// Global maximum window (for calculating maps and guard segments)
-pub const WINDOW_MAX: usize = WINDOW_MAX_FAST;
+// Re-export public types
+pub use advertising::ResourceAdvertisement;
+pub use config::{ResourceConfig, ResourceProgress};
+pub use constants::*;
+pub use parts::ResourcePart;
+pub use status::{ResourceFlags, ResourceStatus};
 
-/// Minimum allowed flexibility of window size
-pub const WINDOW_FLEXIBILITY: usize = 4;
-
-/// Fast rate threshold rounds before using fast window size
-pub const FAST_RATE_THRESHOLD: usize = WINDOW_MAX_SLOW - WINDOW_INITIAL - 2;
-/// Very slow rate threshold rounds before capping window
-pub const VERY_SLOW_RATE_THRESHOLD: usize = 2;
-
-/// Rate threshold for fast links (bytes per second) - 50 Kbps
-pub const RATE_FAST: f64 = (50.0 * 1000.0) / 8.0;
-/// Rate threshold for very slow links (bytes per second) - 2 Kbps
-pub const RATE_VERY_SLOW: f64 = (2.0 * 1000.0) / 8.0;
-
-/// Maximum efficient size for a single resource segment (about 1 MB)
-/// Capped at 16777215 (0xFFFFFF) to fit in 3 bytes in advertisements
-pub const MAX_EFFICIENT_SIZE: usize = 1024 * 1024 - 1;
-
-/// Maximum metadata size (about 16 MB)
-pub const METADATA_MAX_SIZE: usize = 16 * 1024 * 1024 - 1;
-
-/// Maximum size to auto-compress before sending
-pub const AUTO_COMPRESS_MAX_SIZE: usize = 64 * 1024 * 1024;
-
-/// Response max grace time
-pub const RESPONSE_MAX_GRACE_TIME: f64 = 10.0;
-
-/// Part timeout factor
-pub const PART_TIMEOUT_FACTOR: f64 = 4.0;
-/// Part timeout factor after RTT is known
-pub const PART_TIMEOUT_FACTOR_AFTER_RTT: f64 = 2.0;
-/// Proof timeout factor
-pub const PROOF_TIMEOUT_FACTOR: f64 = 3.0;
-
-/// Maximum retries for resource transfer
-pub const MAX_RETRIES: u32 = 16;
-/// Maximum retries for advertisement
-pub const MAX_ADV_RETRIES: u32 = 4;
-
-/// Sender grace time
-pub const SENDER_GRACE_TIME: f64 = 10.0;
-/// Processing grace time
-pub const PROCESSING_GRACE: f64 = 1.0;
-/// Retry grace time
-pub const RETRY_GRACE_TIME: f64 = 0.25;
-/// Per-retry delay
-pub const PER_RETRY_DELAY: f64 = 0.5;
-
-/// Watchdog max sleep time
-pub const WATCHDOG_MAX_SLEEP: f64 = 1.0;
-
-/// Hashmap status indicators
-pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
-pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
-
-/// Resource status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-#[derive(Default)]
-pub enum ResourceStatus {
-    /// No status
-    #[default]
-    None = 0x00,
-    /// Resource is queued for transfer
-    Queued = 0x01,
-    /// Resource advertisement has been sent
-    Advertised = 0x02,
-    /// Resource is currently transferring
-    Transferring = 0x03,
-    /// Waiting for proof after all parts sent
-    AwaitingProof = 0x04,
-    /// Assembling received parts
-    Assembling = 0x05,
-    /// Transfer completed successfully
-    Complete = 0x06,
-    /// Transfer failed
-    Failed = 0x07,
-    /// Resource data is corrupt
-    Corrupt = 0x08,
-}
-
-
-impl From<u8> for ResourceStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => ResourceStatus::None,
-            0x01 => ResourceStatus::Queued,
-            0x02 => ResourceStatus::Advertised,
-            0x03 => ResourceStatus::Transferring,
-            0x04 => ResourceStatus::AwaitingProof,
-            0x05 => ResourceStatus::Assembling,
-            0x06 => ResourceStatus::Complete,
-            0x07 => ResourceStatus::Failed,
-            0x08 => ResourceStatus::Corrupt,
-            _ => ResourceStatus::None,
-        }
-    }
-}
-
-/// Flags for resource advertisements
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ResourceFlags {
-    /// Whether the resource is encrypted
-    pub encrypted: bool,
-    /// Whether the resource is compressed
-    pub compressed: bool,
-    /// Whether the resource is split into segments
-    pub split: bool,
-    /// Whether this is a request
-    pub is_request: bool,
-    /// Whether this is a response
-    pub is_response: bool,
-    /// Whether the resource has metadata
-    pub has_metadata: bool,
-}
-
-impl ResourceFlags {
-    /// Pack flags into a single byte
-    pub fn to_byte(&self) -> u8 {
-        let mut flags = 0u8;
-        if self.encrypted {
-            flags |= 0x01;
-        }
-        if self.compressed {
-            flags |= 0x02;
-        }
-        if self.split {
-            flags |= 0x04;
-        }
-        if self.is_request {
-            flags |= 0x08;
-        }
-        if self.is_response {
-            flags |= 0x10;
-        }
-        if self.has_metadata {
-            flags |= 0x20;
-        }
-        flags
-    }
-
-    /// Unpack flags from a single byte
-    pub fn from_byte(byte: u8) -> Self {
-        Self {
-            encrypted: (byte & 0x01) != 0,
-            compressed: (byte & 0x02) != 0,
-            split: (byte & 0x04) != 0,
-            is_request: (byte & 0x08) != 0,
-            is_response: (byte & 0x10) != 0,
-            has_metadata: (byte & 0x20) != 0,
-        }
-    }
-}
-
-/// A resource part ready for transmission
-#[derive(Debug, Clone)]
-pub struct ResourcePart {
-    /// The data for this part
-    pub data: Vec<u8>,
-    /// The map hash for this part
-    pub map_hash: [u8; MAPHASH_LEN],
-    /// Whether this part has been sent
-    pub sent: bool,
-}
-
-/// Progress information for resource transfer
-#[derive(Debug, Clone)]
-pub struct ResourceProgress {
-    /// Current status
-    pub status: ResourceStatus,
-    /// Total size of resource data
-    pub total_size: usize,
-    /// Size of data transferred
-    pub transfer_size: usize,
-    /// Number of total parts
-    pub total_parts: usize,
-    /// Number of parts processed (sent or received)
-    pub processed_parts: usize,
-    /// Current segment index (1-based)
-    pub segment_index: usize,
-    /// Total number of segments
-    pub total_segments: usize,
-    /// Whether the resource is compressed
-    pub compressed: bool,
-    /// Round-trip time estimate
-    pub rtt: Option<Duration>,
-    /// Expected in-flight rate (bits per second)
-    pub eifr: Option<f64>,
-}
-
-impl ResourceProgress {
-    /// Get progress as a value between 0.0 and 1.0
-    pub fn get_progress(&self) -> f64 {
-        if self.status == ResourceStatus::Complete && self.segment_index == self.total_segments {
-            return 1.0;
-        }
-
-        if self.total_parts == 0 {
-            return 0.0;
-        }
-
-        if !self.is_split() {
-            return self.processed_parts as f64 / self.total_parts as f64;
-        }
-
-        // For split resources, calculate based on segments
-        let max_parts_per_segment =
-            (MAX_EFFICIENT_SIZE as f64 / PACKET_MDU as f64).ceil() as usize;
-        let previously_processed = (self.segment_index - 1) * max_parts_per_segment;
-
-        let current_segment_factor = if self.total_parts < max_parts_per_segment {
-            max_parts_per_segment as f64 / self.total_parts as f64
-        } else {
-            1.0
-        };
-
-        let effective_processed =
-            previously_processed as f64 + self.processed_parts as f64 * current_segment_factor;
-        let effective_total = self.total_segments * max_parts_per_segment;
-
-        (effective_processed / effective_total as f64).min(1.0)
-    }
-
-    /// Check if resource is split into multiple segments
-    pub fn is_split(&self) -> bool {
-        self.total_segments > 1
-    }
-}
+// Internal use
+use compression::{compress_bz2, decompress_bz2};
+use parts::calculate_map_hash;
 
 /// Type alias for progress callback
 pub type ProgressCallback = Arc<dyn Fn(&ResourceProgress) + Send + Sync>;
 
 /// Type alias for completion callback
 pub type CompletionCallback = Arc<dyn Fn(&Resource, bool) + Send + Sync>;
-
-/// Configuration for a resource transfer
-#[derive(Clone)]
-pub struct ResourceConfig {
-    /// Whether to auto-compress the resource
-    pub auto_compress: bool,
-    /// Maximum size for auto-compression
-    pub auto_compress_limit: usize,
-    /// Transfer timeout
-    pub timeout: Option<Duration>,
-    /// Maximum retries
-    pub max_retries: u32,
-    /// Maximum advertisement retries
-    pub max_adv_retries: u32,
-}
-
-impl Default for ResourceConfig {
-    fn default() -> Self {
-        Self {
-            auto_compress: true,
-            auto_compress_limit: AUTO_COMPRESS_MAX_SIZE,
-            timeout: None,
-            max_retries: MAX_RETRIES,
-            max_adv_retries: MAX_ADV_RETRIES,
-        }
-    }
-}
 
 /// A resource for transferring data over a link
 pub struct Resource {
@@ -325,10 +71,10 @@ pub struct Resource {
     total_size: usize,
 
     /// Resource flags
-    flags: ResourceFlags,
+    pub(crate) flags: ResourceFlags,
 
     /// Parts for outgoing resource
-    parts: Vec<ResourcePart>,
+    pub(crate) parts: Vec<ResourcePart>,
     /// Hashmap bytes
     hashmap: Vec<u8>,
     /// Total number of parts
@@ -411,7 +157,7 @@ pub struct Resource {
     completion_callback: Option<CompletionCallback>,
 
     /// SDU (Service Data Unit) size for parts
-    sdu: usize,
+    pub(crate) sdu: usize,
 
     /// Hashmap height (how many entries have been received)
     hashmap_height: usize,
@@ -503,7 +249,7 @@ impl Resource {
         // but for hash we use the uncompressed data
         let hash = Hash::new(
             Hash::generator()
-                .chain_update(&uncompressed_data)  // Includes metadata, uncompressed
+                .chain_update(&uncompressed_data) // Includes metadata, uncompressed
                 .chain_update(random_hash)
                 .finalize()
                 .into(),
@@ -520,7 +266,7 @@ impl Resource {
         // Expected proof is Hash(uncompressed_data + hash)
         let expected_proof = Hash::new(
             Hash::generator()
-                .chain_update(&uncompressed_data)  // Includes metadata, uncompressed
+                .chain_update(&uncompressed_data) // Includes metadata, uncompressed
                 .chain_update(hash.as_bytes())
                 .finalize()
                 .into(),
@@ -540,7 +286,7 @@ impl Resource {
             let part_data = final_data[start..end].to_vec();
 
             // Calculate map hash for this part
-            let map_hash = Self::calculate_map_hash(&part_data, &random_hash);
+            let map_hash = calculate_map_hash(&part_data, &random_hash);
 
             // Check for collisions
             if collision_guard.contains(&map_hash) {
@@ -690,21 +436,6 @@ impl Resource {
             consecutive_completed_height: -1,
             receiver_min_consecutive_height: 0,
         })
-    }
-
-    /// Calculate the map hash for a part.
-    /// Python: full_hash(data + random_hash)[:MAPHASH_LEN]
-    fn calculate_map_hash(data: &[u8], random_hash: &[u8; RANDOM_HASH_SIZE]) -> [u8; MAPHASH_LEN] {
-        let full_hash = Hash::new(
-            Hash::generator()
-                .chain_update(data)
-                .chain_update(random_hash)
-                .finalize()
-                .into(),
-        );
-        let mut result = [0u8; MAPHASH_LEN];
-        result.copy_from_slice(&full_hash.as_bytes()[..MAPHASH_LEN]);
-        result
     }
 
     /// Get current status
@@ -865,7 +596,7 @@ impl Resource {
 
     /// Receive a part by map hash
     pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
-        let map_hash = Self::calculate_map_hash(&data, &self.random_hash);
+        let map_hash = calculate_map_hash(&data, &self.random_hash);
 
         log::debug!(
             "receive_part: data {} bytes, first 20: {:?}, calculated map_hash {:?}",
@@ -898,34 +629,31 @@ impl Resource {
                     i,
                     expected_hash
                 );
-                if expected_hash == map_hash
-                    && self.received_parts[i].is_none() {
-                        self.received_parts[i] = Some(data);
-                        self.rtt_rxd_bytes += self.sdu;
-                        self.received_count += 1;
-                        self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
+                if expected_hash == map_hash && self.received_parts[i].is_none() {
+                    self.received_parts[i] = Some(data);
+                    self.rtt_rxd_bytes += self.sdu;
+                    self.received_count += 1;
+                    self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
 
-                        // Update consecutive completed height
-                        if i as isize == self.consecutive_completed_height + 1 {
-                            self.consecutive_completed_height = i as isize;
+                    // Update consecutive completed height
+                    if i as isize == self.consecutive_completed_height + 1 {
+                        self.consecutive_completed_height = i as isize;
 
-                            // Extend if consecutive
-                            let mut cp = (self.consecutive_completed_height + 1) as usize;
-                            while cp < self.received_parts.len()
-                                && self.received_parts[cp].is_some()
-                            {
-                                self.consecutive_completed_height = cp as isize;
-                                cp += 1;
-                            }
+                        // Extend if consecutive
+                        let mut cp = (self.consecutive_completed_height + 1) as usize;
+                        while cp < self.received_parts.len() && self.received_parts[cp].is_some() {
+                            self.consecutive_completed_height = cp as isize;
+                            cp += 1;
                         }
-
-                        // Trigger progress callback
-                        if let Some(ref callback) = self.progress_callback {
-                            callback(&self.progress());
-                        }
-
-                        return true;
                     }
+
+                    // Trigger progress callback
+                    if let Some(ref callback) = self.progress_callback {
+                        callback(&self.progress());
+                    }
+
+                    return true;
+                }
             }
         }
 
@@ -1124,9 +852,8 @@ impl Resource {
             self.eifr = Some(prev_eifr);
         } else {
             // Estimate from link establishment
-            self.eifr = Some(
-                (link_establishment_cost as f64 * 8.0) / rtt.as_secs_f64(),
-            );
+            self.eifr =
+                Some((link_establishment_cost as f64 * 8.0) / rtt.as_secs_f64());
         }
     }
 
@@ -1202,7 +929,12 @@ impl Resource {
         // Iterate through parts we need
         for idx in search_start..(search_start + search_size).min(self.total_parts) {
             // Check if we already have this part
-            if self.received_parts.get(idx).map(|p| p.is_none()).unwrap_or(true) {
+            if self
+                .received_parts
+                .get(idx)
+                .map(|p| p.is_none())
+                .unwrap_or(true)
+            {
                 // Get the hash for this part from the hashmap
                 let hash_start = pn * MAPHASH_LEN;
                 let hash_end = hash_start + MAPHASH_LEN;
@@ -1283,7 +1015,9 @@ impl Resource {
 
         log::debug!(
             "handle_request: wants_more_hashmap={}, pad={}, requested_hashes len={}",
-            wants_more_hashmap, pad, requested_hashes.len()
+            wants_more_hashmap,
+            pad,
+            requested_hashes.len()
         );
 
         // Define search scope based on receiver's state
@@ -1300,7 +1034,9 @@ impl Resource {
 
             log::debug!(
                 "handle_request: looking for hash {:?} in parts {}..{}",
-                requested_hash, search_start, search_end.min(self.parts.len())
+                requested_hash,
+                search_start,
+                search_end.min(self.parts.len())
             );
 
             // Search for this hash in our parts
@@ -1308,7 +1044,8 @@ impl Resource {
             for idx in search_start..search_end.min(self.parts.len()) {
                 log::trace!(
                     "handle_request: part {} has hash {:?}",
-                    idx, &self.parts[idx].map_hash
+                    idx,
+                    &self.parts[idx].map_hash
                 );
                 if self.parts[idx].map_hash == requested_hash {
                     parts_to_send.push(idx);
@@ -1459,257 +1196,10 @@ mod hex {
     }
 }
 
-/// Resource advertisement for announcing a resource
-#[derive(Debug, Clone)]
-pub struct ResourceAdvertisement {
-    /// Transfer size (after compression/encryption)
-    pub transfer_size: usize,
-    /// Total uncompressed data size
-    pub data_size: usize,
-    /// Number of parts
-    pub num_parts: usize,
-    /// Resource hash
-    pub hash: [u8; 32],
-    /// Random hash
-    pub random_hash: [u8; RANDOM_HASH_SIZE],
-    /// Original hash (for multi-segment)
-    pub original_hash: [u8; 32],
-    /// Segment index (1-based)
-    pub segment_index: usize,
-    /// Total segments
-    pub total_segments: usize,
-    /// Request ID (for request/response pattern)
-    pub request_id: Option<[u8; 16]>,
-    /// Resource flags
-    pub flags: ResourceFlags,
-    /// Hashmap (first segment only)
-    pub hashmap: Vec<u8>,
-}
-
-impl ResourceAdvertisement {
-    /// Overhead in bytes for advertisement packet
-    pub const OVERHEAD: usize = 134;
-
-    /// Maximum hashmap entries that fit in an advertisement
-    pub const HASHMAP_MAX_LEN: usize = (464 - Self::OVERHEAD) / MAPHASH_LEN; // Approximate MDU - overhead
-
-    /// Collision guard size for hashmap
-    pub const COLLISION_GUARD_SIZE: usize = 2 * WINDOW_MAX + Self::HASHMAP_MAX_LEN;
-
-    /// Pack the advertisement into bytes using MessagePack map format
-    pub fn pack(&self, segment: usize) -> Result<Vec<u8>, RnsError> {
-        use std::collections::BTreeMap;
-
-        // Calculate hashmap slice for this segment
-        let hashmap_start = segment * Self::HASHMAP_MAX_LEN * MAPHASH_LEN;
-        let hashmap_end =
-            ((segment + 1) * Self::HASHMAP_MAX_LEN * MAPHASH_LEN).min(self.hashmap.len());
-
-        let hashmap_slice = if hashmap_start < self.hashmap.len() {
-            self.hashmap[hashmap_start..hashmap_end].to_vec()
-        } else {
-            vec![]
-        };
-
-        // Build a map that matches Python's dictionary structure
-        let mut map: BTreeMap<String, rmpv::Value> = BTreeMap::new();
-        map.insert("t".to_string(), rmpv::Value::from(self.transfer_size as u64));
-        map.insert("d".to_string(), rmpv::Value::from(self.data_size as u64));
-        map.insert("n".to_string(), rmpv::Value::from(self.num_parts as u64));
-        map.insert("h".to_string(), rmpv::Value::Binary(self.hash.to_vec()));
-        map.insert("r".to_string(), rmpv::Value::Binary(self.random_hash.to_vec()));
-        map.insert("o".to_string(), rmpv::Value::Binary(self.original_hash.to_vec()));
-        map.insert("i".to_string(), rmpv::Value::from(self.segment_index as u64));
-        map.insert("l".to_string(), rmpv::Value::from(self.total_segments as u64));
-
-        // Handle optional request_id
-        if let Some(ref req_id) = self.request_id {
-            map.insert("q".to_string(), rmpv::Value::Binary(req_id.to_vec()));
-        } else {
-            map.insert("q".to_string(), rmpv::Value::Nil);
-        }
-
-        map.insert("f".to_string(), rmpv::Value::from(self.flags.to_byte() as u64));
-        map.insert("m".to_string(), rmpv::Value::Binary(hashmap_slice));
-
-        // Serialize as map
-        let value = rmpv::Value::Map(
-            map.into_iter()
-                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-                .collect()
-        );
-
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &value)
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        Ok(buf)
-    }
-
-    /// Unpack an advertisement from bytes
-    pub fn unpack(data: &[u8]) -> Result<Self, RnsError> {
-        let value = rmpv::decode::read_value(&mut &data[..])
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        let map = match value {
-            rmpv::Value::Map(m) => m,
-            _ => return Err(RnsError::InvalidArgument),
-        };
-
-        // Helper to extract values from the map
-        let get_value = |key: &str| -> Option<&rmpv::Value> {
-            map.iter()
-                .find(|(k, _)| {
-                    match k {
-                        rmpv::Value::String(s) => s.as_str() == Some(key),
-                        _ => false,
-                    }
-                })
-                .map(|(_, v)| v)
-        };
-
-        let get_u64 = |key: &str| -> Result<u64, RnsError> {
-            get_value(key)
-                .and_then(|v| v.as_u64())
-                .ok_or(RnsError::InvalidArgument)
-        };
-
-        let get_bytes = |key: &str| -> Result<Vec<u8>, RnsError> {
-            get_value(key)
-                .and_then(|v| match v {
-                    rmpv::Value::Binary(b) => Some(b.clone()),
-                    _ => None,
-                })
-                .ok_or(RnsError::InvalidArgument)
-        };
-
-        let transfer_size = get_u64("t")? as usize;
-        let data_size = get_u64("d")? as usize;
-        let num_parts = get_u64("n")? as usize;
-
-        let hash: [u8; 32] = get_bytes("h")?
-            .try_into()
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        let random_hash: [u8; RANDOM_HASH_SIZE] = get_bytes("r")?
-            .try_into()
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        let original_hash: [u8; 32] = get_bytes("o")?
-            .try_into()
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        let segment_index = get_u64("i")? as usize;
-        let total_segments = get_u64("l")? as usize;
-
-        let request_id = get_value("q")
-            .and_then(|v| match v {
-                rmpv::Value::Binary(b) if b.len() == 16 => {
-                    let arr: [u8; 16] = b.clone().try_into().ok()?;
-                    Some(arr)
-                }
-                rmpv::Value::Nil => None,
-                _ => None,
-            });
-
-        let flags = ResourceFlags::from_byte(get_u64("f")? as u8);
-        let hashmap = get_bytes("m")?;
-
-        Ok(Self {
-            transfer_size,
-            data_size,
-            num_parts,
-            hash,
-            random_hash,
-            original_hash,
-            segment_index,
-            total_segments,
-            request_id,
-            flags,
-            hashmap,
-        })
-    }
-
-    /// Check if this is a request advertisement
-    pub fn is_request(&self) -> bool {
-        self.request_id.is_some() && self.flags.is_request
-    }
-
-    /// Check if this is a response advertisement
-    pub fn is_response(&self) -> bool {
-        self.request_id.is_some() && self.flags.is_response
-    }
-}
-
-/// Compress data using bz2 compression (compatible with Python bz2 module)
-fn compress_bz2(data: &[u8]) -> Result<Vec<u8>, RnsError> {
-    use bzip2::write::BzEncoder;
-    use bzip2::Compression;
-    use std::io::Write;
-
-    let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(data)
-        .map_err(|e| {
-            log::error!("bz2 compression failed: {:?}", e);
-            RnsError::InvalidArgument
-        })?;
-    encoder.finish().map_err(|e| {
-        log::error!("bz2 compression finalize failed: {:?}", e);
-        RnsError::InvalidArgument
-    })
-}
-
-/// Decompress bz2-compressed data
-fn decompress_bz2(data: &[u8]) -> Result<Vec<u8>, RnsError> {
-    use bzip2::read::BzDecoder;
-    use std::io::Read;
-
-    let mut decoder = BzDecoder::new(data);
-    let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| {
-            log::error!("bz2 decompression failed: {:?}", e);
-            RnsError::InvalidArgument
-        })?;
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand_core::OsRng;
-
-    #[test]
-    fn test_resource_flags() {
-        let flags = ResourceFlags {
-            encrypted: true,
-            compressed: true,
-            split: false,
-            is_request: true,
-            is_response: false,
-            has_metadata: true,
-        };
-
-        let byte = flags.to_byte();
-        let restored = ResourceFlags::from_byte(byte);
-
-        assert_eq!(flags.encrypted, restored.encrypted);
-        assert_eq!(flags.compressed, restored.compressed);
-        assert_eq!(flags.split, restored.split);
-        assert_eq!(flags.is_request, restored.is_request);
-        assert_eq!(flags.is_response, restored.is_response);
-        assert_eq!(flags.has_metadata, restored.has_metadata);
-    }
-
-    #[test]
-    fn test_resource_status_conversion() {
-        assert_eq!(ResourceStatus::from(0x00), ResourceStatus::None);
-        assert_eq!(ResourceStatus::from(0x03), ResourceStatus::Transferring);
-        assert_eq!(ResourceStatus::from(0x06), ResourceStatus::Complete);
-        assert_eq!(ResourceStatus::from(0xFF), ResourceStatus::None);
-    }
 
     #[test]
     fn test_resource_creation() {
@@ -1731,64 +1221,10 @@ mod tests {
         let data = b"Data with metadata";
         let metadata = b"filename.txt";
 
-        let resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), Some(metadata))
-                .expect("create resource");
+        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), Some(metadata))
+            .expect("create resource");
 
         assert!(resource.flags.has_metadata);
-    }
-
-    #[test]
-    fn test_resource_advertisement_pack_unpack() {
-        let adv = ResourceAdvertisement {
-            transfer_size: 1024,
-            data_size: 2048,
-            num_parts: 5,
-            hash: [1u8; 32],
-            random_hash: [2u8; RANDOM_HASH_SIZE],
-            original_hash: [3u8; 32],
-            segment_index: 1,
-            total_segments: 1,
-            request_id: None,
-            flags: ResourceFlags::default(),
-            hashmap: vec![0u8; 20],
-        };
-
-        let packed = adv.pack(0).expect("pack advertisement");
-        let unpacked = ResourceAdvertisement::unpack(&packed).expect("unpack advertisement");
-
-        assert_eq!(adv.transfer_size, unpacked.transfer_size);
-        assert_eq!(adv.data_size, unpacked.data_size);
-        assert_eq!(adv.num_parts, unpacked.num_parts);
-        assert_eq!(adv.hash, unpacked.hash);
-        assert_eq!(adv.segment_index, unpacked.segment_index);
-    }
-
-    #[test]
-    fn test_compression() {
-        let data = b"This is some test data that should compress well. ".repeat(100);
-        let compressed = compress_bz2(&data).expect("compress");
-        let decompressed = decompress_bz2(&compressed).expect("decompress");
-        assert_eq!(data.as_slice(), decompressed.as_slice());
-    }
-
-    #[test]
-    fn test_resource_progress() {
-        let progress = ResourceProgress {
-            status: ResourceStatus::Transferring,
-            total_size: 10000,
-            transfer_size: 5000,
-            total_parts: 10,
-            processed_parts: 5,
-            segment_index: 1,
-            total_segments: 1,
-            compressed: false,
-            rtt: Some(Duration::from_millis(100)),
-            eifr: Some(50000.0),
-        };
-
-        let p = progress.get_progress();
-        assert!((p - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -1796,8 +1232,8 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x41u8; 1000]; // 1KB of 'A'
 
-        let resource = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create resource");
+        let resource =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create resource");
 
         // Verify parts were created
         assert!(resource.total_parts() > 0);
@@ -1816,40 +1252,18 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_map_hash_calculation() {
-        let random_hash = [0x12u8; RANDOM_HASH_SIZE];
-        let data = b"test data for hashing";
-
-        let hash1 = Resource::calculate_map_hash(data, &random_hash);
-        let hash2 = Resource::calculate_map_hash(data, &random_hash);
-
-        // Same input should produce same hash
-        assert_eq!(hash1, hash2);
-
-        // Different data should produce different hash
-        let different_data = b"different data";
-        let hash3 = Resource::calculate_map_hash(different_data, &random_hash);
-        assert_ne!(hash1, hash3);
-
-        // Different random hash should produce different result
-        let different_random = [0x34u8; RANDOM_HASH_SIZE];
-        let hash4 = Resource::calculate_map_hash(data, &different_random);
-        assert_ne!(hash1, hash4);
-    }
-
-    #[test]
     fn test_resource_receive_part() {
         let mut rng = OsRng;
         let data = vec![0x42u8; 500]; // 500 bytes
 
         // Create outgoing resource to get parts
-        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         // Create incoming resource from advertisement
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Verify initial state
         assert_eq!(incoming.received_count, 0);
@@ -1871,12 +1285,12 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x43u8; 2000]; // Large enough for multiple parts
 
-        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Receive parts in order (window-based reception requires parts to be
         // within the current window, which starts at consecutive_completed_height + 1)
@@ -1895,12 +1309,12 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x44u8; 1000];
 
-        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Generate first request
         let request = incoming.request_next();
@@ -1916,8 +1330,8 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x45u8; 500];
 
-        let mut resource = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create resource");
+        let mut resource =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create resource");
 
         // Create a mock request with the first part hash
         let mut request_data = Vec::new();
@@ -1939,8 +1353,8 @@ mod tests {
         let mut rng = OsRng;
         let data = b"Data for proof testing";
 
-        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), None)
-            .expect("create resource");
+        let resource =
+            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create resource");
 
         // Generate proof
         let proof = resource.generate_proof();
@@ -1962,12 +1376,12 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x46u8; 500];
 
-        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Get hashmap update from outgoing
         let hashmap_update = outgoing.get_hashmap_update(0);
@@ -1981,12 +1395,12 @@ mod tests {
         let mut rng = OsRng;
         let data = vec![0x47u8; 500];
 
-        let outgoing = Resource::new(&mut rng, &data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         let initial_window = incoming.window();
         assert_eq!(initial_window, WINDOW_INITIAL);
@@ -2015,8 +1429,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, data, config, None)
-            .expect("create resource");
+        let resource = Resource::new(&mut rng, data, config, None).expect("create resource");
 
         // Small data might not compress well, could be either compressed or not
         // Just verify resource was created successfully
@@ -2034,8 +1447,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, &data, config, None)
-            .expect("create resource");
+        let resource = Resource::new(&mut rng, &data, config, None).expect("create resource");
 
         // Verify it's marked as compressed
         assert!(resource.is_compressed());
@@ -2055,12 +1467,12 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let outgoing = Resource::new(&mut rng, original_data, config, None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, original_data, config, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Receive all parts
         for part in &outgoing.parts {
@@ -2088,12 +1500,12 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let outgoing = Resource::new(&mut rng, data, config, None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, data, config, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Before receiving parts, should return None
         assert!(incoming.get_raw_assembled_data().is_none());
@@ -2114,8 +1526,8 @@ mod tests {
         let mut rng = OsRng;
         let data = b"Data to cancel";
 
-        let mut resource = Resource::new(&mut rng, data, ResourceConfig::default(), None)
-            .expect("create resource");
+        let mut resource =
+            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create resource");
 
         assert_ne!(resource.status(), ResourceStatus::Failed);
 
@@ -2129,12 +1541,12 @@ mod tests {
         let mut rng = OsRng;
         let data = b"RTT test";
 
-        let outgoing = Resource::new(&mut rng, data, ResourceConfig::default(), None)
-            .expect("create outgoing resource");
+        let outgoing =
+            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
-        let mut incoming = Resource::from_advertisement(&adv, outgoing.sdu)
-            .expect("create incoming resource");
+        let mut incoming =
+            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Initial RTT should be None
         assert!(incoming.rtt.is_none());
