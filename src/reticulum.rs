@@ -19,7 +19,8 @@
 //! - **SharedInstance**: This instance owns the transport and interfaces. It acts as
 //!   the daemon that other local programs connect to.
 //! - **ConnectedToSharedInstance**: This instance connects to an existing daemon via IPC.
-//!   Transport and probes are disabled; all operations route through the daemon.
+//!   Has a client-mode transport that relays packets through the daemon. Applications
+//!   can use transport methods (add_destination, recv_announces, etc.) transparently.
 //! - **Standalone**: This instance operates independently with full transport capabilities
 //!   but no IPC. Used when `share_instance=false` in config or when negotiation fails.
 //!
@@ -53,7 +54,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{LogLevel, ReticulumConfig, StoragePaths};
 use crate::identity::PrivateIdentity;
 use crate::ipc::addr::{connect, IpcListener, ListenerAddr};
-use crate::ipc::LocalServerInterface;
+use crate::ipc::{LocalClientInterface, LocalServerInterface};
 use crate::rpc::client::{RpcClient, RpcClientError};
 use crate::rpc::protocol::{InterfaceStats, PathEntry};
 use crate::rpc::RpcServer;
@@ -68,7 +69,9 @@ pub enum InstanceMode {
     SharedInstance,
 
     /// This instance is connected to a shared instance via LocalClientInterface.
-    /// Transport and probes are disabled; routes through the shared instance.
+    /// Has a client-mode transport that relays packets through the shared instance.
+    /// Applications can use transport methods (add_destination, recv_announces, etc.)
+    /// which work by relaying through the daemon.
     ConnectedToSharedInstance,
 
     /// This instance operates standalone with full transport capabilities.
@@ -440,7 +443,13 @@ impl Reticulum {
                             local_addr.display()
                         );
 
-                        // Build RPC client for communicating with the daemon
+                        // Create client-mode transport with LocalClientInterface
+                        // This allows applications to use transport methods (add_destination,
+                        // recv_announces, etc.) that relay through the daemon.
+                        let transport =
+                            Self::create_client_mode_transport(identity, local_addr.clone()).await;
+
+                        // Build RPC client for management queries (status, paths, etc.)
                         let rpc_addr = ipc.rpc_addr();
 
                         // Derive RPC key from identity (matches Python behavior)
@@ -451,11 +460,9 @@ impl Reticulum {
 
                         let rpc_client = RpcClient::new(rpc_addr, rpc_key);
 
-                        // In client mode, we don't run our own transport
-                        // All operations go through RPC to the shared instance
                         Ok((
                             InstanceMode::ConnectedToSharedInstance,
-                            None,
+                            Some(transport),
                             Some(rpc_client),
                         ))
                     }
@@ -577,6 +584,33 @@ impl Reticulum {
         } else {
             Ok(transport)
         }
+    }
+
+    /// Create transport for client mode (connected to a shared instance).
+    ///
+    /// In client mode, we create a Transport with LocalClientInterface as the only interface.
+    /// The LocalClientInterface relays packets to/from the daemon. This matches Python's
+    /// architecture where clients still have a Transport that processes packets locally
+    /// but relays them through the daemon for network I/O.
+    async fn create_client_mode_transport(
+        identity: &PrivateIdentity,
+        local_addr: ListenerAddr,
+    ) -> Arc<Transport> {
+        // Create transport in client mode (no announce retransmission)
+        let transport = Transport::new(TransportConfig::new_client_mode("reticulum-client", identity));
+        let transport_arc = Arc::new(transport);
+
+        // Spawn LocalClientInterface to relay packets to/from daemon
+        {
+            let iface_manager_arc = transport_arc.iface_manager();
+            let mut iface_manager = iface_manager_arc.lock().await;
+            iface_manager.spawn(
+                LocalClientInterface::new(local_addr),
+                LocalClientInterface::spawn,
+            );
+        }
+
+        transport_arc
     }
 
     /// Spawn interfaces from configuration.
@@ -709,16 +743,20 @@ impl Reticulum {
 
     /// Returns a reference to the transport layer.
     ///
-    /// # Panics
-    ///
-    /// Panics if called in ConnectedToSharedInstance mode (use RPC methods instead).
+    /// Transport is available in all modes:
+    /// - SharedInstance/Standalone: Full transport with network interfaces
+    /// - ConnectedToSharedInstance: Client-mode transport with LocalClientInterface
+    ///   that relays packets to/from the daemon
     pub fn transport(&self) -> &Transport {
         self.transport
             .as_ref()
-            .expect("Transport not available in client mode. Use RPC methods instead.")
+            .expect("Transport should always be available")
     }
 
-    /// Returns the transport if available (not in client mode).
+    /// Returns the transport if available.
+    ///
+    /// This method is provided for compatibility but will always return Some
+    /// since transport is available in all modes.
     pub fn transport_opt(&self) -> Option<&Transport> {
         self.transport.as_ref().map(|arc| arc.as_ref())
     }

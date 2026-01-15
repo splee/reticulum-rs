@@ -104,6 +104,9 @@ pub struct TransportConfig {
     identity: PrivateIdentity,
     broadcast: bool,
     retransmit: bool,
+    /// When true, this transport is in client mode (connected to a daemon).
+    /// Client mode transports don't run announce retransmission - the daemon handles that.
+    client_mode: bool,
 }
 
 #[derive(Clone)]
@@ -158,7 +161,27 @@ impl TransportConfig {
             identity: identity.clone(),
             broadcast: enable_transport,
             retransmit: enable_transport,
+            client_mode: false,
         }
+    }
+
+    /// Create a client-mode transport configuration.
+    ///
+    /// Client mode transports connect to a daemon via LocalClientInterface.
+    /// They don't run announce retransmission (the daemon handles that).
+    pub fn new_client_mode<T: Into<String>>(name: T, identity: &PrivateIdentity) -> Self {
+        Self {
+            name: Arc::from(name.into()),
+            identity: identity.clone(),
+            broadcast: false,
+            retransmit: false,
+            client_mode: true,
+        }
+    }
+
+    /// Returns true if this transport is in client mode.
+    pub fn is_client_mode(&self) -> bool {
+        self.client_mode
     }
 
     pub fn set_retransmit(&mut self, retransmit: bool) {
@@ -176,6 +199,7 @@ impl Default for TransportConfig {
             identity: PrivateIdentity::new_from_rand(OsRng),
             broadcast: false,
             retransmit: false,
+            client_mode: false,
         }
     }
 }
@@ -1878,6 +1902,7 @@ async fn manage_transport(
 ) {
     let cancel = handler.lock().await.cancel.clone();
     let retransmit = handler.lock().await.config.retransmit;
+    let client_mode = handler.lock().await.config.is_client_mode();
 
     let _packet_task = {
         let handler = handler.clone();
@@ -2063,7 +2088,8 @@ async fn manage_transport(
         });
     }
 
-    if retransmit {
+    // In client mode, the daemon handles announce retransmission
+    if retransmit && !client_mode {
         let handler = handler.clone();
         let cancel = cancel.clone();
 
