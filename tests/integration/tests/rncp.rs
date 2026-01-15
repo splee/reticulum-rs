@@ -190,10 +190,7 @@ fn test_rncp_listen_mode() {
 /// 2. Creates a test file with known content and calculates its SHA256
 /// 3. Sends the file using Python rncp
 /// 4. Verifies the received file exists and has matching checksum
-///
-/// Note: Ignored due to path discovery timing issues; run with --ignored
 #[test]
-#[ignore]
 fn test_rncp_python_to_rust_with_checksum() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
@@ -255,15 +252,6 @@ fn test_rncp_python_to_rust_with_checksum() {
     // Wait for announce to propagate
     std::thread::sleep(Duration::from_secs(5));
 
-    // Send file using Python rncp
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rncp",
-        test_file_path.to_str().unwrap(),
-        &rust_hash,
-        "-v",  // verbose for debugging
-    ]);
-
     // Set up Python config to use the hub
     let python_config_dir = tempfile::tempdir().expect("Failed to create python config dir");
     let python_config = format!(
@@ -286,7 +274,18 @@ share_instance = false
     )
     .expect("Failed to write Python config");
 
-    python_cmd.env("RNS_CONFIG_DIR", python_config_dir.path());
+    // Send file using Python rncp
+    // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
+    // (Python RNS doesn't recognize the env var)
+    let mut python_cmd = ctx.venv().python_command();
+    python_cmd.args([
+        "-m", "RNS.Utilities.rncp",
+        "--config", python_config_dir.path().to_str().unwrap(),
+        "-w", "30",  // path request timeout
+        "-v",  // verbose for debugging
+        test_file_path.to_str().unwrap(),
+        &rust_hash,
+    ]);
 
     eprintln!("Sending file with Python rncp...");
     let python_output = python_cmd.output().expect("Failed to run Python rncp");
@@ -353,10 +352,7 @@ share_instance = false
 /// 2. Creates a test file with known content and calculates its SHA256
 /// 3. Sends the file using Rust rncp
 /// 4. Verifies the received file via the Python helper's checksum output
-///
-/// Note: Ignored due to path discovery timing issues; run with --ignored
 #[test]
-#[ignore]
 fn test_rncp_rust_to_python_with_checksum() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
@@ -503,10 +499,7 @@ fn test_rncp_rust_to_python_with_checksum() {
 /// Test large file transfer with checksum verification.
 ///
 /// Transfers a 100KB+ file to verify multi-part resource handling.
-///
-/// Note: Ignored due to path discovery timing issues; run with --ignored
 #[test]
-#[ignore]
 fn test_rncp_large_file_transfer() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
@@ -564,15 +557,6 @@ fn test_rncp_large_file_transfer() {
     // Wait for announce propagation
     std::thread::sleep(Duration::from_secs(5));
 
-    // Send file using Python rncp
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rncp",
-        test_file_path.to_str().unwrap(),
-        &rust_hash,
-        "-v",
-    ]);
-
     // Set up Python config
     let python_config_dir = tempfile::tempdir().expect("Failed to create python config dir");
     let python_config = format!(
@@ -592,7 +576,17 @@ share_instance = false
     std::fs::write(python_config_dir.path().join("config"), &python_config)
         .expect("Failed to write Python config");
 
-    python_cmd.env("RNS_CONFIG_DIR", python_config_dir.path());
+    // Send file using Python rncp
+    // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
+    let mut python_cmd = ctx.venv().python_command();
+    python_cmd.args([
+        "-m", "RNS.Utilities.rncp",
+        "--config", python_config_dir.path().to_str().unwrap(),
+        "-w", "60",  // longer timeout for large file
+        "-v",
+        test_file_path.to_str().unwrap(),
+        &rust_hash,
+    ]);
 
     eprintln!("Sending large file with Python rncp...");
     let python_output = python_cmd.output().expect("Failed to run Python rncp");

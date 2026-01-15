@@ -293,7 +293,6 @@ fn test_rnx_listen_tcp_server_mode() {
 /// and the need for proper announce propagation. This test verifies basic
 /// connection can be established.
 #[test]
-#[ignore] // Ignored due to timing complexity; run with --ignored
 fn test_rnx_bidirectional_connection() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
@@ -339,15 +338,6 @@ fn test_rnx_bidirectional_connection() {
     // Wait for announce propagation
     std::thread::sleep(Duration::from_secs(5));
 
-    // Try to connect with Python rnx client
-    // Note: This requires rnx to support client mode properly
-    let mut python_cmd = ctx.venv().python_command();
-    python_cmd.args([
-        "-m", "RNS.Utilities.rnx",
-        &rust_hash,
-        "echo", "test123",
-    ]);
-
     // Set up Python config to use the hub
     let python_config_dir = tempfile::tempdir().expect("Failed to create config dir");
     let python_config = format!(
@@ -367,7 +357,17 @@ share_instance = false
     std::fs::write(python_config_dir.path().join("config"), &python_config)
         .expect("Failed to write config");
 
-    python_cmd.env("RNS_CONFIG_DIR", python_config_dir.path());
+    // Try to connect with Python rnx client
+    // Note: This requires rnx to support client mode properly
+    // IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
+    let mut python_cmd = ctx.venv().python_command();
+    python_cmd.args([
+        "-m", "RNS.Utilities.rnx",
+        "--config", python_config_dir.path().to_str().unwrap(),
+        "-w", "30",  // path request timeout
+        &rust_hash,
+        "echo", "test123",
+    ]);
 
     eprintln!("Executing command via Python rnx client...");
     let python_output = python_cmd.output();

@@ -84,24 +84,9 @@ def main():
     # Record initial files in directory
     initial_files = set(os.listdir(save_dir)) if os.path.exists(save_dir) else set()
 
-    # Build rncp command
-    cmd = [
-        sys.executable, '-m', 'RNS.Utilities.rncp',
-        '-l',  # listen mode
-        '-s', save_dir,  # save directory
-        '-b', str(args.announce_interval),  # announce interval
-    ]
-
-    if args.no_auth:
-        cmd.append('-n')
-
-    if args.verbose:
-        cmd.append('-v')
-
-    # Start rncp process
-    env = os.environ.copy()
-
     # Create a temporary config for TCP client connection
+    # IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
+    # (Python RNS doesn't recognize the env var)
     config_dir = tempfile.mkdtemp(prefix='rncp_config_')
     config_file = os.path.join(config_dir, 'config')
 
@@ -121,7 +106,24 @@ share_instance = false
     with open(config_file, 'w') as f:
         f.write(config_content)
 
-    env['RNS_CONFIG_DIR'] = config_dir
+    # Build rncp command with --config argument
+    # Use -u for unbuffered Python output to ensure we see "listening on" immediately
+    cmd = [
+        sys.executable, '-u', '-m', 'RNS.Utilities.rncp',
+        '--config', config_dir,  # use our config directory
+        '-l',  # listen mode
+        '-s', save_dir,  # save directory
+        '-b', str(args.announce_interval),  # announce interval
+    ]
+
+    if args.no_auth:
+        cmd.append('-n')
+
+    if args.verbose:
+        cmd.append('-v')
+
+    # Start rncp process
+    env = os.environ.copy()
 
     received_files = []
 

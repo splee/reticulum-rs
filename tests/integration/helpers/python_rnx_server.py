@@ -30,23 +30,9 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     args = parser.parse_args()
 
-    # Build rnx command
-    cmd = [
-        sys.executable, '-m', 'RNS.Utilities.rnx',
-        '-l',  # listen mode
-        '-b',  # announce/broadcast
-    ]
-
-    if args.noauth:
-        cmd.append('-n')
-
-    if args.verbose:
-        cmd.append('-v')
-
-    # Start rnx process with config for TCP client
-    env = os.environ.copy()
-
     # Create a temporary config for TCP client connection
+    # IMPORTANT: Use --config argument, not RNS_CONFIG_DIR env var
+    # (Python RNS doesn't recognize the env var)
     config_dir = tempfile.mkdtemp(prefix='rnx_config_')
     config_file = os.path.join(config_dir, 'config')
 
@@ -66,7 +52,23 @@ share_instance = false
     with open(config_file, 'w') as f:
         f.write(config_content)
 
-    env['RNS_CONFIG_DIR'] = config_dir
+    # Build rnx command with --config argument
+    # Use -u for unbuffered Python output to ensure we see "listening on" immediately
+    cmd = [
+        sys.executable, '-u', '-m', 'RNS.Utilities.rnx',
+        '--config', config_dir,  # use our config directory
+        '-l',  # listen mode
+        '-b',  # announce/broadcast
+    ]
+
+    if args.noauth:
+        cmd.append('-n')
+
+    if args.verbose:
+        cmd.append('-v')
+
+    # Start rnx process
+    env = os.environ.copy()
 
     try:
         proc = subprocess.Popen(
