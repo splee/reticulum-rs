@@ -46,8 +46,8 @@ impl KaonicGrpc {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
-        let current_config = { context.inner.lock().unwrap().config.clone() };
+        let addr = { context.inner.lock().await.addr.clone() };
+        let current_config = { context.inner.lock().await.config.clone() };
 
         let iface_address = context.channel.address;
 
@@ -55,7 +55,7 @@ impl KaonicGrpc {
 
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
-        let config_channel = context.inner.lock().unwrap().config_channel.clone();
+        let config_channel = context.inner.lock().await.config_channel.clone();
 
         loop {
             if context.cancel.is_cancelled() {

@@ -54,8 +54,8 @@ impl LocalServerInterface {
     /// This function runs until cancelled, accepting new client connections
     /// and spawning a `LocalClientInterface` for each one.
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+        let addr = { context.inner.lock().await.addr.clone() };
+        let iface_manager = { context.inner.lock().await.iface_manager.clone() };
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -197,10 +197,10 @@ impl LocalClientInterface {
     /// For client-side connections, this includes reconnection logic.
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
-        let peer_addr = { context.inner.lock().unwrap().peer_addr.clone() };
-        let connect_addr = { context.inner.lock().unwrap().connect_addr.clone() };
+        let peer_addr = { context.inner.lock().await.peer_addr.clone() };
+        let connect_addr = { context.inner.lock().await.connect_addr.clone() };
         let iface_address = context.channel.address;
-        let mut stream = { context.inner.lock().unwrap().stream.take() };
+        let mut stream = { context.inner.lock().await.stream.take() };
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));

@@ -26,10 +26,10 @@ impl TcpServer {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
+        let addr = { context.inner.lock().await.addr.clone() };
         let iface_address = context.channel.address;
 
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+        let iface_manager = { context.inner.lock().await.iface_manager.clone() };
 
         // Create interface metadata for stats tracking
         let metadata = Arc::new(InterfaceMetadata::new(

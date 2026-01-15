@@ -6,7 +6,6 @@ use packet_cache::PacketCache;
 // PathTable is accessed via PathManager
 use rand_core::OsRng;
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -676,7 +675,7 @@ impl Transport {
         packet: Packet,
         destination_hash: AddressHash,
         hops: u8,
-    ) -> Arc<StdMutex<PacketReceipt>> {
+    ) -> Arc<Mutex<PacketReceipt>> {
         let hash = packet.hash().to_bytes();
         let dest_truncated: [u8; 16] = {
             let slice = destination_hash.as_slice();
@@ -686,7 +685,7 @@ impl Transport {
         };
 
         let receipt = PacketReceipt::new_with_destination(hash, dest_truncated, hops, None);
-        let receipt = self.handler.lock().await.receipt_manager.add(receipt);
+        let receipt = self.handler.lock().await.receipt_manager.add(receipt).await;
 
         self.send_packet(packet).await;
         receipt
@@ -1253,24 +1252,23 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
             arr
         };
 
-        if let Some(receipt) = handler.receipt_manager.get(&truncated_hash) {
+        if let Some(receipt) = handler.receipt_manager.get(&truncated_hash).await {
             // Get the destination identity for proof validation
-            if let Ok(mut receipt_guard) = receipt.lock() {
-                if let Some(dest_hash) = receipt_guard.destination_hash() {
-                    // Look up the destination's identity
-                    let dest_hash_arr = AddressHash::new_from_slice(dest_hash);
-                    if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
-                        let dest_lock = dest.blocking_lock();
-                        let identity = &dest_lock.identity;
-                        let proof_data = packet.data.as_slice();
+            let mut receipt_guard = receipt.lock().await;
+            if let Some(dest_hash) = receipt_guard.destination_hash() {
+                // Look up the destination's identity
+                let dest_hash_arr = AddressHash::new_from_slice(dest_hash);
+                if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
+                    let dest_lock = dest.blocking_lock();
+                    let identity = &dest_lock.identity;
+                    let proof_data = packet.data.as_slice();
 
-                        if receipt_guard.validate_proof(proof_data, identity) {
-                            log::debug!(
-                                "tp({}): validated proof for packet {}",
-                                handler.config.name,
-                                packet.destination
-                            );
-                        }
+                    if receipt_guard.validate_proof(proof_data, identity) {
+                        log::debug!(
+                            "tp({}): validated proof for packet {}",
+                            handler.config.name,
+                            packet.destination
+                        );
                     }
                 }
             }

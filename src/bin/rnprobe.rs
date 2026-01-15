@@ -346,7 +346,7 @@ async fn wait_for_path(transport: &Transport, dest_hash: &AddressHash, timeout: 
 
 /// Wait for proof receipt with spinner animation
 async fn wait_for_proof(
-    receipt: Arc<std::sync::Mutex<reticulum::receipt::PacketReceipt>>,
+    receipt: Arc<tokio::sync::Mutex<reticulum::receipt::PacketReceipt>>,
     timeout: Duration,
 ) -> Option<Duration> {
     let spinner = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
@@ -355,7 +355,7 @@ async fn wait_for_proof(
 
     while start.elapsed() < timeout {
         {
-            let r = receipt.lock().unwrap();
+            let r = receipt.lock().await;
             if r.is_delivered() {
                 return r.rtt();
             }
@@ -372,7 +372,8 @@ async fn wait_for_proof(
     }
 
     // Mark as timed out
-    if let Ok(mut r) = receipt.lock() {
+    {
+        let mut r = receipt.lock().await;
         r.check_timeout();
     }
 

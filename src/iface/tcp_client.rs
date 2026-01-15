@@ -43,9 +43,9 @@ impl TcpClient {
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
-        let addr = { context.inner.lock().unwrap().addr.clone() };
+        let addr = { context.inner.lock().await.addr.clone() };
         let iface_address = context.channel.address;
-        let mut stream = { context.inner.lock().unwrap().stream.take() };
+        let mut stream = { context.inner.lock().await.stream.take() };
 
         // Create interface metadata for stats tracking
         let metadata = Arc::new(InterfaceMetadata::new(

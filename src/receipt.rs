@@ -3,8 +3,10 @@
 //! This module provides PacketReceipt functionality for tracking packet delivery
 //! and validating proofs, matching the Python implementation.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::Mutex;
 
 use crate::identity::{Identity, PrivateIdentity};
 
@@ -382,101 +384,97 @@ pub fn generate_proof(
 }
 
 /// Manager for tracking multiple packet receipts
-#[derive(Debug, Default)]
+///
+/// Uses tokio async primitives to avoid blocking the async runtime.
+#[derive(Debug)]
 pub struct ReceiptManager {
     /// Active receipts (truncated hash -> receipt)
-    receipts: RwLock<std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceipt>>>>,
+    receipts: tokio::sync::RwLock<std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceipt>>>>,
     /// Maximum number of receipts to track
     max_receipts: usize,
+}
+
+impl Default for ReceiptManager {
+    fn default() -> Self {
+        Self::new(1000)
+    }
 }
 
 impl ReceiptManager {
     /// Create a new receipt manager
     pub fn new(max_receipts: usize) -> Self {
         Self {
-            receipts: RwLock::new(std::collections::HashMap::new()),
+            receipts: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             max_receipts,
         }
     }
 
     /// Add a receipt to the manager
-    pub fn add(&self, receipt: PacketReceipt) -> Arc<Mutex<PacketReceipt>> {
+    pub async fn add(&self, receipt: PacketReceipt) -> Arc<Mutex<PacketReceipt>> {
         let hash = *receipt.truncated_hash();
         let receipt = Arc::new(Mutex::new(receipt));
 
-        if let Ok(mut receipts) = self.receipts.write() {
-            // Cull old receipts if at capacity
-            if receipts.len() >= self.max_receipts {
-                self.cull_oldest(&mut receipts);
-            }
+        let mut receipts = self.receipts.write().await;
 
-            receipts.insert(hash, receipt.clone());
+        // Cull old receipts if at capacity
+        if receipts.len() >= self.max_receipts {
+            self.cull_oldest(&mut receipts).await;
         }
+
+        receipts.insert(hash, receipt.clone());
 
         receipt
     }
 
     /// Get a receipt by its truncated hash
-    pub fn get(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
-        self.receipts
-            .read()
-            .ok()
-            .and_then(|r| r.get(truncated_hash).cloned())
+    pub async fn get(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
+        self.receipts.read().await.get(truncated_hash).cloned()
     }
 
     /// Remove a receipt by its truncated hash
-    pub fn remove(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
-        self.receipts
-            .write()
-            .ok()
-            .and_then(|mut r| r.remove(truncated_hash))
+    pub async fn remove(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
+        self.receipts.write().await.remove(truncated_hash)
     }
 
     /// Check all receipts for timeouts
-    pub fn check_timeouts(&self) {
-        if let Ok(receipts) = self.receipts.read() {
-            for receipt in receipts.values() {
-                if let Ok(mut r) = receipt.lock() {
-                    r.check_timeout();
-                }
-            }
+    pub async fn check_timeouts(&self) {
+        let receipts = self.receipts.read().await;
+        for receipt in receipts.values() {
+            let mut r = receipt.lock().await;
+            r.check_timeout();
         }
     }
 
     /// Cull the oldest receipts to make room
-    fn cull_oldest(
+    async fn cull_oldest(
         &self,
         receipts: &mut std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceipt>>>,
     ) {
         // Find concluded receipts to remove
-        let to_remove: Vec<[u8; 16]> = receipts
-            .iter()
-            .filter_map(|(hash, receipt)| {
-                receipt
-                    .lock()
-                    .ok()
-                    .filter(|r| r.is_concluded())
-                    .map(|_| *hash)
-            })
-            .collect();
+        let mut to_remove = Vec::new();
+        for (hash, receipt) in receipts.iter() {
+            let r = receipt.lock().await;
+            if r.is_concluded() {
+                to_remove.push(*hash);
+            }
+        }
 
         for hash in to_remove.iter().take(self.max_receipts / 4) {
             if let Some(receipt) = receipts.remove(hash) {
-                if let Ok(mut r) = receipt.lock() {
-                    r.cull();
-                }
+                let mut r = receipt.lock().await;
+                r.cull();
             }
         }
     }
 
     /// Get the number of active receipts
-    pub fn len(&self) -> usize {
-        self.receipts.read().map(|r| r.len()).unwrap_or(0)
+    pub async fn len(&self) -> usize {
+        self.receipts.read().await.len()
     }
 
     /// Check if the manager is empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 }
 
@@ -510,21 +508,21 @@ mod tests {
         assert!(receipt.is_concluded());
     }
 
-    #[test]
-    fn test_receipt_manager() {
+    #[tokio::test]
+    async fn test_receipt_manager() {
         let manager = ReceiptManager::new(100);
 
         let hash = [0u8; HASH_LENGTH];
         let receipt = PacketReceipt::new(hash, 0, false, None);
         let truncated = *receipt.truncated_hash();
 
-        manager.add(receipt);
+        manager.add(receipt).await;
 
-        assert_eq!(manager.len(), 1);
-        assert!(manager.get(&truncated).is_some());
+        assert_eq!(manager.len().await, 1);
+        assert!(manager.get(&truncated).await.is_some());
 
-        manager.remove(&truncated);
-        assert!(manager.get(&truncated).is_none());
+        manager.remove(&truncated).await;
+        assert!(manager.get(&truncated).await.is_none());
     }
 
     #[test]

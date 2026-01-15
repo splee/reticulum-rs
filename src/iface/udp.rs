@@ -32,8 +32,8 @@ impl UdpInterface {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let bind_addr = { context.inner.lock().unwrap().bind_addr.clone() };
-        let forward_addr = { context.inner.lock().unwrap().forward_addr.clone() };
+        let bind_addr = { context.inner.lock().await.bind_addr.clone() };
+        let forward_addr = { context.inner.lock().await.forward_addr.clone() };
         let iface_address = context.channel.address;
 
         // Create interface metadata for stats tracking

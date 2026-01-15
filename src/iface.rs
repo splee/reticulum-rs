@@ -14,9 +14,9 @@ pub use registry::{InterfaceRegistry, InterfaceStatsSnapshot};
 pub use stats::{InterfaceMetadata, InterfaceMode};
 
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
