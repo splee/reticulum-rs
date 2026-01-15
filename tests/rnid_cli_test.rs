@@ -84,17 +84,22 @@ fn test_version_flag() {
 
 #[test]
 fn test_generate_identity() {
+    let temp = temp_dir();
+    let identity_file = temp.join("test_identity.dat");
+
+    // Generate identity with -p to print info
     let output = Command::new(rnid_binary())
-        .arg("-g")
+        .args(["-g", identity_file.to_str().unwrap(), "-p"])
         .output()
         .expect("Failed to execute rnid");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Identity generated successfully"));
     assert!(stdout.contains("Address Hash:"));
     assert!(stdout.contains("Public Key:"));
     assert!(stdout.contains("Verifying Key:"));
+
+    cleanup(&temp);
 }
 
 #[test]
@@ -103,7 +108,7 @@ fn test_generate_and_save_identity() {
     let identity_file = temp.join("test_identity.dat");
 
     let output = Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to execute rnid");
 
@@ -119,8 +124,18 @@ fn test_generate_and_save_identity() {
 
 #[test]
 fn test_generate_with_base64_export() {
+    let temp = temp_dir();
+    let identity_file = temp.join("test_identity.dat");
+
+    // Generate identity first
+    Command::new(rnid_binary())
+        .args(["-g", identity_file.to_str().unwrap()])
+        .output()
+        .expect("Failed to generate identity");
+
+    // Export as base64
     let output = Command::new(rnid_binary())
-        .args(["-g", "-x", "-b"])
+        .args(["-i", identity_file.to_str().unwrap(), "-x", "-b"])
         .output()
         .expect("Failed to execute rnid");
 
@@ -135,6 +150,8 @@ fn test_generate_with_base64_export() {
         line.len() > 80 && line.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
     });
     assert!(has_base64);
+
+    cleanup(&temp);
 }
 
 // =============================================================================
@@ -148,7 +165,7 @@ fn test_print_identity_info() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -173,7 +190,7 @@ fn test_export_hex_format() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -209,7 +226,7 @@ fn test_sign_and_verify_file() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -257,7 +274,7 @@ fn test_verify_invalid_signature() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -286,6 +303,7 @@ fn test_verify_invalid_signature() {
         .expect("Failed to verify signature");
 
     assert!(!verify_output.status.success());
+    // "INVALID" message is printed to stderr
     let stderr = String::from_utf8_lossy(&verify_output.stderr);
     assert!(stderr.contains("INVALID"));
 
@@ -306,7 +324,7 @@ fn test_encrypt_and_decrypt_file() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -361,12 +379,12 @@ fn test_decrypt_with_wrong_identity_fails() {
 
     // Generate two different identities
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity1_file.to_str().unwrap()])
+        .args(["-g", identity1_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity1");
 
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity2_file.to_str().unwrap()])
+        .args(["-g", identity2_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity2");
 
@@ -407,7 +425,7 @@ fn test_destination_hash() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -438,7 +456,7 @@ fn test_destination_hash_deterministic() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -515,7 +533,7 @@ fn test_force_overwrite() {
 
     // Generate first identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate first identity");
 
@@ -523,7 +541,7 @@ fn test_force_overwrite() {
 
     // Try to generate again without -f (should fail or warn)
     let output_no_force = Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to execute rnid");
 
@@ -531,7 +549,7 @@ fn test_force_overwrite() {
 
     // Generate with -f (should succeed)
     let output_force = Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap(), "-f"])
+        .args(["-g", identity_file.to_str().unwrap(), "-f"])
         .output()
         .expect("Failed to execute rnid");
 
@@ -555,7 +573,7 @@ fn test_base32_encoding() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
@@ -591,7 +609,7 @@ fn test_print_private_key() {
 
     // Generate identity
     Command::new(rnid_binary())
-        .args(["-g", "-w", identity_file.to_str().unwrap()])
+        .args(["-g", identity_file.to_str().unwrap()])
         .output()
         .expect("Failed to generate identity");
 
