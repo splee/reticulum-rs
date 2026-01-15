@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::cli::format::format_hash;
-use reticulum::destination::link::LinkEvent;
+use reticulum::destination::link::{Link, LinkEvent};
 use reticulum::hash::AddressHash;
 use reticulum::resource::{Resource, ResourceConfig};
 use reticulum::transport::{Transport, TransportConfig};
@@ -25,6 +25,71 @@ use crate::protocol::{
     setup_transport_interfaces, wait_for_announce, wait_for_link_activation, ProtocolError,
 };
 use crate::APP_NAME;
+
+/// Handle a resource request event by sending requested parts.
+///
+/// Returns the number of parts sent, or None if the request failed.
+async fn handle_resource_request(
+    transport: &Transport,
+    link: &Arc<tokio::sync::Mutex<Link>>,
+    resource: &Arc<tokio::sync::Mutex<Resource>>,
+    payload: &[u8],
+    progress: &mut TransferProgress,
+    total_parts: usize,
+    parts_sent: &mut usize,
+) -> Option<()> {
+    log::info!("Received resource request ({} bytes)", payload.len());
+
+    // Handle request and collect parts to send
+    let parts_to_send = {
+        let mut resource_guard = resource.lock().await;
+        match resource_guard.handle_request(payload) {
+            Ok((_wants_more_hashmap, part_indices)) => {
+                let parts: Vec<_> = part_indices
+                    .iter()
+                    .filter_map(|&idx| {
+                        resource_guard
+                            .get_part_data(idx)
+                            .map(|d| (idx, d.to_vec()))
+                    })
+                    .collect();
+                parts
+            }
+            Err(e) => {
+                log::error!("Failed to handle resource request: {:?}", e);
+                return None;
+            }
+        }
+    };
+
+    // Send requested parts
+    for (part_idx, part_data) in parts_to_send {
+        let part_size = part_data.len();
+        let link_guard = link.lock().await;
+        match link_guard.resource_data_packet(&part_data) {
+            Ok(packet) => {
+                drop(link_guard);
+                transport.send_packet(packet).await;
+                *parts_sent += 1;
+
+                progress.update(part_size);
+                progress.display();
+
+                log::debug!(
+                    "Sent part {}/{}, total sent: {}",
+                    part_idx,
+                    total_parts,
+                    *parts_sent
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to create resource data packet: {:?}", e);
+            }
+        }
+    }
+
+    Some(())
+}
 
 /// Run rncp in send mode.
 ///
@@ -235,59 +300,16 @@ pub async fn run_send_mode(
                 if event.id == link_id {
                     match event.event {
                         LinkEvent::ResourceRequest(payload) => {
-                            log::info!(
-                                "Received resource request ({} bytes)",
-                                payload.len()
-                            );
-
-                            let mut resource_guard = resource.lock().await;
-                            match resource_guard.handle_request(payload.as_slice()) {
-                                Ok((_wants_more_hashmap, part_indices)) => {
-                                    // Collect parts to send
-                                    let parts_to_send: Vec<_> = part_indices
-                                        .iter()
-                                        .filter_map(|&idx| {
-                                            resource_guard
-                                                .get_part_data(idx)
-                                                .map(|d| (idx, d.to_vec()))
-                                        })
-                                        .collect();
-                                    drop(resource_guard);
-
-                                    // Send requested parts
-                                    for (part_idx, part_data) in parts_to_send {
-                                        let part_size = part_data.len();
-                                        let link_guard = link.lock().await;
-                                        match link_guard.resource_data_packet(&part_data) {
-                                            Ok(packet) => {
-                                                drop(link_guard);
-                                                transport.send_packet(packet).await;
-                                                parts_sent += 1;
-
-                                                // Update progress
-                                                progress.update(part_size);
-                                                progress.display();
-
-                                                log::debug!(
-                                                    "Sent part {}/{}, total sent: {}",
-                                                    part_idx,
-                                                    total_parts,
-                                                    parts_sent
-                                                );
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "Failed to create resource data packet: {:?}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to handle resource request: {:?}", e);
-                                }
-                            }
+                            handle_resource_request(
+                                &transport,
+                                &link,
+                                &resource,
+                                payload.as_slice(),
+                                &mut progress,
+                                total_parts,
+                                &mut parts_sent,
+                            )
+                            .await;
                         }
                         LinkEvent::ResourceProof(payload) => {
                             log::info!("Received resource proof");
