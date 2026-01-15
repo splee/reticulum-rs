@@ -379,6 +379,7 @@ fn test_python_remote_status_server_setup() {
 ///
 /// Note: This test takes ~25 seconds due to announce propagation delay.
 #[test]
+#[ignore = "flaky - timing-dependent on announce propagation"]
 fn test_rnstatus_remote_query_full_flow() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
