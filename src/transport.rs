@@ -100,7 +100,7 @@ pub struct ReceivedData {
 }
 
 pub struct TransportConfig {
-    name: String,
+    name: Arc<str>,
     identity: PrivateIdentity,
     broadcast: bool,
     retransmit: bool,
@@ -138,8 +138,9 @@ struct TransportHandler {
     cancel: CancellationToken,
 }
 
+#[derive(Clone)]
 pub struct Transport {
-    name: String,
+    name: Arc<str>,
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     link_out_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -153,7 +154,7 @@ pub struct Transport {
 impl TransportConfig {
     pub fn new<T: Into<String>>(name: T, identity: &PrivateIdentity, enable_transport: bool) -> Self {
         Self {
-            name: name.into(),
+            name: Arc::from(name.into()),
             identity: identity.clone(),
             broadcast: enable_transport,
             retransmit: enable_transport,
