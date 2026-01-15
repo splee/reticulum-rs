@@ -1349,3 +1349,493 @@ fn validate_proof_packet(
 
     Ok(identity)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tests for LinkPayload buffer wrapper.
+    mod link_payload {
+        use super::*;
+
+        #[test]
+        fn test_new_creates_empty_payload() {
+            let payload = LinkPayload::new();
+            assert_eq!(payload.len(), 0);
+            assert!(payload.is_empty());
+        }
+
+        #[test]
+        fn test_default_creates_empty_payload() {
+            let payload = LinkPayload::default();
+            assert_eq!(payload.len(), 0);
+            assert!(payload.is_empty());
+        }
+
+        #[test]
+        fn test_new_from_slice_copies_data() {
+            let data = [1u8, 2, 3, 4, 5];
+            let payload = LinkPayload::new_from_slice(&data);
+            assert_eq!(payload.len(), 5);
+            assert!(!payload.is_empty());
+            assert_eq!(payload.as_slice(), &data);
+        }
+
+        #[test]
+        fn test_new_from_slice_empty() {
+            let payload = LinkPayload::new_from_slice(&[]);
+            assert_eq!(payload.len(), 0);
+            assert!(payload.is_empty());
+        }
+
+        #[test]
+        fn test_new_from_slice_truncates_overflow() {
+            // Create data larger than PACKET_MDU
+            let data = vec![0xABu8; PACKET_MDU + 100];
+            let payload = LinkPayload::new_from_slice(&data);
+            // Should truncate to PACKET_MDU
+            assert_eq!(payload.len(), PACKET_MDU);
+            assert_eq!(payload.as_slice().len(), PACKET_MDU);
+        }
+
+        #[test]
+        fn test_new_from_vec_copies_data() {
+            let data = vec![10u8, 20, 30, 40];
+            let payload = LinkPayload::new_from_vec(&data);
+            assert_eq!(payload.len(), 4);
+            assert_eq!(payload.as_slice(), &[10, 20, 30, 40]);
+        }
+
+        #[test]
+        fn test_new_from_vec_max_size() {
+            let data = vec![0x42u8; PACKET_MDU];
+            let payload = LinkPayload::new_from_vec(&data);
+            assert_eq!(payload.len(), PACKET_MDU);
+        }
+
+        #[test]
+        fn test_as_slice_returns_correct_portion() {
+            let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+            let payload = LinkPayload::new_from_slice(&data);
+            let slice = payload.as_slice();
+            assert_eq!(slice.len(), 8);
+            assert_eq!(slice, &data);
+        }
+
+        #[test]
+        fn test_clone() {
+            let data = [1u8, 2, 3];
+            let payload1 = LinkPayload::new_from_slice(&data);
+            let payload2 = payload1.clone();
+            assert_eq!(payload1.as_slice(), payload2.as_slice());
+        }
+    }
+
+    /// Tests for LinkStatus enum.
+    mod link_status {
+        use super::*;
+
+        #[test]
+        fn test_status_values() {
+            assert_eq!(LinkStatus::Pending as u8, 0x00);
+            assert_eq!(LinkStatus::Handshake as u8, 0x01);
+            assert_eq!(LinkStatus::Active as u8, 0x02);
+            assert_eq!(LinkStatus::Stale as u8, 0x03);
+            assert_eq!(LinkStatus::Closed as u8, 0x04);
+        }
+
+        #[test]
+        fn test_not_yet_active_pending() {
+            assert!(LinkStatus::Pending.not_yet_active());
+        }
+
+        #[test]
+        fn test_not_yet_active_handshake() {
+            assert!(LinkStatus::Handshake.not_yet_active());
+        }
+
+        #[test]
+        fn test_not_yet_active_active() {
+            assert!(!LinkStatus::Active.not_yet_active());
+        }
+
+        #[test]
+        fn test_not_yet_active_stale() {
+            assert!(!LinkStatus::Stale.not_yet_active());
+        }
+
+        #[test]
+        fn test_not_yet_active_closed() {
+            assert!(!LinkStatus::Closed.not_yet_active());
+        }
+
+        #[test]
+        fn test_status_equality() {
+            assert_eq!(LinkStatus::Active, LinkStatus::Active);
+            assert_ne!(LinkStatus::Active, LinkStatus::Pending);
+        }
+
+        #[test]
+        fn test_status_clone_copy() {
+            let status = LinkStatus::Active;
+            let cloned = status.clone();
+            let copied = status;
+            assert_eq!(status, cloned);
+            assert_eq!(status, copied);
+        }
+    }
+
+    /// Tests for LinkId derivation from Packet.
+    mod link_id {
+        use super::*;
+
+        #[test]
+        fn test_link_id_from_packet_deterministic() {
+            let mut packet = Packet::default();
+            packet.data.safe_write(&[0u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let id1 = LinkId::from(&packet);
+            let id2 = LinkId::from(&packet);
+            assert_eq!(id1, id2);
+        }
+
+        #[test]
+        fn test_link_id_from_different_packets_differ() {
+            let mut packet1 = Packet::default();
+            packet1.data.safe_write(&[1u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let mut packet2 = Packet::default();
+            packet2.data.safe_write(&[2u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let id1 = LinkId::from(&packet1);
+            let id2 = LinkId::from(&packet2);
+            assert_ne!(id1, id2);
+        }
+
+        #[test]
+        fn test_link_id_uses_truncated_data() {
+            // Link ID only uses first PUBLIC_KEY_LENGTH * 2 bytes of data
+            let mut packet1 = Packet::default();
+            let mut data1 = [0u8; PUBLIC_KEY_LENGTH * 2 + 100];
+            data1[..PUBLIC_KEY_LENGTH * 2].fill(0xAA);
+            data1[PUBLIC_KEY_LENGTH * 2..].fill(0xBB);
+            packet1.data.safe_write(&data1);
+
+            let mut packet2 = Packet::default();
+            let mut data2 = [0u8; PUBLIC_KEY_LENGTH * 2 + 100];
+            data2[..PUBLIC_KEY_LENGTH * 2].fill(0xAA);
+            data2[PUBLIC_KEY_LENGTH * 2..].fill(0xCC); // Different trailing bytes
+            packet2.data.safe_write(&data2);
+
+            let id1 = LinkId::from(&packet1);
+            let id2 = LinkId::from(&packet2);
+            // IDs should be the same because trailing bytes are ignored
+            assert_eq!(id1, id2);
+        }
+
+        #[test]
+        fn test_link_id_affected_by_destination() {
+            let mut packet1 = Packet::default();
+            packet1.destination = AddressHash::new([0u8; 16]);
+            packet1.data.safe_write(&[0u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let mut packet2 = Packet::default();
+            packet2.destination = AddressHash::new([1u8; 16]);
+            packet2.data.safe_write(&[0u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let id1 = LinkId::from(&packet1);
+            let id2 = LinkId::from(&packet2);
+            assert_ne!(id1, id2);
+        }
+
+        #[test]
+        fn test_link_id_affected_by_context() {
+            let mut packet1 = Packet::default();
+            packet1.context = PacketContext::None;
+            packet1.data.safe_write(&[0u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let mut packet2 = Packet::default();
+            packet2.context = PacketContext::Resource;
+            packet2.data.safe_write(&[0u8; PUBLIC_KEY_LENGTH * 2]);
+
+            let id1 = LinkId::from(&packet1);
+            let id2 = LinkId::from(&packet2);
+            assert_ne!(id1, id2);
+        }
+    }
+
+    /// Tests for LinkEvent variants.
+    mod link_event {
+        use super::*;
+
+        #[test]
+        fn test_event_data_payload() {
+            let payload = LinkPayload::new_from_slice(&[1, 2, 3]);
+            let event = LinkEvent::Data(payload.clone());
+            if let LinkEvent::Data(p) = event {
+                assert_eq!(p.as_slice(), &[1, 2, 3]);
+            } else {
+                panic!("Expected Data event");
+            }
+        }
+
+        #[test]
+        fn test_event_channel_payload() {
+            let payload = LinkPayload::new_from_slice(&[4, 5, 6]);
+            let event = LinkEvent::Channel(payload.clone());
+            if let LinkEvent::Channel(p) = event {
+                assert_eq!(p.as_slice(), &[4, 5, 6]);
+            } else {
+                panic!("Expected Channel event");
+            }
+        }
+
+        #[test]
+        fn test_event_clone() {
+            let event1 = LinkEvent::Activated;
+            let event2 = event1.clone();
+            if let (LinkEvent::Activated, LinkEvent::Activated) = (&event1, &event2) {
+                // Both are Activated
+            } else {
+                panic!("Clone failed");
+            }
+        }
+    }
+
+    /// Tests for Link lifecycle and basic operations.
+    mod link_lifecycle {
+        use super::*;
+        use crate::destination::DestinationName;
+
+        pub(super) fn create_test_destination() -> DestinationDesc {
+            let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+            let identity = *priv_identity.as_identity();
+            DestinationDesc {
+                address_hash: identity.address_hash,
+                identity,
+                name: DestinationName::new("test", "link"),
+            }
+        }
+
+        #[test]
+        fn test_link_new_initial_state() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest.clone(), tx);
+
+            assert_eq!(link.status(), LinkStatus::Pending);
+            assert!(link.is_initiator());
+            assert!(link.id().as_slice().iter().all(|&b| b == 0)); // Empty ID initially
+            assert_eq!(link.outgoing_resource_count(), 0);
+            assert_eq!(link.incoming_resource_count(), 0);
+        }
+
+        #[test]
+        fn test_link_request_creates_packet() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest.clone(), tx);
+
+            let packet = link.request();
+
+            assert_eq!(packet.header.packet_type, PacketType::LinkRequest);
+            assert_eq!(packet.destination, dest.address_hash);
+            assert_eq!(packet.context, PacketContext::None);
+            // Data should contain public key + verifying key (64 bytes)
+            assert_eq!(packet.data.len(), PUBLIC_KEY_LENGTH * 2);
+        }
+
+        #[test]
+        fn test_link_request_sets_id() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest.clone(), tx);
+
+            // ID is empty before request
+            assert!(link.id().as_slice().iter().all(|&b| b == 0));
+
+            let packet = link.request();
+            let expected_id = LinkId::from(&packet);
+
+            // ID should be set after request
+            assert_eq!(*link.id(), expected_id);
+        }
+
+        #[test]
+        fn test_link_close_sets_status() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            link.close();
+
+            assert_eq!(link.status(), LinkStatus::Closed);
+        }
+
+        #[test]
+        fn test_link_restart_sets_pending() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            link.close();
+            assert_eq!(link.status(), LinkStatus::Closed);
+
+            link.restart();
+            assert_eq!(link.status(), LinkStatus::Pending);
+        }
+
+        #[test]
+        fn test_link_mdu() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let mdu = link.mdu();
+            // MDU should be PACKET_MDU minus encryption overhead (~64 bytes)
+            assert!(mdu > 0);
+            assert!(mdu < PACKET_MDU);
+            assert_eq!(mdu, PACKET_MDU - 64);
+        }
+
+        #[test]
+        fn test_link_ready_for_new_resource_inactive() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // Link is not active, should not be ready
+            assert!(!link.ready_for_new_resource());
+        }
+
+        #[test]
+        fn test_link_keep_alive_packet() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let packet = link.keep_alive_packet(0xFF);
+
+            assert_eq!(packet.header.packet_type, PacketType::Data);
+            assert_eq!(packet.header.destination_type, DestinationType::Link);
+            assert_eq!(packet.context, PacketContext::KeepAlive);
+            assert_eq!(packet.data.len(), 1);
+            assert_eq!(packet.data.as_slice()[0], 0xFF);
+        }
+
+        #[test]
+        fn test_link_elapsed() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let elapsed = link.elapsed();
+            // Should be very small (just created)
+            assert!(elapsed.as_secs() < 1);
+        }
+
+        #[test]
+        fn test_link_rtt_initial() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert_eq!(link.rtt(), Duration::from_secs(0));
+        }
+
+        #[test]
+        fn test_link_destination() {
+            let dest = create_test_destination();
+            let expected_hash = dest.address_hash;
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert_eq!(link.destination().address_hash, expected_hash);
+        }
+
+        #[test]
+        fn test_link_remote_identity_initial() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert!(link.remote_identity().is_none());
+            assert!(link.remote_identity_hash().is_none());
+        }
+    }
+
+    /// Tests for Link handle result.
+    mod link_handle_result {
+        use super::*;
+
+        #[test]
+        fn test_handle_result_variants_exist() {
+            // Just verify the enum variants exist
+            let _none = LinkHandleResult::None;
+            let _activated = LinkHandleResult::Activated;
+            let _keepalive = LinkHandleResult::KeepAlive;
+        }
+    }
+
+    /// Tests for resource management constants.
+    mod resource_management {
+        use super::*;
+
+        #[test]
+        fn test_max_outgoing_resources_constant() {
+            assert_eq!(MAX_OUTGOING_RESOURCES, 16);
+        }
+
+        #[test]
+        fn test_link_resource_counts_initial() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert_eq!(link.outgoing_resource_count(), 0);
+            assert_eq!(link.incoming_resource_count(), 0);
+        }
+
+        #[test]
+        fn test_link_has_no_resources_initially() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let resource_id: ResourceId = [0u8; 16];
+            assert!(!link.has_outgoing_resource(&resource_id));
+            assert!(!link.has_incoming_resource(&resource_id));
+        }
+
+        #[test]
+        fn test_link_get_nonexistent_resource() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let resource_id: ResourceId = [0u8; 16];
+            assert!(link.get_outgoing_resource(&resource_id).is_none());
+            assert!(link.get_incoming_resource(&resource_id).is_none());
+        }
+
+        #[test]
+        fn test_link_get_last_resource_window() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // Initial window should be the default
+            let window = link.get_last_resource_window();
+            assert!(window > 0);
+        }
+
+        #[test]
+        fn test_link_get_last_resource_eifr_initial() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert!(link.get_last_resource_eifr().is_none());
+        }
+    }
+}

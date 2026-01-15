@@ -259,3 +259,503 @@ impl<'a> InputBuffer<'a> {
         self.buffer.len() - self.offset
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== StaticBuffer Tests ====================
+
+    mod static_buffer {
+        use super::*;
+
+        // Basic operations
+        #[test]
+        fn test_new_creates_empty_buffer() {
+            let buffer = StaticBuffer::<256>::new();
+            assert_eq!(buffer.len(), 0);
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn test_new_from_slice_copies_data() {
+            let data = [1u8, 2, 3, 4, 5];
+            let buffer = StaticBuffer::<256>::new_from_slice(&data);
+            assert_eq!(buffer.len(), 5);
+            assert_eq!(buffer.as_slice(), &data);
+        }
+
+        #[test]
+        fn test_new_from_slice_truncates_overflow() {
+            let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            let buffer = StaticBuffer::<5>::new_from_slice(&data);
+            assert_eq!(buffer.len(), 5);
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn test_reset_clears_buffer() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            assert_eq!(buffer.len(), 3);
+            buffer.reset();
+            assert_eq!(buffer.len(), 0);
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn test_default_creates_empty_buffer() {
+            let buffer = StaticBuffer::<256>::default();
+            assert_eq!(buffer.len(), 0);
+            assert!(buffer.is_empty());
+        }
+
+        // Write operations
+        #[test]
+        fn test_write_single_byte() {
+            let mut buffer = StaticBuffer::<256>::new();
+            let result = buffer.write(&[42]);
+            assert_eq!(result, Ok(1));
+            assert_eq!(buffer.len(), 1);
+            assert_eq!(buffer.as_slice(), &[42]);
+        }
+
+        #[test]
+        fn test_write_multiple_bytes() {
+            let mut buffer = StaticBuffer::<256>::new();
+            buffer.write(&[1, 2, 3]).unwrap();
+            buffer.write(&[4, 5]).unwrap();
+            assert_eq!(buffer.len(), 5);
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn test_write_exact_capacity() {
+            let mut buffer = StaticBuffer::<5>::new();
+            let result = buffer.write(&[1, 2, 3, 4, 5]);
+            assert_eq!(result, Ok(5));
+            assert_eq!(buffer.len(), 5);
+        }
+
+        #[test]
+        fn test_write_overflow_returns_error() {
+            let mut buffer = StaticBuffer::<5>::new();
+            buffer.write(&[1, 2, 3]).unwrap();
+            let result = buffer.write(&[4, 5, 6]);
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+            assert_eq!(buffer.len(), 3); // Unchanged
+        }
+
+        #[test]
+        fn test_write_empty_data() {
+            let mut buffer = StaticBuffer::<256>::new();
+            let result = buffer.write(&[]);
+            assert_eq!(result, Ok(0));
+            assert_eq!(buffer.len(), 0);
+        }
+
+        #[test]
+        fn test_chain_write_returns_self() {
+            let mut buffer = StaticBuffer::<256>::new();
+            buffer
+                .chain_write(&[1, 2])
+                .unwrap()
+                .chain_write(&[3, 4])
+                .unwrap();
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
+        }
+
+        // Safe write operations
+        #[test]
+        fn test_safe_write_returns_bytes_written() {
+            let mut buffer = StaticBuffer::<256>::new();
+            let written = buffer.safe_write(&[1, 2, 3]);
+            assert_eq!(written, 3);
+        }
+
+        #[test]
+        fn test_safe_write_truncates_overflow() {
+            let mut buffer = StaticBuffer::<5>::new();
+            buffer.safe_write(&[1, 2, 3]);
+            let written = buffer.safe_write(&[4, 5, 6, 7, 8]);
+            assert_eq!(written, 2); // Only 2 bytes fit
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn test_safe_write_when_full() {
+            let mut buffer = StaticBuffer::<3>::new();
+            buffer.safe_write(&[1, 2, 3]);
+            let written = buffer.safe_write(&[4]);
+            assert_eq!(written, 0);
+        }
+
+        #[test]
+        fn test_chain_safe_write_returns_self() {
+            let mut buffer = StaticBuffer::<256>::new();
+            buffer.chain_safe_write(&[1, 2]).chain_safe_write(&[3, 4]);
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
+        }
+
+        // Resize operations
+        #[test]
+        fn test_resize_increases_length() {
+            let mut buffer = StaticBuffer::<256>::new();
+            buffer.resize(100);
+            assert_eq!(buffer.len(), 100);
+        }
+
+        #[test]
+        fn test_resize_decreases_length() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3, 4, 5]);
+            buffer.resize(2);
+            assert_eq!(buffer.len(), 2);
+        }
+
+        #[test]
+        fn test_resize_clamps_to_capacity() {
+            let mut buffer = StaticBuffer::<10>::new();
+            buffer.resize(100);
+            assert_eq!(buffer.len(), 10);
+        }
+
+        #[test]
+        fn test_resize_to_zero() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            buffer.resize(0);
+            assert_eq!(buffer.len(), 0);
+        }
+
+        // Rotate operations
+        #[test]
+        fn test_rotate_left_basic() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3, 4, 5]);
+            let result = buffer.rotate_left(2);
+            assert_eq!(result, Ok(3));
+            assert_eq!(buffer.len(), 3);
+            assert_eq!(buffer.as_slice(), &[3, 4, 5]);
+        }
+
+        #[test]
+        fn test_rotate_left_full_length() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            let result = buffer.rotate_left(3);
+            assert_eq!(result, Ok(0));
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn test_rotate_left_zero() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            let result = buffer.rotate_left(0);
+            assert_eq!(result, Ok(3));
+            assert_eq!(buffer.as_slice(), &[1, 2, 3]);
+        }
+
+        #[test]
+        fn test_rotate_left_beyond_length_errors() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            let result = buffer.rotate_left(5);
+            assert_eq!(result, Err(RnsError::InvalidArgument));
+        }
+
+        // Slice access
+        #[test]
+        fn test_as_slice_returns_valid_data() {
+            let buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            assert_eq!(buffer.as_slice(), &[1, 2, 3]);
+        }
+
+        #[test]
+        fn test_as_mut_slice_allows_modification() {
+            let mut buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            buffer.as_mut_slice()[0] = 99;
+            assert_eq!(buffer.as_slice(), &[99, 2, 3]);
+        }
+
+        #[test]
+        fn test_accuire_buf_sets_length() {
+            let mut buffer = StaticBuffer::<256>::new();
+            let slice = buffer.accuire_buf(10);
+            assert_eq!(slice.len(), 10);
+            assert_eq!(buffer.len(), 10);
+        }
+
+        #[test]
+        fn test_accuire_buf_max_fills_buffer() {
+            let mut buffer = StaticBuffer::<64>::new();
+            let slice = buffer.accuire_buf_max();
+            assert_eq!(slice.len(), 64);
+            assert_eq!(buffer.len(), 64);
+        }
+
+        // Display
+        #[test]
+        fn test_display_empty_buffer() {
+            let buffer = StaticBuffer::<256>::new();
+            let display = format!("{}", buffer);
+            assert_eq!(display, "[ 0x ]");
+        }
+
+        #[test]
+        fn test_display_with_data() {
+            let buffer = StaticBuffer::<256>::new_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            let display = format!("{}", buffer);
+            assert_eq!(display, "[ 0xdeadbeef ]");
+        }
+
+        #[test]
+        fn test_finalize_returns_self() {
+            let buffer = StaticBuffer::<256>::new_from_slice(&[1, 2, 3]);
+            let finalized = buffer.finalize();
+            assert_eq!(finalized.as_slice(), &[1, 2, 3]);
+        }
+    }
+
+    // ==================== OutputBuffer Tests ====================
+
+    mod output_buffer {
+        use super::*;
+
+        #[test]
+        fn test_new_starts_at_zero() {
+            let mut backing = [0u8; 256];
+            let buffer = OutputBuffer::new(&mut backing);
+            assert_eq!(buffer.offset(), 0);
+            assert!(!buffer.is_full());
+        }
+
+        #[test]
+        fn test_write_single_byte() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            let result = buffer.write(&[42]);
+            assert_eq!(result, Ok(1));
+            assert_eq!(buffer.offset(), 1);
+            assert_eq!(buffer.as_slice(), &[42]);
+        }
+
+        #[test]
+        fn test_write_multiple_sequential() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3]).unwrap();
+            buffer.write(&[4, 5]).unwrap();
+            assert_eq!(buffer.offset(), 5);
+            assert_eq!(buffer.as_slice(), &[1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn test_write_exact_capacity() {
+            let mut backing = [0u8; 5];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3, 4, 5]).unwrap();
+            assert!(buffer.is_full());
+        }
+
+        #[test]
+        fn test_write_overflow_returns_error() {
+            let mut backing = [0u8; 5];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3]).unwrap();
+            let result = buffer.write(&[4, 5, 6]);
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+
+        #[test]
+        fn test_write_byte_method() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write_byte(42).unwrap();
+            buffer.write_byte(43).unwrap();
+            assert_eq!(buffer.as_slice(), &[42, 43]);
+        }
+
+        #[test]
+        fn test_reset_clears_offset() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3]).unwrap();
+            buffer.reset();
+            assert_eq!(buffer.offset(), 0);
+        }
+
+        #[test]
+        fn test_write_after_reset() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3]).unwrap();
+            buffer.reset();
+            buffer.write(&[4, 5]).unwrap();
+            assert_eq!(buffer.as_slice(), &[4, 5]);
+        }
+
+        #[test]
+        fn test_is_full_accurate() {
+            let mut backing = [0u8; 3];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            assert!(!buffer.is_full());
+            buffer.write(&[1, 2]).unwrap();
+            assert!(!buffer.is_full());
+            buffer.write(&[3]).unwrap();
+            assert!(buffer.is_full());
+        }
+
+        #[test]
+        fn test_as_mut_slice_allows_modification() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[1, 2, 3]).unwrap();
+            buffer.as_mut_slice()[0] = 99;
+            assert_eq!(buffer.as_slice(), &[99, 2, 3]);
+        }
+
+        #[test]
+        fn test_display_format() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            buffer.write(&[0xca, 0xfe]).unwrap();
+            let display = format!("{}", buffer);
+            assert_eq!(display, "[ 0xcafe ]");
+        }
+
+        #[test]
+        fn test_write_empty_data() {
+            let mut backing = [0u8; 256];
+            let mut buffer = OutputBuffer::new(&mut backing);
+            let result = buffer.write(&[]);
+            assert_eq!(result, Ok(0));
+            assert_eq!(buffer.offset(), 0);
+        }
+    }
+
+    // ==================== InputBuffer Tests ====================
+
+    mod input_buffer {
+        use super::*;
+
+        #[test]
+        fn test_new_starts_at_zero() {
+            let data = [1u8, 2, 3, 4, 5];
+            let buffer = InputBuffer::new(&data);
+            assert_eq!(buffer.bytes_left(), 5);
+        }
+
+        #[test]
+        fn test_read_single_byte() {
+            let data = [42u8, 43, 44];
+            let mut buffer = InputBuffer::new(&data);
+            let byte = buffer.read_byte().unwrap();
+            assert_eq!(byte, 42);
+            assert_eq!(buffer.bytes_left(), 2);
+        }
+
+        #[test]
+        fn test_read_multiple_sequential() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out1 = [0u8; 2];
+            let mut out2 = [0u8; 3];
+            buffer.read(&mut out1).unwrap();
+            buffer.read(&mut out2).unwrap();
+            assert_eq!(out1, [1, 2]);
+            assert_eq!(out2, [3, 4, 5]);
+            assert_eq!(buffer.bytes_left(), 0);
+        }
+
+        #[test]
+        fn test_read_exact_amount() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out = [0u8; 5];
+            buffer.read(&mut out).unwrap();
+            assert_eq!(out, [1, 2, 3, 4, 5]);
+            assert_eq!(buffer.bytes_left(), 0);
+        }
+
+        #[test]
+        fn test_read_overflow_returns_error() {
+            let data = [1u8, 2, 3];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out = [0u8; 5];
+            let result = buffer.read(&mut out);
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+
+        #[test]
+        fn test_read_slice_method() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            let slice = buffer.read_slice(3).unwrap();
+            assert_eq!(slice, &[1, 2, 3]);
+            assert_eq!(buffer.bytes_left(), 2);
+        }
+
+        #[test]
+        fn test_read_slice_advances_offset() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            buffer.read_slice(2).unwrap();
+            let slice = buffer.read_slice(2).unwrap();
+            assert_eq!(slice, &[3, 4]);
+        }
+
+        #[test]
+        fn test_read_size_with_smaller_request() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out = [0u8; 10];
+            let result = buffer.read_size(&mut out, 3);
+            assert_eq!(result, Ok(3));
+            assert_eq!(&out[..3], &[1, 2, 3]);
+        }
+
+        #[test]
+        fn test_read_size_buffer_too_small() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out = [0u8; 2];
+            let result = buffer.read_size(&mut out, 5);
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+
+        #[test]
+        fn test_read_size_not_enough_data() {
+            let data = [1u8, 2, 3];
+            let mut buffer = InputBuffer::new(&data);
+            let mut out = [0u8; 10];
+            let result = buffer.read_size(&mut out, 5);
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+
+        #[test]
+        fn test_bytes_left_decreases() {
+            let data = [1u8, 2, 3, 4, 5];
+            let mut buffer = InputBuffer::new(&data);
+            assert_eq!(buffer.bytes_left(), 5);
+            buffer.read_byte().unwrap();
+            assert_eq!(buffer.bytes_left(), 4);
+            buffer.read_slice(2).unwrap();
+            assert_eq!(buffer.bytes_left(), 2);
+        }
+
+        #[test]
+        fn test_read_empty_buffer() {
+            let data: [u8; 0] = [];
+            let mut buffer = InputBuffer::new(&data);
+            assert_eq!(buffer.bytes_left(), 0);
+            let result = buffer.read_byte();
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+
+        #[test]
+        fn test_partial_read_then_exhausted() {
+            let data = [1u8, 2, 3];
+            let mut buffer = InputBuffer::new(&data);
+            buffer.read_byte().unwrap();
+            buffer.read_byte().unwrap();
+            buffer.read_byte().unwrap();
+            let result = buffer.read_byte();
+            assert_eq!(result, Err(RnsError::OutOfMemory));
+        }
+    }
+}
