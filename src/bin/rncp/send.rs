@@ -1,0 +1,397 @@
+//! Send mode implementation for rncp.
+//!
+//! This module handles pushing files to a remote rncp listener.
+//! It establishes a link, creates a resource from the file, and
+//! transfers it to the destination.
+
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use rand_core::OsRng;
+use reticulum::cli::format::format_hash;
+use reticulum::destination::link::LinkEvent;
+use reticulum::hash::AddressHash;
+use reticulum::resource::{Resource, ResourceConfig};
+use reticulum::transport::{Transport, TransportConfig};
+
+use crate::config::{get_config_dir, get_identity_path, prepare_identity};
+use crate::metadata::encode_filename_metadata;
+use crate::progress::TransferProgress;
+use crate::protocol::{
+    setup_transport_interfaces, wait_for_announce, wait_for_link_activation, ProtocolError,
+};
+use crate::APP_NAME;
+
+/// Run rncp in send mode.
+///
+/// Sends a file to a remote rncp listener at the specified destination.
+///
+/// # Arguments
+/// * `matches` - Command line arguments
+/// * `timeout` - Operation timeout
+/// * `running` - Atomic flag for graceful shutdown
+///
+/// # Returns
+/// Exit code (0 for success, non-zero for errors)
+pub async fn run_send_mode(
+    matches: &clap::ArgMatches,
+    timeout: Duration,
+    running: Arc<AtomicBool>,
+) -> i32 {
+    let dest_hash_str = matches.get_one::<String>("destination").unwrap();
+    let file_path_str = matches.get_one::<String>("file").unwrap();
+
+    // Parse destination hash
+    let dest_hash = match AddressHash::new_from_hex_string(dest_hash_str) {
+        Ok(hash) => hash,
+        Err(e) => {
+            eprintln!(
+                "Invalid destination hash: must be {} hexadecimal characters",
+                32
+            );
+            log::error!("Invalid destination hash: {:?}", e);
+            return 1;
+        }
+    };
+
+    // Read file
+    let file_path = PathBuf::from(file_path_str);
+    if !file_path.exists() {
+        eprintln!("File not found: {}", file_path.display());
+        return 1;
+    }
+
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    let mut file = match File::open(&file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Could not open file: {}", e);
+            return 1;
+        }
+    };
+
+    let mut file_data = Vec::new();
+    if let Err(e) = file.read_to_end(&mut file_data) {
+        eprintln!("Could not read file: {}", e);
+        return 1;
+    }
+
+    log::info!("Sending file: {} ({} bytes)", filename, file_data.len());
+
+    // Get config and identity paths
+    let config_dir = get_config_dir(matches.get_one::<String>("config").map(|s| s.as_str()));
+    let identity_path = get_identity_path(
+        &config_dir,
+        matches.get_one::<String>("identity").map(|s| s.as_str()),
+    );
+
+    // Load or create identity with persistence
+    let identity = match prepare_identity(&identity_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+
+    // Create transport
+    let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+
+    // Set up TCP interfaces if specified
+    setup_transport_interfaces(
+        &transport,
+        matches.get_one::<String>("tcp-server").map(|s| s.as_str()),
+        matches.get_one::<String>("tcp-client").map(|s| s.as_str()),
+    )
+    .await;
+
+    // Give interfaces time to connect
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Wait for announce from destination
+    let mut announce_rx = transport.recv_announces().await;
+    let dest_desc = match wait_for_announce(&mut announce_rx, &dest_hash, timeout, &running, false)
+        .await
+    {
+        Ok(desc) => desc,
+        Err(ProtocolError::PathNotFound) => {
+            eprintln!("Path not found");
+            return 1;
+        }
+        Err(ProtocolError::Cancelled) => {
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+
+    // Create link
+    let mut link_events = transport.out_link_events();
+    let link = transport.link(dest_desc).await;
+    let link_id = *link.lock().await.id();
+
+    // Wait for link activation
+    if let Err(e) =
+        wait_for_link_activation(&link, &link_id, &mut link_events, timeout, &running, false).await
+    {
+        match e {
+            ProtocolError::LinkClosed => {
+                eprintln!("Link establishment failed");
+            }
+            ProtocolError::Timeout => {
+                eprintln!("Link establishment timed out");
+            }
+            _ => {
+                eprintln!("{}", e);
+            }
+        }
+        return 1;
+    }
+
+    // Create metadata with filename
+    let metadata = encode_filename_metadata(&filename);
+
+    // Create resource
+    let auto_compress = !matches.get_flag("no-compress");
+    let config = ResourceConfig {
+        auto_compress,
+        ..ResourceConfig::default()
+    };
+
+    let mut rng = OsRng;
+    let resource = match Resource::new(&mut rng, &file_data, config, Some(&metadata)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to create resource: {:?}", e);
+            return 1;
+        }
+    };
+
+    let resource_hash_hex = hex::encode(&resource.hash()[..8]);
+    println!(
+        "Advertising file resource ({} parts)",
+        resource.total_parts()
+    );
+    log::info!(
+        "Resource created: hash={}, size={}, parts={}",
+        resource_hash_hex,
+        resource.total_size(),
+        resource.total_parts()
+    );
+
+    // Create and send advertisement
+    let advertisement = resource.create_advertisement();
+    {
+        let link_guard = link.lock().await;
+        match link_guard.resource_advertisement_packet(&advertisement, 0) {
+            Ok(packet) => {
+                drop(link_guard);
+                transport.send_packet(packet).await;
+                log::info!("Sent resource advertisement");
+            }
+            Err(e) => {
+                eprintln!("Failed to send advertisement: {:?}", e);
+                return 1;
+            }
+        }
+    }
+
+    // Store resource for handling requests
+    let resource = Arc::new(tokio::sync::Mutex::new(resource));
+
+    // Wait for resource requests and send parts
+    let mut transfer_complete = false;
+    let total_parts = resource.lock().await.total_parts();
+    let total_size = resource.lock().await.total_size();
+    let mut parts_sent = 0usize;
+    let silent = matches.get_flag("silent");
+
+    // Initialize progress tracker
+    let mut progress = TransferProgress::new(total_size, silent);
+
+    if !silent {
+        println!("Transferring file...");
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while tokio::time::Instant::now() < deadline
+        && running.load(Ordering::SeqCst)
+        && !transfer_complete
+    {
+        tokio::select! {
+            Ok(event) = link_events.recv() => {
+                if event.id == link_id {
+                    match event.event {
+                        LinkEvent::ResourceRequest(payload) => {
+                            log::info!(
+                                "Received resource request ({} bytes)",
+                                payload.len()
+                            );
+
+                            let mut resource_guard = resource.lock().await;
+                            match resource_guard.handle_request(payload.as_slice()) {
+                                Ok((_wants_more_hashmap, part_indices)) => {
+                                    // Collect parts to send
+                                    let parts_to_send: Vec<_> = part_indices
+                                        .iter()
+                                        .filter_map(|&idx| {
+                                            resource_guard
+                                                .get_part_data(idx)
+                                                .map(|d| (idx, d.to_vec()))
+                                        })
+                                        .collect();
+                                    drop(resource_guard);
+
+                                    // Send requested parts
+                                    for (part_idx, part_data) in parts_to_send {
+                                        let part_size = part_data.len();
+                                        let link_guard = link.lock().await;
+                                        match link_guard.resource_data_packet(&part_data) {
+                                            Ok(packet) => {
+                                                drop(link_guard);
+                                                transport.send_packet(packet).await;
+                                                parts_sent += 1;
+
+                                                // Update progress
+                                                progress.update(part_size);
+                                                progress.display();
+
+                                                log::debug!(
+                                                    "Sent part {}/{}, total sent: {}",
+                                                    part_idx,
+                                                    total_parts,
+                                                    parts_sent
+                                                );
+                                            }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "Failed to create resource data packet: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to handle resource request: {:?}", e);
+                                }
+                            }
+                        }
+                        LinkEvent::ResourceProof(payload) => {
+                            log::info!("Received resource proof");
+
+                            let resource_guard = resource.lock().await;
+                            if resource_guard.verify_proof(payload.as_slice()) {
+                                progress.finish(true);
+                                transfer_complete = true;
+                            } else {
+                                log::warn!("Invalid proof received");
+                            }
+                        }
+                        LinkEvent::Closed => {
+                            log::info!("Link closed");
+                            if !transfer_complete {
+                                progress.finish(false);
+                                return 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Continue waiting
+            }
+        }
+    }
+
+    if !transfer_complete {
+        progress.finish(false);
+        eprintln!("Transfer timed out");
+        return 1;
+    }
+
+    if !silent {
+        println!(
+            "{} copied to {}",
+            file_path.display(),
+            format_hash(dest_hash.as_slice())
+        );
+    }
+
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_file_validation() {
+        // Test with non-existent file
+        let path = PathBuf::from("/nonexistent/path/file.txt");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_file_reading() {
+        // Create a temporary file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let content = b"test content";
+        temp_file.write_all(content).unwrap();
+
+        // Read it back
+        let mut file = File::open(temp_file.path()).unwrap();
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).unwrap();
+
+        assert_eq!(data, content);
+    }
+
+    #[test]
+    fn test_filename_extraction() {
+        let path = PathBuf::from("/path/to/file.txt");
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        assert_eq!(filename, "file.txt");
+    }
+
+    #[test]
+    fn test_filename_extraction_no_extension() {
+        let path = PathBuf::from("/path/to/file");
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        assert_eq!(filename, "file");
+    }
+
+    #[test]
+    fn test_filename_extraction_fallback() {
+        let path = PathBuf::from("/");
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        assert_eq!(filename, "file");
+    }
+}
