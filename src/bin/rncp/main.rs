@@ -8,6 +8,11 @@
 //! - Send mode (default): Push file to remote destination
 //! - Fetch mode (`-f`): Pull file from remote listener
 
+mod common;
+mod config;
+mod metadata;
+mod progress;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -18,260 +23,31 @@ use std::time::Duration;
 
 use clap::{Arg, ArgAction, Command};
 use rand_core::OsRng;
+use reticulum::cli::format::format_hash;
 use reticulum::destination::link::{LinkEvent, LinkEventData, LinkId, LinkStatus};
 use reticulum::destination::DestinationName;
 use reticulum::hash::AddressHash;
-use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::packet::PACKET_MDU;
-use reticulum::hash::Hash;
 use reticulum::resource::{Resource, ResourceAdvertisement, ResourceConfig};
 use reticulum::transport::{Transport, TransportConfig};
-use rmpv::Value;
 use tokio::sync::RwLock;
 
-const APP_NAME: &str = "rncp";
+use config::{
+    get_config_dir, get_identity_path, load_allowed_identities,
+    parse_allowed_from_cli, prepare_identity, FetchServerConfig,
+};
+use metadata::{
+    create_request_data, encode_filename_metadata, extract_filename_and_data,
+    parse_fetch_request,
+};
+use common::{TrackedIncomingResource, TrackedOutgoingResource, validate_fetch_path};
+use progress::TransferProgress;
+
+pub(crate) const APP_NAME: &str = "rncp";
 const ASPECT_RECEIVE: &str = "receive";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Spinner characters (matching Python's braille spinner)
-const SPINNER_CHARS: &[char] = &['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
-
-/// Progress tracker for file transfers
-struct TransferProgress {
-    total_size: usize,
-    transferred: usize,
-    start_time: std::time::Instant,
-    spinner_idx: usize,
-    silent: bool,
-}
-
-impl TransferProgress {
-    fn new(total_size: usize, silent: bool) -> Self {
-        Self {
-            total_size,
-            transferred: 0,
-            start_time: std::time::Instant::now(),
-            spinner_idx: 0,
-            silent,
-        }
-    }
-
-    fn update(&mut self, bytes: usize) {
-        self.transferred += bytes;
-        self.spinner_idx = (self.spinner_idx + 1) % SPINNER_CHARS.len();
-    }
-
-    fn display(&self) {
-        if self.silent {
-            return;
-        }
-
-        let progress = if self.total_size > 0 {
-            (self.transferred as f64 / self.total_size as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            self.transferred as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        let spinner = SPINNER_CHARS[self.spinner_idx];
-
-        // Use carriage return to overwrite line
-        print!(
-            "\r{} {:.1}%  {} / {}  {}/s   ",
-            spinner,
-            progress,
-            size_str(self.transferred as u64, 'B'),
-            size_str(self.total_size as u64, 'B'),
-            size_str(speed as u64, 'B')
-        );
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-    }
-
-    fn finish(&self, success: bool) {
-        if self.silent {
-            return;
-        }
-
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            self.transferred as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        if success {
-            println!(
-                "\r✓ 100%  {} transferred in {:.1}s ({}/s)   ",
-                size_str(self.transferred as u64, 'B'),
-                elapsed,
-                size_str(speed as u64, 'B')
-            );
-        } else {
-            println!("\r✗ Transfer failed                         ");
-        }
-    }
-}
-
-/// Get the default Reticulum config directory
-fn get_config_dir(config_override: Option<&str>) -> PathBuf {
-    if let Some(path) = config_override {
-        PathBuf::from(path)
-    } else {
-        // Default: ~/.reticulum
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".reticulum")
-    }
-}
-
-/// Get the identity file path
-fn get_identity_path(config_dir: &Path, identity_override: Option<&str>) -> PathBuf {
-    if let Some(path) = identity_override {
-        PathBuf::from(path)
-    } else {
-        config_dir.join("identities").join(APP_NAME)
-    }
-}
-
-/// Load allowed identity hashes from config files
-/// Checks: /etc/rncp/allowed_identities, ~/.config/rncp/allowed_identities, ~/.rncp/allowed_identities
-fn load_allowed_identities() -> Vec<[u8; 16]> {
-    let mut allowed = Vec::new();
-    let allowed_file_name = "allowed_identities";
-
-    // Possible config file locations (in order of precedence)
-    let paths = [
-        PathBuf::from("/etc/rncp").join(allowed_file_name),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".config/rncp")
-            .join(allowed_file_name),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".rncp")
-            .join(allowed_file_name),
-    ];
-
-    for path in &paths {
-        if path.exists() {
-            log::info!("Loading allowed identities from {}", path.display());
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    // Skip comments and empty lines
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    // Parse hex hash (should be 32 hex chars = 16 bytes)
-                    if line.len() == 32 {
-                        if let Ok(bytes) = hex::decode(line) {
-                            if bytes.len() == 16 {
-                                let mut hash = [0u8; 16];
-                                hash.copy_from_slice(&bytes);
-                                allowed.push(hash);
-                                log::debug!("Added allowed identity: {}", line);
-                            }
-                        }
-                    }
-                }
-            }
-            break; // Only use first found file
-        }
-    }
-
-    allowed
-}
-
-/// Parse allowed identity hashes from CLI arguments
-fn parse_allowed_from_cli(allowed_args: Option<clap::parser::ValuesRef<String>>) -> Vec<[u8; 16]> {
-    let mut allowed = Vec::new();
-
-    if let Some(hashes) = allowed_args {
-        for hash_str in hashes {
-            let hash_str = hash_str.trim();
-            if hash_str.len() == 32 {
-                if let Ok(bytes) = hex::decode(hash_str) {
-                    if bytes.len() == 16 {
-                        let mut hash = [0u8; 16];
-                        hash.copy_from_slice(&bytes);
-                        allowed.push(hash);
-                        log::debug!("Added allowed identity from CLI: {}", hash_str);
-                    }
-                }
-            } else {
-                eprintln!("Warning: Invalid identity hash '{}' (must be 32 hex chars)", hash_str);
-            }
-        }
-    }
-
-    allowed
-}
-
-/// Load or create an identity, persisting to file
-fn prepare_identity(identity_path: &PathBuf) -> Result<PrivateIdentity, Box<dyn std::error::Error>> {
-    // Try to load existing identity
-    if identity_path.exists() {
-        match std::fs::read_to_string(identity_path) {
-            Ok(hex_string) => {
-                let hex_string = hex_string.trim();
-                match PrivateIdentity::new_from_hex_string(hex_string) {
-                    Ok(identity) => {
-                        log::info!(
-                            "Loaded identity from {}",
-                            identity_path.display()
-                        );
-                        return Ok(identity);
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Could not load identity from {}: {:?}",
-                            identity_path.display(),
-                            e
-                        );
-                        return Err(format!(
-                            "Could not load identity for rncp. The identity file at \"{}\" may be corrupt or unreadable.",
-                            identity_path.display()
-                        ).into());
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Could not read identity file: {}", e);
-                return Err(format!(
-                    "Could not read identity file at \"{}\": {}",
-                    identity_path.display(),
-                    e
-                ).into());
-            }
-        }
-    }
-
-    // Create new identity
-    log::info!("No valid saved identity found, creating new...");
-    let identity = PrivateIdentity::new_from_rand(OsRng);
-
-    // Ensure parent directory exists
-    if let Some(parent) = identity_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    // Save identity
-    let hex_string = identity.to_hex_string();
-    std::fs::write(identity_path, &hex_string)?;
-    log::info!("Saved new identity to {}", identity_path.display());
-
-    Ok(identity)
-}
 
 fn main() {
     let matches = Command::new("rncp")
@@ -512,63 +288,6 @@ fn print_help() {
     eprintln!("Run 'rncp --help' for full options.");
 }
 
-/// Format bytes as pretty hex (matching Python's RNS.prettyhexrep)
-fn pretty_hex(bytes: &[u8]) -> String {
-    format!("<{}>", hex::encode(bytes))
-}
-
-/// Format file size with appropriate unit (matching Python's size_str)
-#[allow(dead_code)]
-fn size_str(num: u64, suffix: char) -> String {
-    let mut num = num as f64;
-    if suffix == 'b' {
-        num *= 8.0;
-    }
-    let units = ['K', 'M', 'G', 'T', 'P', 'E', 'Z'];
-
-    if num < 1000.0 {
-        return format!("{:.0} {}", num, suffix.to_ascii_uppercase());
-    }
-
-    for unit in units {
-        num /= 1000.0;
-        if num < 1000.0 {
-            return format!("{:.2} {}{}", num, unit, suffix.to_ascii_uppercase());
-        }
-    }
-
-    format!("{:.2} Y{}", num, suffix.to_ascii_uppercase())
-}
-
-/// Tracked incoming resource with its link
-struct TrackedIncomingResource {
-    resource: Resource,
-    link_id: LinkId,
-    has_metadata: bool,
-}
-
-/// Tracked outgoing resource for fetch server
-struct TrackedOutgoingResource {
-    resource: Resource,
-    link_id: LinkId,
-}
-
-/// Path hash for "fetch_file" request handler (pre-computed truncated hash)
-fn fetch_file_path_hash() -> [u8; 10] {
-    truncated_hash(b"fetch_file")
-}
-
-/// Configuration for listen mode fetch server
-struct FetchServerConfig {
-    allow_fetch: bool,
-    #[allow(dead_code)]
-    no_auth: bool,
-    fetch_jail: Option<PathBuf>,
-    #[allow(dead_code)]
-    allowed_identity_hashes: Vec<[u8; 16]>,
-    auto_compress: bool,
-}
-
 /// Listen mode - accept incoming file transfers
 async fn run_listen_mode(
     matches: &clap::ArgMatches,
@@ -635,11 +354,11 @@ async fn run_listen_mode(
             "Identity     : {}",
             hex::encode(identity.as_identity().address_hash.as_slice())
         );
-        println!("Listening on : {}", pretty_hex(dest_hash.as_slice()));
+        println!("Listening on : {}", format_hash(dest_hash.as_slice()));
         return 0;
     }
 
-    println!("rncp listening on {}", pretty_hex(dest_hash.as_slice()));
+    println!("rncp listening on {}", format_hash(dest_hash.as_slice()));
 
     // Handle announce interval
     let announce_interval: i32 = matches
@@ -1018,167 +737,6 @@ async fn handle_listen_link_event(
     }
 }
 
-/// Extract filename from resource data
-/// The assembled data may contain metadata with a 3-byte length prefix:
-/// [len_high, len_mid, len_low, ...metadata..., ...actual_data...]
-/// Metadata format (msgpack): {"name": <bytes>}
-/// Returns (filename_option, actual_data_without_metadata)
-fn extract_filename_and_data(data: &[u8], has_metadata: bool) -> (Option<String>, Vec<u8>) {
-    if !has_metadata || data.len() < 4 {
-        return (None, data.to_vec());
-    }
-
-    // Extract metadata length (3-byte big-endian)
-    let meta_len = ((data[0] as usize) << 16) | ((data[1] as usize) << 8) | (data[2] as usize);
-
-    if data.len() < 3 + meta_len {
-        log::debug!("Data too short for metadata of length {}", meta_len);
-        return (None, data.to_vec());
-    }
-
-    let metadata = &data[3..3 + meta_len];
-    let actual_data = data[3 + meta_len..].to_vec();
-
-    // Parse msgpack metadata
-    let filename = parse_metadata_filename(metadata);
-
-    (filename, actual_data)
-}
-
-/// Parse msgpack metadata and extract the "name" field
-fn parse_metadata_filename(metadata: &[u8]) -> Option<String> {
-    let value = rmpv::decode::read_value(&mut &metadata[..]).ok()?;
-
-    // Look for "name" key in the map
-    match value {
-        Value::Map(entries) => {
-            for (key, val) in entries {
-                let key_str = match key {
-                    Value::String(s) => s.as_str().map(|s| s.to_string()),
-                    Value::Binary(b) => String::from_utf8(b.clone()).ok(),
-                    _ => None,
-                };
-
-                if key_str.as_deref() == Some("name") {
-                    // Extract filename from value
-                    let filename = match val {
-                        Value::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                        Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                        _ => continue,
-                    };
-
-                    // Sanitize: only keep the basename to prevent path traversal
-                    let basename = std::path::Path::new(&filename)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("received_file")
-                        .to_string();
-
-                    return Some(basename);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Parse a fetch_file request and extract the file path
-/// Request format (msgpack): [timestamp: f64, path_hash: bin10, data: bin]
-fn parse_fetch_request(payload: &[u8]) -> Option<String> {
-    let value = rmpv::decode::read_value(&mut &payload[..]).ok()?;
-
-    let arr = match value {
-        Value::Array(a) if a.len() >= 3 => a,
-        _ => return None,
-    };
-
-    // Verify this is a fetch_file request by checking path hash
-    let expected_hash = fetch_file_path_hash();
-    let path_hash = match &arr[1] {
-        Value::Binary(b) if b.len() == 10 => b.as_slice(),
-        _ => return None,
-    };
-
-    if path_hash != expected_hash {
-        log::debug!(
-            "Request path hash mismatch: expected {}, got {}",
-            hex::encode(expected_hash),
-            hex::encode(path_hash)
-        );
-        return None;
-    }
-
-    // Extract file path from data field
-    let file_path = match &arr[2] {
-        Value::Binary(b) => String::from_utf8_lossy(b).to_string(),
-        Value::String(s) => s.as_str().unwrap_or("").to_string(),
-        _ => return None,
-    };
-
-    Some(file_path)
-}
-
-/// Validate a file path against the fetch jail
-fn validate_fetch_path(path_str: &str, jail: Option<&PathBuf>) -> Option<PathBuf> {
-    // Expand and canonicalize the path
-    let expanded = if path_str.starts_with('~') {
-        dirs::home_dir()
-            .map(|h| h.join(&path_str[2..]))
-            .unwrap_or_else(|| PathBuf::from(path_str))
-    } else {
-        PathBuf::from(path_str)
-    };
-
-    // If there's a jail, handle paths relative to it
-    let file_path = if let Some(jail) = jail {
-        // Strip jail prefix if present, then join with jail
-        let stripped = if path_str.starts_with(jail.to_str().unwrap_or("")) {
-            PathBuf::from(path_str.strip_prefix(jail.to_str().unwrap_or("")).unwrap_or(path_str).trim_start_matches('/'))
-        } else {
-            expanded.clone()
-        };
-
-        let joined = jail.join(&stripped);
-
-        // Canonicalize to resolve symlinks
-        match std::fs::canonicalize(&joined) {
-            Ok(canonical) => {
-                // Verify the resolved path is still within jail
-                if canonical.starts_with(jail) {
-                    canonical
-                } else {
-                    log::warn!(
-                        "Fetch request for {} resolved to {} which is outside jail {}",
-                        path_str,
-                        canonical.display(),
-                        jail.display()
-                    );
-                    return None;
-                }
-            }
-            Err(e) => {
-                log::debug!("Failed to canonicalize path {}: {}", joined.display(), e);
-                return None;
-            }
-        }
-    } else {
-        // No jail, just use the expanded path
-        match std::fs::canonicalize(&expanded) {
-            Ok(canonical) => canonical,
-            Err(_) => expanded,
-        }
-    };
-
-    // Verify the file exists
-    if !file_path.is_file() {
-        log::debug!("Requested file does not exist: {}", file_path.display());
-        return None;
-    }
-
-    Some(file_path)
-}
-
 /// Send a response to a request (for error codes)
 async fn send_fetch_response(transport: &Transport, link_id: &LinkId, response: u8) {
     if let Some(link_mutex) = transport.find_in_link(link_id).await {
@@ -1256,29 +814,11 @@ async fn handle_fetch_request(
 
     log::info!("Sending file {} ({} bytes) to client", file_path.display(), file_data.len());
 
-    // Create metadata with filename (msgpack format matching Python)
+    // Create metadata with filename
     let filename = file_path.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
-
-    // Create metadata (msgpack format matching Python)
-    // Python uses: {"name": filename.encode("utf-8")} - note: bytes value, not string
-    let mut metadata = Vec::new();
-    metadata.push(0x81); // fixmap with 1 element
-    metadata.push(0xa4); // fixstr with 4 chars ("name" key is a string)
-    metadata.extend_from_slice(b"name");
-    // Value is bytes (bin format), not string
-    let name_bytes = filename.as_bytes();
-    if name_bytes.len() < 256 {
-        metadata.push(0xc4); // bin 8
-        metadata.push(name_bytes.len() as u8);
-    } else {
-        metadata.push(0xc5); // bin 16
-        metadata.push((name_bytes.len() >> 8) as u8);
-        metadata.push(name_bytes.len() as u8);
-    }
-    metadata.extend_from_slice(name_bytes);
+        .unwrap_or("file");
+    let metadata = encode_filename_metadata(filename);
 
     // Create resource
     let resource_config = ResourceConfig {
@@ -1500,7 +1040,7 @@ async fn run_send_mode(
     // Wait for announce from destination
     println!(
         "Path to {} requested",
-        pretty_hex(dest_hash.as_slice())
+        format_hash(dest_hash.as_slice())
     );
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1534,7 +1074,7 @@ async fn run_send_mode(
     // Create link
     println!(
         "Establishing link with {}",
-        pretty_hex(dest_hash.as_slice())
+        format_hash(dest_hash.as_slice())
     );
 
     let mut link_events = transport.out_link_events();
@@ -1577,23 +1117,8 @@ async fn run_send_mode(
         return 1;
     }
 
-    // Create metadata (msgpack format matching Python)
-    // Python uses: {"name": filename.encode("utf-8")} - note: bytes value, not string
-    let mut metadata = Vec::new();
-    metadata.push(0x81); // fixmap with 1 element
-    metadata.push(0xa4); // fixstr with 4 chars ("name" key is a string)
-    metadata.extend_from_slice(b"name");
-    // Value is bytes (bin format), not string
-    let name_bytes = filename.as_bytes();
-    if name_bytes.len() < 256 {
-        metadata.push(0xc4); // bin 8
-        metadata.push(name_bytes.len() as u8);
-    } else {
-        metadata.push(0xc5); // bin 16
-        metadata.push((name_bytes.len() >> 8) as u8);
-        metadata.push(name_bytes.len() as u8);
-    }
-    metadata.extend_from_slice(name_bytes);
+    // Create metadata with filename
+    let metadata = encode_filename_metadata(&filename);
 
     // Create resource
     let auto_compress = !matches.get_flag("no-compress");
@@ -1758,7 +1283,7 @@ async fn run_send_mode(
         println!(
             "{} copied to {}",
             file_path.display(),
-            pretty_hex(dest_hash.as_slice())
+            format_hash(dest_hash.as_slice())
         );
     }
 
@@ -1767,52 +1292,6 @@ async fn run_send_mode(
 
 /// Response codes from fetch requests (matching Python)
 const REQ_FETCH_NOT_ALLOWED: u8 = 0xF0;
-
-/// Create a truncated hash (10 bytes) of data, matching Python's Identity.truncated_hash
-fn truncated_hash(data: &[u8]) -> [u8; 10] {
-    let full_hash = Hash::new_from_slice(data);
-    let mut truncated = [0u8; 10];
-    truncated.copy_from_slice(&full_hash.as_bytes()[..10]);
-    truncated
-}
-
-/// Create a msgpack-encoded request packet data
-/// Format: [timestamp, path_hash, request_data]
-fn create_request_data(path: &str, data: &[u8]) -> Vec<u8> {
-    let path_hash = truncated_hash(path.as_bytes());
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-
-    // Manually encode msgpack array
-    // Format: [timestamp (float64), path_hash (bin 10), data (bin)]
-    let mut result = Vec::new();
-
-    // Array with 3 elements (fixarray)
-    result.push(0x93);
-
-    // Timestamp as float64
-    result.push(0xcb);
-    result.extend_from_slice(&timestamp.to_be_bytes());
-
-    // Path hash as bin 8 (10 bytes)
-    result.push(0xc4);
-    result.push(10);
-    result.extend_from_slice(&path_hash);
-
-    // Data as bin 8 or bin 16
-    if data.len() < 256 {
-        result.push(0xc4);
-        result.push(data.len() as u8);
-    } else {
-        result.push(0xc5);
-        result.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    }
-    result.extend_from_slice(data);
-
-    result
-}
 
 /// Fetch mode - pull a file from a remote listener
 async fn run_fetch_mode(
@@ -1890,7 +1369,7 @@ async fn run_fetch_mode(
     if !silent {
         println!(
             "Path to {} requested",
-            pretty_hex(dest_hash.as_slice())
+            format_hash(dest_hash.as_slice())
         );
     }
 
@@ -1926,7 +1405,7 @@ async fn run_fetch_mode(
     if !silent {
         println!(
             "Establishing link with {}",
-            pretty_hex(dest_hash.as_slice())
+            format_hash(dest_hash.as_slice())
         );
     }
 
