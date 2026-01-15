@@ -2,26 +2,24 @@
 //!
 //! This module provides the `ListenerAddr` enum which abstracts over different
 //! socket types based on platform capabilities:
-//! - Linux: Abstract Unix sockets (preferred, no filesystem cleanup)
-//! - macOS/BSD: Filesystem Unix sockets
-//! - Windows: TCP localhost fallback
+//! - Linux: Abstract Unix sockets (no filesystem cleanup needed)
+//! - macOS/BSD/Windows: TCP localhost (matches Python behavior)
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use tokio::net::{UnixListener, UnixStream};
 
 /// Address for IPC listeners and connections.
 ///
 /// Supports multiple socket types for cross-platform compatibility:
 /// - Abstract Unix sockets (Linux only)
-/// - Filesystem Unix sockets (Unix systems)
-/// - TCP localhost (Windows fallback, or explicit configuration)
+/// - TCP localhost (macOS/BSD/Windows, matches Python behavior)
 #[derive(Debug, Clone)]
 pub enum ListenerAddr {
     /// Abstract Unix socket (Linux only).
@@ -30,13 +28,8 @@ pub enum ListenerAddr {
     #[cfg(target_os = "linux")]
     AbstractUnix(String),
 
-    /// Filesystem-based Unix socket.
-    /// The socket file will be created at this path and must be cleaned up on shutdown.
-    #[cfg(unix)]
-    FilesystemUnix(PathBuf),
-
     /// TCP socket bound to localhost.
-    /// Used as fallback on Windows or when explicitly configured.
+    /// Used on macOS/BSD/Windows (matches Python behavior).
     Tcp(SocketAddr),
 }
 
@@ -45,23 +38,17 @@ impl ListenerAddr {
     ///
     /// Uses the instance name to create a unique socket address:
     /// - Linux: Abstract socket `\0rns/{instance_name}`
-    /// - macOS/BSD: Filesystem socket `{socket_dir}/{instance_name}.sock`
-    /// - Windows: TCP `127.0.0.1:{port}`
+    /// - macOS/BSD/Windows: TCP `127.0.0.1:{port}`
     pub fn default_transport(instance_name: &str, socket_dir: &Path, port: u16) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let _ = socket_dir; // unused on Linux
+            let _ = socket_dir;
             let _ = port;
             ListenerAddr::AbstractUnix(format!("rns/{}", instance_name))
         }
 
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            let _ = port;
-            ListenerAddr::FilesystemUnix(socket_dir.join(format!("{}.sock", instance_name)))
-        }
-
-        #[cfg(windows)]
+        // macOS/BSD/Windows: Use TCP localhost (matches Python behavior)
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = instance_name;
             let _ = socket_dir;
@@ -73,8 +60,7 @@ impl ListenerAddr {
     ///
     /// Similar to `default_transport` but uses a distinct socket/port:
     /// - Linux: Abstract socket `\0rns/{instance_name}/rpc`
-    /// - macOS/BSD: Filesystem socket `{socket_dir}/{instance_name}_rpc.sock`
-    /// - Windows: TCP `127.0.0.1:{port}`
+    /// - macOS/BSD/Windows: TCP `127.0.0.1:{port}`
     pub fn default_rpc(instance_name: &str, socket_dir: &Path, port: u16) -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -83,13 +69,8 @@ impl ListenerAddr {
             ListenerAddr::AbstractUnix(format!("rns/{}/rpc", instance_name))
         }
 
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            let _ = port;
-            ListenerAddr::FilesystemUnix(socket_dir.join(format!("{}_rpc.sock", instance_name)))
-        }
-
-        #[cfg(windows)]
+        // macOS/BSD/Windows: Use TCP localhost (matches Python behavior)
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = instance_name;
             let _ = socket_dir;
@@ -107,12 +88,6 @@ impl ListenerAddr {
         Self::tcp([127, 0, 0, 1], port)
     }
 
-    /// Create a filesystem Unix socket address.
-    #[cfg(unix)]
-    pub fn unix_filesystem(path: impl Into<PathBuf>) -> Self {
-        ListenerAddr::FilesystemUnix(path.into())
-    }
-
     /// Create an abstract Unix socket address (Linux only).
     #[cfg(target_os = "linux")]
     pub fn unix_abstract(name: impl Into<String>) -> Self {
@@ -124,8 +99,6 @@ impl ListenerAddr {
         match self {
             #[cfg(target_os = "linux")]
             ListenerAddr::AbstractUnix(name) => format!("unix-abstract://{}", name),
-            #[cfg(unix)]
-            ListenerAddr::FilesystemUnix(path) => format!("unix://{}", path.display()),
             ListenerAddr::Tcp(addr) => format!("tcp://{}", addr),
         }
     }
@@ -133,7 +106,7 @@ impl ListenerAddr {
 
 /// A wrapper around different stream types that implements AsyncRead + AsyncWrite.
 pub enum IpcStream {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Unix(UnixStream),
     Tcp(TcpStream),
 }
@@ -145,7 +118,7 @@ impl AsyncRead for IpcStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             IpcStream::Unix(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
             IpcStream::Tcp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
         }
@@ -159,7 +132,7 @@ impl AsyncWrite for IpcStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         match self.get_mut() {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             IpcStream::Unix(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
             IpcStream::Tcp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
         }
@@ -170,7 +143,7 @@ impl AsyncWrite for IpcStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             IpcStream::Unix(stream) => std::pin::Pin::new(stream).poll_flush(cx),
             IpcStream::Tcp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
         }
@@ -181,7 +154,7 @@ impl AsyncWrite for IpcStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             IpcStream::Unix(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
             IpcStream::Tcp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
         }
@@ -191,7 +164,7 @@ impl AsyncWrite for IpcStream {
 /// A wrapper around different listener types.
 #[derive(Debug)]
 pub enum IpcListener {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Unix(UnixListener),
     Tcp(TcpListener),
 }
@@ -209,24 +182,6 @@ impl IpcListener {
                 let listener = UnixListener::from_std(std_listener)?;
                 Ok(IpcListener::Unix(listener))
             }
-            #[cfg(unix)]
-            ListenerAddr::FilesystemUnix(path) => {
-                // Never delete existing socket files - refuse to bind if one exists.
-                // This prevents accidentally destroying an active daemon's socket.
-                // If the socket is stale (from a crashed daemon), the user must
-                // manually delete it before starting a new daemon.
-                if path.exists() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!(
-                            "Socket file {} already exists. Remove it manually if the daemon is not running.",
-                            path.display()
-                        ),
-                    ));
-                }
-                let listener = UnixListener::bind(path)?;
-                Ok(IpcListener::Unix(listener))
-            }
             ListenerAddr::Tcp(addr) => {
                 let listener = TcpListener::bind(addr).await?;
                 Ok(IpcListener::Tcp(listener))
@@ -237,7 +192,7 @@ impl IpcListener {
     /// Accept a new connection.
     pub async fn accept(&self) -> io::Result<(IpcStream, String)> {
         match self {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             IpcListener::Unix(listener) => {
                 let (stream, addr) = listener.accept().await?;
                 let addr_str = addr
@@ -265,11 +220,6 @@ pub async fn connect(addr: &ListenerAddr) -> io::Result<IpcStream> {
             let std_stream = std::os::unix::net::UnixStream::connect_addr(&socket_addr)?;
             std_stream.set_nonblocking(true)?;
             let stream = UnixStream::from_std(std_stream)?;
-            Ok(IpcStream::Unix(stream))
-        }
-        #[cfg(unix)]
-        ListenerAddr::FilesystemUnix(path) => {
-            let stream = UnixStream::connect(path).await?;
             Ok(IpcStream::Unix(stream))
         }
         ListenerAddr::Tcp(addr) => {
@@ -300,78 +250,9 @@ mod tests {
             let abstract_addr = ListenerAddr::unix_abstract("rns/default");
             assert!(abstract_addr.display().starts_with("unix-abstract://"));
         }
-
-        #[cfg(unix)]
-        {
-            let fs_addr = ListenerAddr::unix_filesystem("/tmp/test.sock");
-            assert!(fs_addr.display().starts_with("unix://"));
-        }
     }
 
-    /// Test that bind() fails when a socket file already exists.
-    /// This verifies we don't accidentally delete an active daemon's socket.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_bind_fails_when_socket_file_exists() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
-
-        // Create a file at the socket path (simulating a stale or active socket)
-        std::fs::write(&socket_path, "").unwrap();
-        assert!(socket_path.exists());
-
-        // Attempt to bind should fail
-        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
-        let result = IpcListener::bind(&addr).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
-        assert!(err.to_string().contains("already exists"));
-
-        // File should NOT be deleted
-        assert!(socket_path.exists());
-    }
-
-    /// Test that bind() fails when trying to bind to an already-bound socket.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_bind_fails_on_active_socket() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("active.sock");
-
-        // First bind should succeed
-        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
-        let listener = IpcListener::bind(&addr).await.unwrap();
-        assert!(socket_path.exists());
-
-        // Second bind should fail (socket file exists)
-        let result = IpcListener::bind(&addr).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
-
-        // Original listener should still be functional
-        drop(listener);
-    }
-
-    /// Test that bind() succeeds on a new path with no existing socket.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_bind_succeeds_on_new_path() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("new.sock");
-
-        assert!(!socket_path.exists());
-
-        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
-        let result = IpcListener::bind(&addr).await;
-
-        assert!(result.is_ok());
-        assert!(socket_path.exists());
-    }
-
-    /// Test that TCP bind still works normally (not affected by this change).
+    /// Test that TCP bind works correctly.
     #[tokio::test]
     async fn test_tcp_bind_succeeds() {
         // Use port 0 to let OS assign an available port
