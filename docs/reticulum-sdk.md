@@ -113,6 +113,23 @@ let paths = rns.get_path_table(Some(4)).await?;  // max 4 hops
 let links = rns.get_link_count().await?;
 ```
 
+## Transport Ownership
+
+`Transport` implements `Clone`, allowing structs to own their transport handle directly without lifetime parameters. Cloning is cheap—all fields are `Arc`-wrapped, so cloning only increments reference counts.
+
+```rust
+// Clone transport to own it
+let transport = rns.transport().clone();
+
+// Pass owned transport to structs (no lifetime needed)
+let client = MyClient::new(transport, config);
+
+// Multiple clones share the same underlying transport
+let transport_a = rns.transport().clone();
+let transport_b = rns.transport().clone();
+// Both refer to the same transport handler
+```
+
 ## Error Handling
 
 ```rust
