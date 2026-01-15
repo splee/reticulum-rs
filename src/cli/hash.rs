@@ -19,8 +19,14 @@ use crate::hash::AddressHash;
 /// * `Err(String)` - Error message describing the parse failure
 ///
 /// # Example
-/// ```ignore
-/// let hash = parse_destination("<abcd1234567890abcdef1234567890ab>")?;
+/// ```
+/// use reticulum::cli::hash::parse_destination;
+/// let hash = parse_destination("<abcd1234567890abcdef1234567890ab>").unwrap();
+/// assert_eq!(hash.as_slice(), &[0xab, 0xcd, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab,
+///                               0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab]);
+/// // Also accepts plain hex and path-style formats
+/// assert!(parse_destination("abcd1234567890abcdef1234567890ab").is_ok());
+/// assert!(parse_destination("/abcd1234567890abcdef1234567890ab/").is_ok());
 /// ```
 pub fn parse_destination(dest_str: &str) -> Result<AddressHash, String> {
     let clean = dest_str

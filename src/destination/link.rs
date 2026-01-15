@@ -836,11 +836,6 @@ impl Link {
     /// # Returns
     /// A packet to send, or an error if the link is not active or we are not the initiator.
     ///
-    /// # Example
-    /// ```ignore
-    /// let packet = link.identify(&my_identity)?;
-    /// transport.send(packet).await;
-    /// ```
     pub fn identify(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
         // Only the initiator (client) can identify
         if !self.initiator {

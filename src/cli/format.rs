@@ -14,9 +14,10 @@ use crate::hash::AddressHash;
 /// Matches Python's hash display format for destination hashes.
 ///
 /// # Example
-/// ```ignore
-/// let hash = AddressHash::new_from_slice(&[0xab, 0xcd]);
-/// assert_eq!(format_hash(hash.as_slice()), "<abcd>");
+/// ```
+/// use reticulum::cli::format::format_hash;
+/// assert_eq!(format_hash(&[0xab, 0xcd]), "<abcd>");
+/// assert_eq!(format_hash(&[0xde, 0xad, 0xbe, 0xef]), "<deadbeef>");
 /// ```
 pub fn format_hash(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2 + 2);
@@ -31,9 +32,11 @@ pub fn format_hash(bytes: &[u8]) -> String {
 /// Format an AddressHash as a plain hex string (no brackets).
 ///
 /// # Example
-/// ```ignore
-/// let hash = AddressHash::new_from_slice(&[0xab, 0xcd]);
-/// assert_eq!(format_hash_hex(&hash), "abcd");
+/// ```
+/// use reticulum::cli::format::format_hash_hex;
+/// use reticulum::hash::AddressHash;
+/// let hash = AddressHash::new([0xab; 16]);
+/// assert_eq!(format_hash_hex(&hash), "abababababababababababababababab");
 /// ```
 pub fn format_hash_hex(hash: &AddressHash) -> String {
     hash.as_slice()
@@ -69,7 +72,8 @@ pub fn format_hash_pretty(bytes: &[u8]) -> String {
 /// * `suffix` - 'B' for bytes, 'b' for bits (will multiply by 8)
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::size_str;
 /// assert_eq!(size_str(1500, 'B'), "1.50 KB");
 /// assert_eq!(size_str(1000000, 'B'), "1.00 MB");
 /// ```
@@ -106,7 +110,8 @@ pub fn format_size(bytes: u64) -> String {
 /// Matches Python's `RNS.prettyspeed()`.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::speed_str;
 /// assert_eq!(speed_str(1500.0), "1.50 kbps");
 /// assert_eq!(speed_str(1000000.0), "1.00 Mbps");
 /// ```
@@ -147,7 +152,8 @@ pub fn format_transfer_rate(bytes_per_sec: f64) -> String {
 /// Used by rnstatus for interface timing info.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::format_time_compact;
 /// assert_eq!(format_time_compact(45.0), "45s");
 /// assert_eq!(format_time_compact(125.0), "2m");
 /// assert_eq!(format_time_compact(7200.0), "2.0h");
@@ -176,7 +182,8 @@ pub fn format_time_compact(seconds: f64) -> String {
 /// Used by rnpath for path timing info.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::format_time;
 /// assert_eq!(format_time(45.0), "45 seconds");
 /// assert_eq!(format_time(125.0), "2 minutes");
 /// assert_eq!(format_time(7200.0), "2 hours");
@@ -234,8 +241,13 @@ pub fn format_time(seconds: f64) -> String {
 /// Returns strings like "Just now", "5m ago", "2h ago", "3d ago".
 ///
 /// # Example
-/// ```ignore
-/// // For a timestamp 120 seconds in the past:
+/// ```
+/// use reticulum::cli::format::format_time_ago;
+/// use std::time::{SystemTime, UNIX_EPOCH};
+/// let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+/// // Recent timestamp returns "Just now"
+/// assert_eq!(format_time_ago(now - 30.0), "Just now");
+/// // 2 minutes ago
 /// assert_eq!(format_time_ago(now - 120.0), "2m ago");
 /// ```
 pub fn format_time_ago(last_heard: f64) -> String {
@@ -261,7 +273,8 @@ pub fn format_time_ago(last_heard: f64) -> String {
 /// Matches Python's `RNS.prettyfrequency()`.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::format_frequency;
 /// assert_eq!(format_frequency(0.5), "0.5/s");
 /// assert_eq!(format_frequency(0.01), "0.6/min");
 /// ```
@@ -285,8 +298,10 @@ pub fn format_frequency(freq: f64) -> String {
 /// Format a number with comma separators.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use reticulum::cli::format::format_with_commas;
 /// assert_eq!(format_with_commas(1000000), "1,000,000");
+/// assert_eq!(format_with_commas(1234567890), "1,234,567,890");
 /// ```
 pub fn format_with_commas(n: u64) -> String {
     let s = n.to_string();

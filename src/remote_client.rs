@@ -9,21 +9,6 @@
 //! Remote management uses two destination types:
 //! - `rnstransport.remote.management` - Authenticated management (ALLOW_LIST)
 //! - `rnstransport.info.blackhole` - Public blackhole info (ALLOW_ALL)
-//!
-//! # Example
-//!
-//! ```ignore
-//! use reticulum::remote_client::{RemoteClient, RemoteClientConfig};
-//!
-//! let config = RemoteClientConfig {
-//!     timeout: Duration::from_secs(15),
-//!     identity: None,
-//!     json_output: false,
-//! };
-//!
-//! let client = RemoteClient::new(transport, config);
-//! let response = client.query_status(&transport_hash).await?;
-//! ```
 
 use std::fs;
 use std::io::Read as IoRead;
