@@ -18,3 +18,4 @@ mod resource;
 mod rncp;
 mod rnx;
 mod rpc_interop;
+mod shared_instance;

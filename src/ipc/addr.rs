@@ -189,6 +189,7 @@ impl AsyncWrite for IpcStream {
 }
 
 /// A wrapper around different listener types.
+#[derive(Debug)]
 pub enum IpcListener {
     #[cfg(unix)]
     Unix(UnixListener),
@@ -210,8 +211,19 @@ impl IpcListener {
             }
             #[cfg(unix)]
             ListenerAddr::FilesystemUnix(path) => {
-                // Remove existing socket file if present
-                let _ = std::fs::remove_file(path);
+                // Never delete existing socket files - refuse to bind if one exists.
+                // This prevents accidentally destroying an active daemon's socket.
+                // If the socket is stale (from a crashed daemon), the user must
+                // manually delete it before starting a new daemon.
+                if path.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "Socket file {} already exists. Remove it manually if the daemon is not running.",
+                            path.display()
+                        ),
+                    ));
+                }
                 let listener = UnixListener::bind(path)?;
                 Ok(IpcListener::Unix(listener))
             }
@@ -294,5 +306,77 @@ mod tests {
             let fs_addr = ListenerAddr::unix_filesystem("/tmp/test.sock");
             assert!(fs_addr.display().starts_with("unix://"));
         }
+    }
+
+    /// Test that bind() fails when a socket file already exists.
+    /// This verifies we don't accidentally delete an active daemon's socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bind_fails_when_socket_file_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        // Create a file at the socket path (simulating a stale or active socket)
+        std::fs::write(&socket_path, "").unwrap();
+        assert!(socket_path.exists());
+
+        // Attempt to bind should fail
+        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
+        let result = IpcListener::bind(&addr).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("already exists"));
+
+        // File should NOT be deleted
+        assert!(socket_path.exists());
+    }
+
+    /// Test that bind() fails when trying to bind to an already-bound socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bind_fails_on_active_socket() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("active.sock");
+
+        // First bind should succeed
+        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
+        let listener = IpcListener::bind(&addr).await.unwrap();
+        assert!(socket_path.exists());
+
+        // Second bind should fail (socket file exists)
+        let result = IpcListener::bind(&addr).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+
+        // Original listener should still be functional
+        drop(listener);
+    }
+
+    /// Test that bind() succeeds on a new path with no existing socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bind_succeeds_on_new_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("new.sock");
+
+        assert!(!socket_path.exists());
+
+        let addr = ListenerAddr::FilesystemUnix(socket_path.clone());
+        let result = IpcListener::bind(&addr).await;
+
+        assert!(result.is_ok());
+        assert!(socket_path.exists());
+    }
+
+    /// Test that TCP bind still works normally (not affected by this change).
+    #[tokio::test]
+    async fn test_tcp_bind_succeeds() {
+        // Use port 0 to let OS assign an available port
+        let addr = ListenerAddr::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        let result = IpcListener::bind(&addr).await;
+        assert!(result.is_ok());
     }
 }
