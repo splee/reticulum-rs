@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,7 +182,7 @@ async fn handle_fetch_response(
     link_events: &mut tokio::sync::broadcast::Receiver<reticulum::destination::link::LinkEventData>,
     link_id: &reticulum::destination::link::LinkId,
     file_path_str: &str,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     allow_overwrite: bool,
     silent: bool,
     timeout: Duration,
@@ -371,7 +371,7 @@ async fn handle_data_event(
     resource: &mut Resource,
     payload: &[u8],
     file_path_str: &str,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     allow_overwrite: bool,
 ) -> DataEventResult {
     if !resource.receive_part(payload.to_vec()) {

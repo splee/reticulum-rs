@@ -30,6 +30,7 @@ impl<T: std::hash::Hash + Eq + Clone> CacheSet<T> {
             }
         }
 
+        // Two clones required: both set and queue need ownership
         self.set.insert(value.clone());
         self.queue.push_back(value.clone());
 

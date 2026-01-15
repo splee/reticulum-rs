@@ -1611,21 +1611,18 @@ async fn handle_announce<'a>(
         };
 
         if !destination_known {
-            if !handler
+            handler
                 .single_out_destinations
-                .contains_key(&packet.destination)
-            {
-                log::debug!(
-                    "Valid announce for {} {} hops away, received on {}",
-                    packet.destination,
-                    hops,
-                    iface_name
-                );
-
-                handler
-                    .single_out_destinations
-                    .insert(packet.destination, destination.clone());
-            }
+                .entry(packet.destination)
+                .or_insert_with(|| {
+                    log::debug!(
+                        "Valid announce for {} {} hops away, received on {}",
+                        packet.destination,
+                        hops,
+                        iface_name
+                    );
+                    destination.clone()
+                });
 
             handler.announce_manager.add(
                 packet,

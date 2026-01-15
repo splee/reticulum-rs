@@ -234,7 +234,7 @@ impl RpcClient {
 
         // Step 2: Serialize request to Python dict format
         let request_bytes = serialize_request_to_pickle(&request)
-            .map_err(|e| RpcClientError::SerializationError(e))?;
+            .map_err(RpcClientError::SerializationError)?;
 
         // Step 3: Send pickle-encoded request
         timeout(RPC_TIMEOUT, send_bytes(&mut stream, &request_bytes))
@@ -252,7 +252,7 @@ impl RpcClient {
         // Note: Python returns raw values, not wrapped in Success/Error
         // We need to interpret the response based on what we requested
         let response = parse_response_from_pickle(&response_bytes, &request)
-            .map_err(|e| RpcClientError::DeserializationError(e))?;
+            .map_err(RpcClientError::DeserializationError)?;
 
         Ok(response)
     }

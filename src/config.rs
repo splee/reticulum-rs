@@ -187,7 +187,6 @@ impl Config {
         let mut config = Config::default();
         let mut current_section: Option<String> = None;
         let mut current_subsection: Option<String> = None;
-        let mut indent_level = 0;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -196,9 +195,6 @@ impl Config {
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
                 continue;
             }
-
-            // Calculate indent level for subsection detection
-            let line_indent = line.len() - line.trim_start().len();
 
             // Section header - check for double brackets [[name]] (subsection) or single [name] (section)
             if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
@@ -219,7 +215,6 @@ impl Config {
                 let section_name = &trimmed[1..trimmed.len() - 1];
                 current_section = Some(section_name.to_string());
                 current_subsection = None;
-                indent_level = line_indent;
                 config
                     .sections
                     .entry(section_name.to_string())
@@ -462,7 +457,7 @@ impl ReticulumConfig {
                 // Python checks "interface_mode" first, then falls back to "mode"
                 let mode = subsection.get("interface_mode")
                     .or_else(|| subsection.get("mode"))
-                    .and_then(|s| crate::iface::InterfaceMode::from_str(s));
+                    .and_then(|s| s.parse().ok());
 
                 // Parse network name with backwards compatibility
                 // Python checks "networkname" first, then "network_name" (which takes precedence)

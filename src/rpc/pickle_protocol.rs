@@ -411,9 +411,9 @@ fn hashable_str(s: &str) -> serde_pickle::HashableValue {
 }
 
 /// Convert a BTreeMap<HashableValue, Value> to HashMap<String, &Value>.
-fn btree_to_string_map<'a>(
-    dict: &'a BTreeMap<serde_pickle::HashableValue, PickleValue>,
-) -> std::collections::HashMap<String, &'a PickleValue> {
+fn btree_to_string_map(
+    dict: &BTreeMap<serde_pickle::HashableValue, PickleValue>,
+) -> std::collections::HashMap<String, &PickleValue> {
     let mut map = std::collections::HashMap::new();
     for (k, v) in dict {
         if let serde_pickle::HashableValue::String(s) = k {

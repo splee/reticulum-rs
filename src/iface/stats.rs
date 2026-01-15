@@ -3,6 +3,7 @@
 //! This module provides thread-safe structures for tracking interface metadata
 //! and traffic statistics (rx/tx bytes, online status, etc.).
 
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -42,18 +43,23 @@ impl InterfaceMode {
         }
     }
 
+}
+
+impl FromStr for InterfaceMode {
+    type Err = ();
+
     /// Parse interface mode from string configuration value.
     /// Supports multiple aliases for backwards compatibility with Python implementation.
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s_lower = s.to_lowercase();
         match s_lower.as_str() {
-            "full" => Some(InterfaceMode::Full),
-            "access_point" | "accesspoint" | "ap" => Some(InterfaceMode::AccessPoint),
-            "pointtopoint" | "ptp" | "point_to_point" => Some(InterfaceMode::PointToPoint),
-            "roaming" => Some(InterfaceMode::Roaming),
-            "boundary" => Some(InterfaceMode::Boundary),
-            "gateway" | "gw" => Some(InterfaceMode::Gateway),
-            _ => None,
+            "full" => Ok(InterfaceMode::Full),
+            "access_point" | "accesspoint" | "ap" => Ok(InterfaceMode::AccessPoint),
+            "pointtopoint" | "ptp" | "point_to_point" => Ok(InterfaceMode::PointToPoint),
+            "roaming" => Ok(InterfaceMode::Roaming),
+            "boundary" => Ok(InterfaceMode::Boundary),
+            "gateway" | "gw" => Ok(InterfaceMode::Gateway),
+            _ => Err(()),
         }
     }
 }
@@ -256,27 +262,27 @@ mod tests {
     #[test]
     fn test_interface_mode_from_str() {
         // Test canonical names
-        assert_eq!(InterfaceMode::from_str("full"), Some(InterfaceMode::Full));
-        assert_eq!(InterfaceMode::from_str("accesspoint"), Some(InterfaceMode::AccessPoint));
-        assert_eq!(InterfaceMode::from_str("pointtopoint"), Some(InterfaceMode::PointToPoint));
-        assert_eq!(InterfaceMode::from_str("roaming"), Some(InterfaceMode::Roaming));
-        assert_eq!(InterfaceMode::from_str("boundary"), Some(InterfaceMode::Boundary));
-        assert_eq!(InterfaceMode::from_str("gateway"), Some(InterfaceMode::Gateway));
+        assert_eq!(InterfaceMode::from_str("full"), Ok(InterfaceMode::Full));
+        assert_eq!(InterfaceMode::from_str("accesspoint"), Ok(InterfaceMode::AccessPoint));
+        assert_eq!(InterfaceMode::from_str("pointtopoint"), Ok(InterfaceMode::PointToPoint));
+        assert_eq!(InterfaceMode::from_str("roaming"), Ok(InterfaceMode::Roaming));
+        assert_eq!(InterfaceMode::from_str("boundary"), Ok(InterfaceMode::Boundary));
+        assert_eq!(InterfaceMode::from_str("gateway"), Ok(InterfaceMode::Gateway));
 
         // Test aliases for backwards compatibility
-        assert_eq!(InterfaceMode::from_str("access_point"), Some(InterfaceMode::AccessPoint));
-        assert_eq!(InterfaceMode::from_str("ap"), Some(InterfaceMode::AccessPoint));
-        assert_eq!(InterfaceMode::from_str("point_to_point"), Some(InterfaceMode::PointToPoint));
-        assert_eq!(InterfaceMode::from_str("ptp"), Some(InterfaceMode::PointToPoint));
-        assert_eq!(InterfaceMode::from_str("gw"), Some(InterfaceMode::Gateway));
+        assert_eq!(InterfaceMode::from_str("access_point"), Ok(InterfaceMode::AccessPoint));
+        assert_eq!(InterfaceMode::from_str("ap"), Ok(InterfaceMode::AccessPoint));
+        assert_eq!(InterfaceMode::from_str("point_to_point"), Ok(InterfaceMode::PointToPoint));
+        assert_eq!(InterfaceMode::from_str("ptp"), Ok(InterfaceMode::PointToPoint));
+        assert_eq!(InterfaceMode::from_str("gw"), Ok(InterfaceMode::Gateway));
 
         // Test case insensitivity
-        assert_eq!(InterfaceMode::from_str("FULL"), Some(InterfaceMode::Full));
-        assert_eq!(InterfaceMode::from_str("Gateway"), Some(InterfaceMode::Gateway));
-        assert_eq!(InterfaceMode::from_str("AP"), Some(InterfaceMode::AccessPoint));
+        assert_eq!(InterfaceMode::from_str("FULL"), Ok(InterfaceMode::Full));
+        assert_eq!(InterfaceMode::from_str("Gateway"), Ok(InterfaceMode::Gateway));
+        assert_eq!(InterfaceMode::from_str("AP"), Ok(InterfaceMode::AccessPoint));
 
         // Test invalid values
-        assert_eq!(InterfaceMode::from_str("invalid"), None);
-        assert_eq!(InterfaceMode::from_str(""), None);
+        assert!(InterfaceMode::from_str("invalid").is_err());
+        assert!(InterfaceMode::from_str("").is_err());
     }
 }
