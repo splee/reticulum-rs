@@ -105,7 +105,7 @@ fn main() {
         );
 
         // Create transport
-        let mut transport = Transport::new(TransportConfig::new("link_server", &identity, false));
+        let transport = Transport::new(TransportConfig::new("link_server", &identity, false));
 
         // Set up interfaces
         if let Some(server_addr) = &args.tcp_server {

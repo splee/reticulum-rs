@@ -102,7 +102,7 @@ fn main() {
         );
 
         // Create transport
-        let mut transport = Transport::new(TransportConfig::new("test_dest", &identity, false));
+        let transport = Transport::new(TransportConfig::new("test_dest", &identity, false));
 
         // Set up interfaces
         if args.shared {

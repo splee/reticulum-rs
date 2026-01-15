@@ -929,7 +929,7 @@ impl Transport {
     }
 
     pub async fn add_destination(
-        &mut self,
+        &self,
         identity: PrivateIdentity,
         name: DestinationName,
     ) -> Arc<Mutex<SingleInputDestination>> {

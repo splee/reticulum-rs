@@ -71,7 +71,7 @@ pub async fn run_listen_mode(
     );
 
     // Create transport
-    let mut transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+    let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
 
     // Set up TCP interfaces if specified
     setup_transport_interfaces(

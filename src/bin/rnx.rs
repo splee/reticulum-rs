@@ -437,7 +437,7 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
         // Create destination to get its hash
         let dest_name = DestinationName::new(APP_NAME, ASPECT);
         // Create a minimal transport just to get the destination hash
-        let mut transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+        let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
         let destination = transport.add_destination(identity.clone(), dest_name).await;
         let dest_hash = destination.lock().await.desc.address_hash;
         println!("Listening on : {}", hex::encode(dest_hash.as_slice()));
@@ -453,7 +453,7 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
     }
 
     // Create transport
-    let mut transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
+    let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
 
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
