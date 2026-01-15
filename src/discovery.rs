@@ -219,7 +219,11 @@ impl InterfaceMetadata {
         if data.len() < offset + 8 {
             return Err(RnsError::InvalidArgument);
         }
-        let bandwidth = u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
+        let bandwidth = u64::from_be_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| RnsError::InvalidData)?,
+        );
         offset += 8;
 
         // Location
@@ -357,7 +361,11 @@ impl InterfaceAnnouncement {
 
         for nonce in 0..u64::MAX {
             let hash = Self::compute_pow_hash(interface_hash, public_key, verifying_key, timestamp, &metadata_bytes, nonce);
-            let hash_value = u64::from_be_bytes(hash[..8].try_into().unwrap());
+            let hash_value = u64::from_be_bytes(
+                hash[..8]
+                    .try_into()
+                    .expect("sha256 hash is always 32 bytes"),
+            );
 
             if hash_value < target {
                 return Ok(nonce);
@@ -403,7 +411,11 @@ impl InterfaceAnnouncement {
             &metadata_bytes,
             self.nonce,
         );
-        let hash_value = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        let hash_value = u64::from_be_bytes(
+            hash[..8]
+                .try_into()
+                .expect("sha256 hash is always 32 bytes"),
+        );
         hash_value < target
     }
 
@@ -459,12 +471,26 @@ impl InterfaceAnnouncement {
             return Err(RnsError::InvalidArgument);
         }
 
-        let interface_hash = AddressHash::new(data[..16].try_into().unwrap());
-        let public_key: [u8; 32] = data[16..48].try_into().unwrap();
-        let verifying_key: [u8; 32] = data[48..80].try_into().unwrap();
-        let timestamp = u64::from_be_bytes(data[80..88].try_into().unwrap());
+        let interface_hash = AddressHash::new(
+            data[..16].try_into().map_err(|_| RnsError::InvalidData)?,
+        );
+        let public_key: [u8; 32] = data[16..48]
+            .try_into()
+            .map_err(|_| RnsError::InvalidData)?;
+        let verifying_key: [u8; 32] = data[48..80]
+            .try_into()
+            .map_err(|_| RnsError::InvalidData)?;
+        let timestamp = u64::from_be_bytes(
+            data[80..88]
+                .try_into()
+                .map_err(|_| RnsError::InvalidData)?,
+        );
 
-        let metadata_len = u16::from_be_bytes(data[88..90].try_into().unwrap()) as usize;
+        let metadata_len = u16::from_be_bytes(
+            data[88..90]
+                .try_into()
+                .map_err(|_| RnsError::InvalidData)?,
+        ) as usize;
         if data.len() < 90 + metadata_len + 8 + 64 {
             return Err(RnsError::InvalidArgument);
         }
@@ -472,8 +498,14 @@ impl InterfaceAnnouncement {
         let metadata = InterfaceMetadata::decode(&data[90..90 + metadata_len])?;
         let offset = 90 + metadata_len;
 
-        let nonce = u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
-        let signature: [u8; 64] = data[offset + 8..offset + 72].try_into().unwrap();
+        let nonce = u64::from_be_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| RnsError::InvalidData)?,
+        );
+        let signature: [u8; 64] = data[offset + 8..offset + 72]
+            .try_into()
+            .map_err(|_| RnsError::InvalidData)?;
 
         Ok(Self {
             interface_hash,
