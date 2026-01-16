@@ -1607,6 +1607,15 @@ async fn handle_announce<'a>(
     iface: AddressHash,
     from_local_client: bool,
 ) {
+    // Debug log to trace announce processing
+    log::debug!(
+        "handle_announce: processing announce for {} (from_local_client={}, hops={}, client_mode={})",
+        packet.destination,
+        from_local_client,
+        packet.header.hops,
+        handler.config.is_client_mode()
+    );
+
     if let Some(blocked_until) = handler.announce_manager.check_rate_limit(&packet.destination) {
         log::info!(
             "tp({}): too many announces from {}, blocked for {} seconds",
@@ -1618,8 +1627,14 @@ async fn handle_announce<'a>(
     }
 
     let destination_known = handler.has_destination(&packet.destination);
+    log::debug!(
+        "handle_announce: destination_known={} for {}",
+        destination_known,
+        packet.destination
+    );
 
     if let Ok(result) = DestinationAnnounce::validate(packet) {
+        log::debug!("handle_announce: validation succeeded for {}", packet.destination);
         let destination = result.0;
         let app_data = result.1;
         let dest_hash = destination.identity.address_hash;
@@ -1663,6 +1678,11 @@ async fn handle_announce<'a>(
             );
         }
 
+        log::debug!(
+            "handle_announce: past destination_known block for {}, proceeding to emit",
+            packet.destination
+        );
+
         // Retransmit announces if transport is enabled OR if from local client.
         // This matches Python behavior where local client announces are always
         // forwarded to network interfaces even when transport is disabled.
@@ -1685,10 +1705,16 @@ async fn handle_announce<'a>(
             }
         }
 
+        // Emit announce event to subscribers
         let _ = handler.announce_manager.emit(AnnounceEvent {
             destination,
             app_data: PacketDataBuffer::new_from_slice(app_data),
         });
+    } else {
+        log::warn!(
+            "handle_announce: validation FAILED for {} - announce will not be processed",
+            packet.destination
+        );
     }
 }
 

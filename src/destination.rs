@@ -72,22 +72,36 @@ pub struct DestinationName {
 }
 
 impl DestinationName {
+    /// Create a new destination name from app name and aspects.
+    ///
+    /// The resulting hash is truncated to `NAME_HASH_LENGTH` bytes to match
+    /// the wire protocol format. This ensures that locally-created names
+    /// can be compared directly with names received from announce packets.
     pub fn new(app_name: &str, aspects: &str) -> Self {
-        let hash = Hash::new(
-            Hash::generator()
-                .chain_update(app_name.as_bytes())
-                .chain_update(".".as_bytes())
-                .chain_update(aspects.as_bytes())
-                .finalize()
-                .into(),
-        );
+        let full_hash: [u8; 32] = Hash::generator()
+            .chain_update(app_name.as_bytes())
+            .chain_update(".".as_bytes())
+            .chain_update(aspects.as_bytes())
+            .finalize()
+            .into();
 
-        Self { hash }
+        // Truncate to NAME_HASH_LENGTH to match wire protocol format
+        let mut truncated_hash = [0u8; 32];
+        truncated_hash[..NAME_HASH_LENGTH].copy_from_slice(&full_hash[..NAME_HASH_LENGTH]);
+
+        Self {
+            hash: Hash::new(truncated_hash),
+        }
     }
 
+    /// Create a destination name from a hash slice (typically from an announce packet).
+    ///
+    /// The slice is expected to be `NAME_HASH_LENGTH` bytes. The resulting hash
+    /// will have zeros in bytes beyond the slice length.
     pub fn new_from_hash_slice(hash_slice: &[u8]) -> Self {
         let mut hash = [0u8; 32];
-        hash[..hash_slice.len()].copy_from_slice(hash_slice);
+        let copy_len = hash_slice.len().min(NAME_HASH_LENGTH);
+        hash[..copy_len].copy_from_slice(&hash_slice[..copy_len]);
 
         Self {
             hash: Hash::new(hash),
@@ -452,5 +466,54 @@ mod tests {
             .expect("valid announce packet");
 
         DestinationAnnounce::validate(&announce).expect("valid announce");
+    }
+
+    #[test]
+    fn test_name_hash_truncation() {
+        use super::NAME_HASH_LENGTH;
+
+        // Create a name hash locally
+        let local_name = DestinationName::new("rrc.v2", "hub");
+        let local_hash = local_name.hash.as_slice();
+
+        // Verify only the first NAME_HASH_LENGTH bytes are non-zero
+        // (the rest should be zero due to truncation)
+        assert!(
+            local_hash[NAME_HASH_LENGTH..].iter().all(|&b| b == 0),
+            "Bytes after NAME_HASH_LENGTH should be zero"
+        );
+
+        // Simulate receiving a name hash from an announce packet (only 10 bytes)
+        let received_slice = &local_hash[..NAME_HASH_LENGTH];
+        let received_name = DestinationName::new_from_hash_slice(received_slice);
+
+        // The hashes should be identical - this is the key behavior we're testing
+        assert_eq!(
+            local_name.hash.as_slice(),
+            received_name.hash.as_slice(),
+            "Locally created name hash should match one reconstructed from announce"
+        );
+    }
+
+    #[test]
+    fn test_name_hash_from_announce_matches_local() {
+        // This test verifies the full round-trip: create destination, announce,
+        // validate announce, and compare the resulting name hash with original
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let original_name = DestinationName::new("test.app", "service");
+
+        let destination = SingleInputDestination::new(priv_identity, original_name);
+
+        // Create and validate an announce packet
+        let announce = destination.announce(OsRng, None).expect("valid announce");
+        let (validated_dest, _app_data) =
+            DestinationAnnounce::validate(&announce).expect("validation should succeed");
+
+        // The name hash from the validated announce should match the original
+        assert_eq!(
+            original_name.hash.as_slice(),
+            validated_dest.desc.name.hash.as_slice(),
+            "Name hash from validated announce should match original"
+        );
     }
 }

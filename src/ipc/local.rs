@@ -300,6 +300,13 @@ impl LocalClientInterface {
                                                     if let Ok(packet) = Packet::deserialize(
                                                         &mut InputBuffer::new(output.as_slice())
                                                     ) {
+                                                        // Debug log for all received packets to trace IPC relay
+                                                        log::debug!(
+                                                            "local_client: rx << received {:?} packet (dst={}) from <{}>",
+                                                            packet.header.packet_type,
+                                                            packet.destination,
+                                                            peer_addr
+                                                        );
                                                         if PACKET_TRACE {
                                                             log::debug!(
                                                                 "local_client: rx << ({}) {}",
@@ -366,6 +373,13 @@ impl LocalClientInterface {
                             }
                             Some(message) = tx_channel.recv() => {
                                 let packet = message.packet;
+                                // Debug log for announce packets to trace IPC relay
+                                log::debug!(
+                                    "local_client: tx >> sending {:?} packet (dst={}) to <{}>",
+                                    packet.header.packet_type,
+                                    packet.destination,
+                                    peer_addr
+                                );
                                 if PACKET_TRACE {
                                     log::debug!("local_client: tx >> ({}) {}", iface_address, packet);
                                 }

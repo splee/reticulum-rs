@@ -245,6 +245,13 @@ impl InterfaceManager {
     }
 
     pub async fn send(&self, message: TxMessage) {
+        log::debug!(
+            "iface_manager: send {:?} pkt_type={:?} to {} interfaces (local_clients: {})",
+            message.tx_type,
+            message.packet.header.packet_type,
+            self.ifaces.len(),
+            self.ifaces.iter().filter(|i| i.is_local_client).count()
+        );
         let mut sent = false;
         for iface in &self.ifaces {
             let should_send = match &message.tx_type {
@@ -259,9 +266,25 @@ impl InterfaceManager {
                 TxMessageType::Direct(address) => *address == iface.address,
             };
 
-            if should_send && !iface.stop.is_cancelled() {
-                let _ = iface.tx_send.send(message).await;
-                sent = true;
+            let stopped = iface.stop.is_cancelled();
+            log::debug!(
+                "iface_manager: considering iface {} (local_client={}, should_send={}, stopped={})",
+                iface.address,
+                iface.is_local_client,
+                should_send,
+                stopped
+            );
+
+            if should_send && !stopped {
+                match iface.tx_send.send(message).await {
+                    Ok(()) => {
+                        log::debug!("iface_manager: sent to iface {}", iface.address);
+                        sent = true;
+                    }
+                    Err(e) => {
+                        log::warn!("iface_manager: failed to send to iface {}: {}", iface.address, e);
+                    }
+                }
             }
         }
 

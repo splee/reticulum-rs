@@ -129,7 +129,21 @@ impl AnnounceManager {
     ///
     /// Returns Ok(num_receivers) on success, or Err if no receivers.
     pub fn emit(&self, event: AnnounceEvent) -> Result<usize, broadcast::error::SendError<AnnounceEvent>> {
-        self.event_tx.send(event)
+        let result = self.event_tx.send(event);
+        match &result {
+            Ok(count) => {
+                log::debug!(
+                    "announce_manager: emit sent to {} subscribers",
+                    count
+                );
+            }
+            Err(_) => {
+                log::debug!(
+                    "announce_manager: emit failed - no subscribers"
+                );
+            }
+        }
+        result
     }
 
     /// Get a clone of the event sender for passing to other components.
