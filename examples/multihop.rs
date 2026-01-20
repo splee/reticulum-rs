@@ -11,13 +11,13 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::packet::{HeaderType, Packet, PacketDataBuffer, PropagationType};
+use reticulum::packet::{HeaderType, Packet, PacketDataBuffer, TransportType};
 use reticulum::transport::{Transport, TransportConfig};
 
 fn create_data_packet(message: &String, destination: AddressHash) -> Packet {
     let mut packet: Packet = Default::default();
 
-    packet.header.propagation_type = PropagationType::Transport;
+    packet.header.transport_type = TransportType::Transport;
     packet.destination = destination;
     packet.data = PacketDataBuffer::new_from_slice(message.as_bytes());
 

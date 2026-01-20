@@ -109,21 +109,25 @@ impl MessageBase for StreamDataMessage {
     }
 }
 
-/// Compress data using deflate
+/// Compress data using bz2 (matching Python's Buffer compression).
 fn compress(data: &[u8]) -> Result<Vec<u8>, RnsError> {
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression;
     use std::io::Write;
-    let mut encoder =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+
+    let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(data)
         .map_err(|_| RnsError::InvalidArgument)?;
     encoder.finish().map_err(|_| RnsError::InvalidArgument)
 }
 
-/// Decompress data using deflate
+/// Decompress data using bz2 (matching Python's Buffer decompression).
 fn decompress(data: &[u8]) -> Result<Vec<u8>, RnsError> {
+    use bzip2::read::BzDecoder;
     use std::io::Read;
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
+
+    let mut decoder = BzDecoder::new(data);
     let mut result = Vec::new();
     decoder
         .read_to_end(&mut result)

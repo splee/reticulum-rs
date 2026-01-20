@@ -24,7 +24,47 @@ use crate::{
 
 use super::DestinationDesc;
 
+/// Size of MTU/mode signalling field in link packets (3 bytes).
 const LINK_MTU_SIZE: usize = 3;
+
+/// Default link MTU matching Python's RNS.Reticulum.MTU (500 bytes).
+const DEFAULT_LINK_MTU: u32 = 500;
+
+/// Link encryption/signing modes (matching Python Link.py).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LinkMode {
+    /// AES-128 CBC mode for encryption
+    Aes128Cbc = 0x00,
+    /// AES-256 CBC mode for encryption (default)
+    Aes256Cbc = 0x01,
+}
+
+impl Default for LinkMode {
+    fn default() -> Self {
+        // Match Python's default mode (MODE_AES256_CBC)
+        LinkMode::Aes256Cbc
+    }
+}
+
+/// MTU byte mask for extracting MTU from signalling bytes (21 bits).
+const MTU_BYTEMASK: u32 = 0x1FFFFF;
+
+/// Mode byte mask for extracting mode from signalling bytes.
+const MODE_BYTEMASK: u32 = 0xE0;
+
+/// Generate signalling bytes for link MTU negotiation (matching Python Link.signalling_bytes).
+///
+/// Returns a 3-byte array encoding the MTU and link mode.
+/// Format: Big-endian 24-bit value where:
+/// - Lower 21 bits: MTU value
+/// - Upper 3 bits: Mode (shifted left by 5)
+fn signalling_bytes(mtu: u32, mode: LinkMode) -> [u8; LINK_MTU_SIZE] {
+    let signalling_value = (mtu & MTU_BYTEMASK) + ((((mode as u32) << 5) & MODE_BYTEMASK) << 16);
+    // Pack as big-endian 32-bit, take last 3 bytes (like Python's struct.pack(">I", ...)[1:])
+    let packed = signalling_value.to_be_bytes();
+    [packed[1], packed[2], packed[3]]
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum LinkStatus {
@@ -201,6 +241,10 @@ pub struct Link {
     /// This is set when the link initiator calls identify() and the server
     /// validates the identity proof.
     remote_identity: Option<Identity>,
+    /// Link encryption mode (AES-128 or AES-256 CBC).
+    mode: LinkMode,
+    /// Negotiated MTU for this link.
+    mtu: u32,
 }
 
 impl Link {
@@ -225,6 +269,8 @@ impl Link {
             last_resource_eifr: None,
             initiator: true,
             remote_identity: None,
+            mode: LinkMode::default(),
+            mtu: DEFAULT_LINK_MTU,
         }
     }
 
@@ -235,6 +281,11 @@ impl Link {
         destination: DestinationDesc,
         event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
     ) -> Result<Self, RnsError> {
+        // Link request data format (matching Python):
+        // - pub_bytes: 32 bytes (X25519 public key)
+        // - sig_pub_bytes: 32 bytes (Ed25519 verifying key)
+        // - signalling_bytes: 3 bytes (optional, MTU + mode)
+        // Total: 67 bytes with signalling, 64 bytes without
         if packet.data.len() < PUBLIC_KEY_LENGTH * 2 {
             return Err(RnsError::InvalidArgument);
         }
@@ -244,8 +295,27 @@ impl Link {
             &packet.data.as_slice()[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2],
         );
 
+        // Parse MTU and mode from signalling bytes if present
+        let (mtu, mode) = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
+            let sig_start = PUBLIC_KEY_LENGTH * 2;
+            let sig_bytes = &packet.data.as_slice()[sig_start..sig_start + LINK_MTU_SIZE];
+            let mtu_value = ((sig_bytes[0] as u32) << 16)
+                + ((sig_bytes[1] as u32) << 8)
+                + (sig_bytes[2] as u32);
+            let mtu = mtu_value & MTU_BYTEMASK;
+            let mode_byte = (sig_bytes[0] >> 5) & 0x07;
+            let mode = if mode_byte == 0 {
+                LinkMode::Aes128Cbc
+            } else {
+                LinkMode::Aes256Cbc
+            };
+            (mtu, mode)
+        } else {
+            (DEFAULT_LINK_MTU, LinkMode::default())
+        };
+
         let link_id = LinkId::from(packet);
-        log::debug!("link: create from request {}", link_id);
+        log::debug!("link: create from request {} (mtu={}, mode={:?})", link_id, mtu, mode);
 
         let mut link = Self {
             id: link_id,
@@ -263,6 +333,8 @@ impl Link {
             last_resource_eifr: None,
             initiator: false,
             remote_identity: None,
+            mode,
+            mtu,
         };
 
         link.handshake(peer_identity);
@@ -271,10 +343,16 @@ impl Link {
     }
 
     pub fn request(&mut self) -> Packet {
+        // Link request data format (matching Python):
+        // - pub_bytes: 32 bytes (X25519 public key)
+        // - sig_pub_bytes: 32 bytes (Ed25519 verifying key)
+        // - signalling_bytes: 3 bytes (MTU + mode)
+        // Total: 67 bytes
         let mut packet_data = PacketDataBuffer::new();
 
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        packet_data.safe_write(&signalling_bytes(self.mtu, self.mode));
 
         let packet = Packet {
             header: Header {
@@ -303,19 +381,26 @@ impl Link {
             self.post_event(LinkEvent::Activated);
         }
 
+        // Link proof data format (matching Python):
+        // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
+        // proof_data = signature + pub_bytes + signalling_bytes
+        // Total: 64 (signature) + 32 (pub_key) + 3 (signalling) = 99 bytes
+        let sig_bytes = signalling_bytes(self.mtu, self.mode);
+
+        // Build data to sign
+        let mut signed_data = PacketDataBuffer::new();
+        signed_data.safe_write(self.id.as_slice());
+        signed_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
+        signed_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        signed_data.safe_write(&sig_bytes);
+
+        let signature = self.priv_identity.sign(signed_data.as_slice());
+
+        // Build proof output
         let mut packet_data = PacketDataBuffer::new();
-
-        packet_data.safe_write(self.id.as_slice());
-        packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
-        packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
-
-        let signature = self.priv_identity.sign(packet_data.as_slice());
-
-        packet_data.reset();
         packet_data.safe_write(&signature.to_bytes()[..]);
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
-
-        
+        packet_data.safe_write(&sig_bytes);
 
         Packet {
             header: Header {
@@ -1636,8 +1721,8 @@ mod tests {
             assert_eq!(packet.header.packet_type, PacketType::LinkRequest);
             assert_eq!(packet.destination, dest.address_hash);
             assert_eq!(packet.context, PacketContext::None);
-            // Data should contain public key + verifying key (64 bytes)
-            assert_eq!(packet.data.len(), PUBLIC_KEY_LENGTH * 2);
+            // Data should contain public key + verifying key + signalling bytes (64 + 3 = 67 bytes)
+            assert_eq!(packet.data.len(), PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE);
         }
 
         #[test]

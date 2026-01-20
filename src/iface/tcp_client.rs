@@ -16,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use alloc::string::String;
 
 use super::hdlc::Hdlc;
+use super::tcp_options::configure_tcp_socket;
 use super::{Interface, InterfaceContext};
 
 // TODO: Configure via features
@@ -93,6 +94,12 @@ impl TcpClient {
             let stop = CancellationToken::new();
 
             let stream = stream.unwrap();
+
+            // Configure TCP socket options (keepalive, nodelay, etc.)
+            if let Err(e) = configure_tcp_socket(&stream) {
+                log::warn!("tcp_client: failed to configure socket options: {}", e);
+            }
+
             let (read_stream, write_stream) = stream.into_split();
 
             // Mark interface as online
@@ -245,7 +252,8 @@ impl TcpClient {
 }
 
 impl Interface for TcpClient {
+    /// TCP interface hardware MTU (matching Python's TCPInterface.HW_MTU = 262144 = 256KB).
     fn mtu() -> usize {
-        2048
+        262144
     }
 }

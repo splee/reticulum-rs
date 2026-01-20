@@ -19,7 +19,7 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::logging;
-use reticulum::packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PropagationType};
+use reticulum::packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, TransportType};
 use reticulum::receipt::ReceiptStatus;
 use reticulum::transport::{Transport, TransportConfig};
 
@@ -396,7 +396,7 @@ fn create_probe_packet(
         header: Header {
             packet_type: PacketType::Data,
             destination_type: DestinationType::Single,
-            propagation_type: PropagationType::Broadcast,
+            transport_type: TransportType::Broadcast,
             ..Default::default()
         },
         destination: destination.desc.address_hash,

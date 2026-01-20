@@ -4,6 +4,7 @@ pub mod link_map;
 pub mod link_stats;
 pub mod plain;
 pub mod proof;
+pub mod ratchet;
 pub mod request;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
@@ -15,10 +16,10 @@ use core::{fmt, marker::PhantomData};
 use crate::{
     error::RnsError,
     hash::{AddressHash, Hash},
-    identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH},
+    identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE},
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-        PacketDataBuffer, PacketType, PropagationType,
+        PacketDataBuffer, PacketType, TransportType,
     },
 };
 use sha2::Digest;
@@ -65,6 +66,9 @@ pub const NAME_HASH_LENGTH: usize = 10;
 pub const RAND_HASH_LENGTH: usize = 10;
 pub const MIN_ANNOUNCE_DATA_LENGTH: usize =
     PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH + RAND_HASH_LENGTH + SIGNATURE_LENGTH;
+/// Minimum announce data length when ratchet is included (context_flag=true)
+pub const MIN_ANNOUNCE_DATA_LENGTH_WITH_RATCHET: usize =
+    PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH + RAND_HASH_LENGTH + RATCHET_KEY_SIZE + SIGNATURE_LENGTH;
 
 #[derive(Copy, Clone)]
 pub struct DestinationName {
@@ -130,15 +134,47 @@ impl fmt::Display for DestinationDesc {
 
 pub type DestinationAnnounce = Packet;
 
+/// Result of validating an announce packet.
+pub struct AnnounceValidation<'a> {
+    /// The destination from the announce
+    pub destination: SingleOutputDestination,
+    /// Application data from the announce
+    pub app_data: &'a [u8],
+    /// Ratchet public key if present (when context_flag is true)
+    pub ratchet: Option<[u8; RATCHET_KEY_SIZE]>,
+}
+
 impl DestinationAnnounce {
+    /// Validate an announce packet and extract destination, app_data, and optional ratchet.
+    ///
+    /// When `context_flag` is true in the packet header, the announce includes a 32-byte
+    /// ratchet public key after the random hash. This key is used for forward secrecy
+    /// when encrypting messages to the destination.
     pub fn validate(packet: &Packet) -> Result<(SingleOutputDestination, &[u8]), RnsError> {
+        let validation = Self::validate_full(packet)?;
+        Ok((validation.destination, validation.app_data))
+    }
+
+    /// Validate an announce packet with full ratchet support.
+    ///
+    /// Returns an `AnnounceValidation` struct containing the destination, app_data,
+    /// and optional ratchet public key (present when `context_flag` is true).
+    pub fn validate_full(packet: &Packet) -> Result<AnnounceValidation<'_>, RnsError> {
         if packet.header.packet_type != PacketType::Announce {
             return Err(RnsError::PacketError);
         }
 
         let announce_data = packet.data.as_slice();
+        let has_ratchet = packet.header.context_flag;
 
-        if announce_data.len() < MIN_ANNOUNCE_DATA_LENGTH {
+        // Check minimum length based on whether ratchet is present
+        let min_length = if has_ratchet {
+            MIN_ANNOUNCE_DATA_LENGTH_WITH_RATCHET
+        } else {
+            MIN_ANNOUNCE_DATA_LENGTH
+        };
+
+        if announce_data.len() < min_length {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -165,31 +201,58 @@ impl DestinationAnnounce {
         offset += NAME_HASH_LENGTH;
         let rand_hash = &announce_data[offset..(offset + RAND_HASH_LENGTH)];
         offset += RAND_HASH_LENGTH;
+
+        // Extract ratchet if context_flag is set
+        let ratchet = if has_ratchet {
+            let mut ratchet_key = [0u8; RATCHET_KEY_SIZE];
+            ratchet_key.copy_from_slice(&announce_data[offset..(offset + RATCHET_KEY_SIZE)]);
+            offset += RATCHET_KEY_SIZE;
+            Some(ratchet_key)
+        } else {
+            None
+        };
+
         let signature = &announce_data[offset..(offset + SIGNATURE_LENGTH)];
         offset += SIGNATURE_LENGTH;
         let app_data = &announce_data[offset..];
 
-        let destination = &packet.destination;
+        let destination_hash = &packet.destination;
 
-        // Keeping signed data on stack is only option for now.
-        // Verification function doesn't support prehashed message.
-        let signed_data = PacketDataBuffer::new()
-            .chain_write(destination.as_slice())?
-            .chain_write(public_key.as_bytes())?
-            .chain_write(verifying_key.as_bytes())?
-            .chain_write(name_hash)?
-            .chain_write(rand_hash)?
-            .chain_write(app_data)?
-            .finalize();
+        // Build signed data for verification
+        // Signed data format: destination_hash + public_key + verifying_key + name_hash + rand_hash + [ratchet] + app_data
+        let signed_data = if let Some(ref ratchet_key) = ratchet {
+            PacketDataBuffer::new()
+                .chain_write(destination_hash.as_slice())?
+                .chain_write(public_key.as_bytes())?
+                .chain_write(verifying_key.as_bytes())?
+                .chain_write(name_hash)?
+                .chain_write(rand_hash)?
+                .chain_write(ratchet_key)?
+                .chain_write(app_data)?
+                .finalize()
+        } else {
+            PacketDataBuffer::new()
+                .chain_write(destination_hash.as_slice())?
+                .chain_write(public_key.as_bytes())?
+                .chain_write(verifying_key.as_bytes())?
+                .chain_write(name_hash)?
+                .chain_write(rand_hash)?
+                .chain_write(app_data)?
+                .finalize()
+        };
 
         let signature = Signature::from_slice(signature).map_err(|_| RnsError::CryptoError)?;
 
         identity.verify(signed_data.as_slice(), &signature)?;
 
-        Ok((
-            SingleOutputDestination::new(identity, DestinationName::new_from_hash_slice(name_hash)),
+        Ok(AnnounceValidation {
+            destination: SingleOutputDestination::new(
+                identity,
+                DestinationName::new_from_hash_slice(name_hash),
+            ),
             app_data,
-        ))
+            ratchet,
+        })
     }
 }
 
@@ -262,8 +325,22 @@ impl Destination<PrivateIdentity, Input, Single> {
     ) -> Result<Packet, RnsError> {
         let mut packet_data = PacketDataBuffer::new();
 
-        let rand_hash = Hash::new_from_rand(rng);
-        let rand_hash = &rand_hash.as_slice()[..RAND_HASH_LENGTH];
+        // Generate rand_hash matching Python format (Destination.py line 282):
+        // random_hash = RNS.Identity.get_random_hash()[0:5] + int(time.time()).to_bytes(5, "big")
+        // This encodes a timestamp for replay prevention.
+        let mut rand_hash = [0u8; RAND_HASH_LENGTH];
+        // First 5 bytes: random
+        let random_part = Hash::new_from_rand(rng);
+        rand_hash[..5].copy_from_slice(&random_part.as_slice()[..5]);
+        // Last 5 bytes: Unix timestamp (big-endian, 5 bytes = 40 bits, enough until year ~34,000)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Take last 5 bytes of the 8-byte big-endian timestamp
+        let timestamp_bytes = timestamp.to_be_bytes();
+        rand_hash[5..].copy_from_slice(&timestamp_bytes[3..8]);
+        let rand_hash = &rand_hash[..];
 
         let pub_key = self.identity.as_identity().public_key_bytes();
         let verifying_key = self.identity.as_identity().verifying_key_bytes();
@@ -298,7 +375,87 @@ impl Destination<PrivateIdentity, Input, Single> {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: self.desc.address_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        })
+    }
+
+    /// Create an announce packet with a ratchet public key for forward secrecy.
+    ///
+    /// This method creates an announce with the ratchet included:
+    /// - The ratchet public key is appended after the random hash in both
+    ///   signed data and packet data
+    /// - The context_flag is set to true to indicate ratchet presence
+    ///
+    /// Receivers can extract the ratchet and use it for encrypted communication.
+    pub fn announce_with_ratchet<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        ratchet_pub: &[u8; RATCHET_KEY_SIZE],
+        app_data: Option<&[u8]>,
+    ) -> Result<Packet, RnsError> {
+        let mut packet_data = PacketDataBuffer::new();
+
+        // Generate rand_hash matching Python format
+        let mut rand_hash = [0u8; RAND_HASH_LENGTH];
+        let random_part = Hash::new_from_rand(rng);
+        rand_hash[..5].copy_from_slice(&random_part.as_slice()[..5]);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let timestamp_bytes = timestamp.to_be_bytes();
+        rand_hash[5..].copy_from_slice(&timestamp_bytes[3..8]);
+        let rand_hash = &rand_hash[..];
+
+        let pub_key = self.identity.as_identity().public_key_bytes();
+        let verifying_key = self.identity.as_identity().verifying_key_bytes();
+
+        // Build signed data: dest_hash + pubkey + verifying_key + name_hash + rand_hash + ratchet + app_data
+        packet_data
+            .chain_safe_write(self.desc.address_hash.as_slice())
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(self.desc.name.as_name_hash_slice())
+            .chain_safe_write(rand_hash)
+            .chain_safe_write(ratchet_pub);
+
+        if let Some(data) = app_data {
+            packet_data.write(data)?;
+        }
+
+        let signature = self.identity.sign(packet_data.as_slice());
+
+        packet_data.reset();
+
+        // Build packet data: pubkey + verifying_key + name_hash + rand_hash + ratchet + signature + app_data
+        packet_data
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(self.desc.name.as_name_hash_slice())
+            .chain_safe_write(rand_hash)
+            .chain_safe_write(ratchet_pub)
+            .chain_safe_write(&signature.to_bytes());
+
+        if let Some(data) = app_data {
+            packet_data.write(data)?;
+        }
+
+        Ok(Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: true, // Indicates ratchet is present
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
                 hops: 0,
@@ -515,5 +672,162 @@ mod tests {
             validated_dest.desc.name.hash.as_slice(),
             "Name hash from validated announce should match original"
         );
+    }
+
+    #[test]
+    fn test_validate_full_without_ratchet() {
+        // Test that validate_full works for announces without ratchet
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let original_name = DestinationName::new("test.app", "service");
+
+        let destination = SingleInputDestination::new(priv_identity, original_name);
+
+        let announce = destination.announce(OsRng, None).expect("valid announce");
+
+        // Verify context_flag is false (no ratchet)
+        assert!(!announce.header.context_flag, "Announce without ratchet should have context_flag=false");
+
+        // Use validate_full to get the full result
+        let validation = DestinationAnnounce::validate_full(&announce).expect("validation should succeed");
+
+        // Ratchet should be None
+        assert!(validation.ratchet.is_none(), "Announce without ratchet should have None ratchet");
+
+        // Name hash should still match
+        assert_eq!(
+            original_name.hash.as_slice(),
+            validation.destination.desc.name.hash.as_slice(),
+            "Name hash from validated announce should match original"
+        );
+    }
+
+    #[test]
+    fn test_validate_full_with_ratchet() {
+        use crate::identity::{generate_ratchet, ratchet_public_bytes};
+        use crate::packet::{Packet, PacketDataBuffer, Header, HeaderType, IfacFlag, TransportType, DestinationType, PacketType, PacketContext};
+
+        // Create identity and destination
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "ratchetservice");
+        let address_hash = crate::destination::create_address_hash(priv_identity.as_identity(), &name);
+
+        // Generate a ratchet key
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Build announce data with ratchet
+        let pub_key = priv_identity.as_identity().public_key_bytes();
+        let verifying_key = priv_identity.as_identity().verifying_key_bytes();
+        let name_hash = name.as_name_hash_slice();
+
+        // Random hash (10 bytes)
+        let rand_hash: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22];
+
+        // Build signed data: destination_hash + pubkey + verifying_key + name_hash + rand_hash + ratchet + app_data
+        let app_data = b"test app data";
+        let signed_data = PacketDataBuffer::new()
+            .chain_write(address_hash.as_slice()).unwrap()
+            .chain_write(pub_key).unwrap()
+            .chain_write(verifying_key).unwrap()
+            .chain_write(name_hash).unwrap()
+            .chain_write(&rand_hash).unwrap()
+            .chain_write(&ratchet_pub).unwrap()
+            .chain_write(app_data).unwrap()
+            .finalize();
+
+        let signature = priv_identity.sign(signed_data.as_slice());
+
+        // Build packet data: pubkey + verifying_key + name_hash + rand_hash + ratchet + signature + app_data
+        let packet_data = PacketDataBuffer::new()
+            .chain_write(pub_key).unwrap()
+            .chain_write(verifying_key).unwrap()
+            .chain_write(name_hash).unwrap()
+            .chain_write(&rand_hash).unwrap()
+            .chain_write(&ratchet_pub).unwrap()
+            .chain_write(&signature.to_bytes()).unwrap()
+            .chain_write(app_data).unwrap()
+            .finalize();
+
+        // Create packet with context_flag=true
+        let announce = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: true,  // Indicates ratchet is present
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: address_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        };
+
+        // Validate with full ratchet support
+        let validation = DestinationAnnounce::validate_full(&announce).expect("validation should succeed");
+
+        // Verify ratchet was extracted
+        assert!(validation.ratchet.is_some(), "Announce with context_flag should have ratchet");
+        let extracted_ratchet = validation.ratchet.unwrap();
+        assert_eq!(extracted_ratchet, ratchet_pub, "Extracted ratchet should match original");
+
+        // Verify app data
+        assert_eq!(validation.app_data, app_data, "App data should match");
+
+        // Verify destination
+        assert_eq!(
+            validation.destination.desc.address_hash.as_slice(),
+            address_hash.as_slice(),
+            "Destination hash should match"
+        );
+    }
+
+    #[test]
+    fn test_announce_with_ratchet_roundtrip() {
+        use crate::identity::{generate_ratchet, ratchet_public_bytes, get_ratchet_id};
+
+        // Create identity and destination
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "ratchetservice");
+        let destination = SingleInputDestination::new(priv_identity, name);
+
+        // Generate a ratchet key
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Create announce with ratchet
+        let announce = destination
+            .announce_with_ratchet(OsRng, &ratchet_pub, None)
+            .expect("valid announce");
+
+        // Verify context_flag is set
+        assert!(announce.header.context_flag, "Announce with ratchet should have context_flag=true");
+
+        // Validate the announce
+        let validation = DestinationAnnounce::validate_full(&announce)
+            .expect("Announce should validate");
+
+        // Verify ratchet was extracted
+        assert!(validation.ratchet.is_some(), "Should extract ratchet from announce");
+        let extracted_ratchet = validation.ratchet.unwrap();
+        assert_eq!(extracted_ratchet, ratchet_pub, "Extracted ratchet should match original");
+
+        // Verify ratchet ID
+        let ratchet_id = get_ratchet_id(&extracted_ratchet);
+        let expected_ratchet_id = get_ratchet_id(&ratchet_pub);
+        assert_eq!(ratchet_id, expected_ratchet_id, "Ratchet IDs should match");
+
+        // Verify destination matches
+        assert_eq!(
+            validation.destination.desc.address_hash.as_slice(),
+            destination.desc.address_hash.as_slice(),
+            "Destination hash should match"
+        );
+
+        eprintln!("announce_with_ratchet roundtrip test passed!");
+        eprintln!("  Ratchet ID: {}", hex::encode(&ratchet_id));
     }
 }

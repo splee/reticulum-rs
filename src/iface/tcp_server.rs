@@ -7,6 +7,7 @@ use crate::error::RnsError;
 use crate::iface::stats::InterfaceMetadata;
 
 use super::tcp_client::TcpClient;
+use super::tcp_options::configure_tcp_socket;
 use super::{Interface, InterfaceContext, InterfaceManager};
 
 pub struct TcpServer {
@@ -106,17 +107,22 @@ impl TcpServer {
                     }
 
                     client = listener.accept() => {
-                        if let Ok(client) = client {
+                        if let Ok((stream, peer_addr)) = client {
                             log::info!(
                                 "tcp_server: new client <{}> connected to <{}>",
-                                client.1,
+                                peer_addr,
                                 addr
                             );
+
+                            // Configure TCP socket options (keepalive, nodelay, etc.)
+                            if let Err(e) = configure_tcp_socket(&stream) {
+                                log::warn!("tcp_server: failed to configure socket options for {}: {}", peer_addr, e);
+                            }
 
                             let mut iface_manager = iface_manager.lock().await;
 
                             iface_manager.spawn(
-                                TcpClient::new_from_stream(client.1.to_string(), client.0),
+                                TcpClient::new_from_stream(peer_addr.to_string(), stream),
                                 TcpClient::spawn,
                             );
                         }
@@ -135,7 +141,8 @@ impl TcpServer {
 }
 
 impl Interface for TcpServer {
+    /// TCP interface hardware MTU (matching Python's TCPInterface.HW_MTU = 262144 = 256KB).
     fn mtu() -> usize {
-        2048
+        262144
     }
 }

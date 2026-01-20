@@ -14,11 +14,69 @@ use crate::{
 
 pub const PUBLIC_KEY_LENGTH: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 
+/// X25519 key size in bytes (matches Python's ratchet key size)
+pub const RATCHET_KEY_SIZE: usize = 32;
+
+/// Ratchet ID length in bytes (NAME_HASH_LENGTH / 8 from Python)
+pub const RATCHET_ID_LENGTH: usize = 10;
+
 #[cfg(feature = "fernet-aes128")]
 pub const DERIVED_KEY_LENGTH: usize = 256 / 8;
 
 #[cfg(not(feature = "fernet-aes128"))]
 pub const DERIVED_KEY_LENGTH: usize = 512 / 8;
+
+// =============================================================================
+// Ratchet Key Functions
+// =============================================================================
+// These functions provide forward secrecy for SINGLE destinations by rotating
+// encryption keys. The ratchet public key is included in announces when enabled.
+
+/// Generate a new ratchet private key.
+///
+/// Returns the 32-byte X25519 private key bytes.
+/// This matches Python's `Identity._generate_ratchet()`.
+pub fn generate_ratchet<R: CryptoRngCore>(mut rng: R) -> [u8; RATCHET_KEY_SIZE] {
+    let private_key = StaticSecret::random_from_rng(&mut rng);
+    *private_key.as_bytes()
+}
+
+/// Derive the public key bytes from a ratchet private key.
+///
+/// Returns the 32-byte X25519 public key bytes.
+/// This matches Python's `Identity._ratchet_public_bytes()`.
+pub fn ratchet_public_bytes(ratchet_priv: &[u8; RATCHET_KEY_SIZE]) -> [u8; RATCHET_KEY_SIZE] {
+    let private_key = StaticSecret::from(*ratchet_priv);
+    let public_key = PublicKey::from(&private_key);
+    *public_key.as_bytes()
+}
+
+/// Calculate the ratchet ID from a ratchet public key.
+///
+/// Returns the first 10 bytes of the SHA-256 hash of the public key.
+/// This matches Python's `Identity._get_ratchet_id()`.
+pub fn get_ratchet_id(ratchet_pub: &[u8; RATCHET_KEY_SIZE]) -> [u8; RATCHET_ID_LENGTH] {
+    let mut hasher = Sha256::new();
+    hasher.update(ratchet_pub);
+    let hash = hasher.finalize();
+
+    let mut id = [0u8; RATCHET_ID_LENGTH];
+    id.copy_from_slice(&hash[..RATCHET_ID_LENGTH]);
+    id
+}
+
+/// Perform X25519 key exchange with a ratchet private key and peer public key.
+///
+/// Returns the derived shared secret that can be used for encryption.
+pub fn ratchet_exchange(
+    ratchet_priv: &[u8; RATCHET_KEY_SIZE],
+    peer_pub: &[u8; RATCHET_KEY_SIZE],
+) -> [u8; RATCHET_KEY_SIZE] {
+    let private_key = StaticSecret::from(*ratchet_priv);
+    let peer_public = PublicKey::from(*peer_pub);
+    let shared = private_key.diffie_hellman(&peer_public);
+    *shared.as_bytes()
+}
 
 pub trait EncryptIdentity {
     fn encrypt<'a, R: CryptoRngCore + Copy>(
@@ -177,9 +235,12 @@ impl EncryptIdentity for Identity {
             }
         }
 
+        // Split derived key into signing and encryption keys (matching Python's Fernet key handling).
+        // For AES-256 (default): 64-byte key split into 32-byte signing + 32-byte encryption.
+        // For AES-128 (feature): 32-byte key split into 16-byte signing + 16-byte encryption.
         let token = Fernet::new_from_slices(
-            &derived_key.as_bytes()[..16],
-            &derived_key.as_bytes()[16..],
+            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
         )
         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
@@ -475,7 +536,7 @@ impl DerivedKey {
 mod tests {
     use rand_core::OsRng;
 
-    use super::PrivateIdentity;
+    use super::*;
 
     #[test]
     fn private_identity_hex_string() {
@@ -494,5 +555,65 @@ mod tests {
             actual_id.sign_key.as_bytes(),
             original_id.sign_key.as_bytes()
         );
+    }
+
+    #[test]
+    fn test_generate_ratchet() {
+        let ratchet1 = generate_ratchet(OsRng);
+        let ratchet2 = generate_ratchet(OsRng);
+
+        // Each generated ratchet should be unique
+        assert_ne!(ratchet1, ratchet2);
+
+        // Should be 32 bytes
+        assert_eq!(ratchet1.len(), RATCHET_KEY_SIZE);
+    }
+
+    #[test]
+    fn test_ratchet_public_bytes() {
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Public key should be 32 bytes
+        assert_eq!(ratchet_pub.len(), RATCHET_KEY_SIZE);
+
+        // Same private key should produce same public key
+        let ratchet_pub2 = ratchet_public_bytes(&ratchet_priv);
+        assert_eq!(ratchet_pub, ratchet_pub2);
+
+        // Different private key should produce different public key
+        let ratchet_priv2 = generate_ratchet(OsRng);
+        let ratchet_pub3 = ratchet_public_bytes(&ratchet_priv2);
+        assert_ne!(ratchet_pub, ratchet_pub3);
+    }
+
+    #[test]
+    fn test_get_ratchet_id() {
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+        let ratchet_id = get_ratchet_id(&ratchet_pub);
+
+        // Ratchet ID should be 10 bytes
+        assert_eq!(ratchet_id.len(), RATCHET_ID_LENGTH);
+
+        // Same public key should produce same ratchet ID
+        let ratchet_id2 = get_ratchet_id(&ratchet_pub);
+        assert_eq!(ratchet_id, ratchet_id2);
+    }
+
+    #[test]
+    fn test_ratchet_exchange() {
+        // Generate two ratchet key pairs (simulating two parties)
+        let alice_priv = generate_ratchet(OsRng);
+        let alice_pub = ratchet_public_bytes(&alice_priv);
+
+        let bob_priv = generate_ratchet(OsRng);
+        let bob_pub = ratchet_public_bytes(&bob_priv);
+
+        // Both parties should derive the same shared secret
+        let alice_shared = ratchet_exchange(&alice_priv, &bob_pub);
+        let bob_shared = ratchet_exchange(&bob_priv, &alice_pub);
+
+        assert_eq!(alice_shared, bob_shared);
     }
 }

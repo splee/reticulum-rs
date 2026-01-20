@@ -13,6 +13,7 @@ mod local_client;
 mod multihop;
 mod path;
 mod probe;
+mod ratchet;
 mod remote_status;
 mod resource;
 mod rncp;

@@ -4,11 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     hash::{AddressHash, Hash},
-    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType},
+    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, TransportType},
 };
 
-/// Default path expiration time (30 minutes, matching Python)
-pub const PATH_EXPIRY_TIME: Duration = Duration::from_secs(30 * 60);
+/// Default path expiration time (1 week, matching Python's PATHFINDER_E).
+///
+/// Python reference (Transport.py lines 70-72):
+/// - PATHFINDER_E = 60*60*24*7 (1 week = 604800 seconds) - standard path expiration
+/// - AP_PATH_TIME = 60*60*24 (1 day) - for Access Point paths
+/// - ROAMING_PATH_TIME = 60*60*6 (6 hours) - for Roaming paths
+pub const PATH_EXPIRY_TIME: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
 /// Internal path entry stored in the path table
 pub struct PathEntry {
@@ -231,7 +236,8 @@ impl PathTable {
                     header: Header {
                         ifac_flag: IfacFlag::Authenticated,
                         header_type: HeaderType::Type1,
-                        propagation_type: original_packet.header.propagation_type,
+                        context_flag: original_packet.header.context_flag,
+                        transport_type: original_packet.header.transport_type,
                         destination_type: original_packet.header.destination_type,
                         packet_type: original_packet.header.packet_type,
                         hops: original_packet.header.hops + 1,
@@ -250,9 +256,10 @@ impl PathTable {
                     header: Header {
                         ifac_flag: IfacFlag::Authenticated,
                         header_type: HeaderType::Type2,
-                        // Type2 packets must use Transport propagation type for Python compatibility
+                        context_flag: original_packet.header.context_flag,
+                        // Type2 packets must use Transport transport type for Python compatibility
                         // Python expects bit 4 = 1 (transport_type=TRANSPORT) for routed packets
-                        propagation_type: PropagationType::Transport,
+                        transport_type: TransportType::Transport,
                         destination_type: original_packet.header.destination_type,
                         packet_type: original_packet.header.packet_type,
                         hops: original_packet.header.hops + 1,
@@ -318,9 +325,10 @@ impl PathTable {
                         // Preserve original ifac_flag - Python expects Open for Type2 packets
                         ifac_flag: original_packet.header.ifac_flag,
                         header_type: HeaderType::Type2,
-                        // Type2 packets must use Transport propagation type for Python compatibility
+                        context_flag: original_packet.header.context_flag,
+                        // Type2 packets must use Transport transport type for Python compatibility
                         // Python expects bit 4 = 1 (transport_type=TRANSPORT) for routed packets
-                        propagation_type: PropagationType::Transport,
+                        transport_type: TransportType::Transport,
                         destination_type: original_packet.header.destination_type,
                         packet_type: original_packet.header.packet_type,
                         hops: original_packet.header.hops,

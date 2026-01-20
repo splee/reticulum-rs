@@ -25,7 +25,8 @@ fn send_backwards(packet: &Packet, entry: &LinkEntry) -> (Packet, AddressHash) {
         header: Header {
             ifac_flag: IfacFlag::Authenticated,
             header_type: HeaderType::Type2,
-            propagation_type: packet.header.propagation_type,
+            context_flag: packet.header.context_flag,
+            transport_type: packet.header.transport_type,
             destination_type: packet.header.destination_type,
             packet_type: packet.header.packet_type,
             hops: packet.header.hops + 1,
@@ -121,7 +122,7 @@ impl LinkTable {
 mod tests {
     use super::*;
     use crate::packet::{
-        DestinationType, PacketContext, PacketDataBuffer, PacketType, PropagationType,
+        DestinationType, PacketContext, PacketDataBuffer, PacketType, TransportType,
     };
 
     /// Create a test address hash with a specific byte pattern.
@@ -138,7 +139,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Transport,
+                context_flag: false,
+                transport_type: TransportType::Transport,
                 destination_type: DestinationType::Link,
                 packet_type: PacketType::LinkRequest,
                 hops,
@@ -157,7 +159,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Authenticated,
                 header_type: HeaderType::Type2,
-                propagation_type: PropagationType::Transport,
+                context_flag: false,
+                transport_type: TransportType::Transport,
                 destination_type: DestinationType::Link,
                 packet_type: PacketType::Proof,
                 hops,

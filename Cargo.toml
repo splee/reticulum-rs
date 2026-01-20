@@ -49,6 +49,9 @@ tokio-stream = "0.1.17"
 tokio-util = "0.7.15"
 futures = "0.3"
 
+# Low-level socket access (for TCP keepalive options)
+socket2 = "0.5"
+
 # Serialization
 rmp = "0.8.14"
 rmpv = "1.0"

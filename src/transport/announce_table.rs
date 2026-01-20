@@ -5,7 +5,7 @@ use tokio::time::{Duration, Instant};
 use crate::hash::AddressHash;
 use crate::packet::{
     DestinationType, Header, HeaderType, IfacFlag,
-    Packet, PacketContext, PacketType, PropagationType
+    Packet, PacketContext, PacketType, TransportType
 };
 
 pub struct AnnounceEntry {
@@ -47,7 +47,8 @@ impl AnnounceEntry {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type2,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
                 hops: self.hops,
@@ -191,7 +192,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
                 hops,

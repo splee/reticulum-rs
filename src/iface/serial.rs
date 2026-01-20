@@ -237,7 +237,7 @@ impl SerialInterface {
 
 impl Interface for SerialInterface {
     fn mtu() -> usize {
-        500 // Standard Reticulum MTU
+        564 // Reticulum serial MTU (matches Python implementation)
     }
 }
 
@@ -373,7 +373,7 @@ impl KissInterface {
 
 impl Interface for KissInterface {
     fn mtu() -> usize {
-        500
+        564 // Reticulum serial MTU (matches Python implementation)
     }
 }
 
@@ -442,5 +442,18 @@ mod tests {
         assert_eq!(iface.stats().tx_bytes, 100);
         assert_eq!(iface.stats().rx_bytes, 200);
         assert_eq!(iface.stats().tx_errors, 1);
+    }
+
+    #[test]
+    fn test_serial_mtu_564() {
+        // Verify serial MTU matches Python implementation (564 bytes)
+        // Python: RNS/Interfaces/Interface.py AUTOCONFIGURE_MTU = 564
+        assert_eq!(SerialInterface::mtu(), 564);
+    }
+
+    #[test]
+    fn test_kiss_mtu_564() {
+        // Verify KISS interface MTU also matches Python implementation
+        assert_eq!(KissInterface::mtu(), 564);
     }
 }

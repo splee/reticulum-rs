@@ -14,7 +14,7 @@ use crate::hash::{AddressHash, Hash};
 use crate::error::RnsError;
 use crate::packet::{
     DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-    PacketDataBuffer, PacketType, PropagationType,
+    PacketDataBuffer, PacketType, TransportType,
 };
 
 /// Default path request timeout
@@ -286,7 +286,8 @@ impl PathRequestManager {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Plain,
                 packet_type: PacketType::Data,
                 hops: 0,
@@ -680,7 +681,7 @@ mod tests {
         // Verify packet properties
         assert_eq!(packet.header.packet_type, PacketType::Data);
         assert_eq!(packet.header.destination_type, DestinationType::Plain);
-        assert_eq!(packet.header.propagation_type, PropagationType::Broadcast);
+        assert_eq!(packet.header.transport_type, TransportType::Broadcast);
         assert_eq!(packet.header.header_type, HeaderType::Type1);
         assert_eq!(packet.header.hops, 0);
         assert_eq!(packet.context, PacketContext::None);

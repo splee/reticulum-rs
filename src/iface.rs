@@ -1,6 +1,7 @@
 pub mod auto_interface;
 pub mod hdlc;
 pub mod serial;
+pub mod tcp_options;
 
 pub mod kaonic;
 pub mod tcp_client;
@@ -333,6 +334,17 @@ impl InterfaceManager {
     /// Check if an interface address belongs to a local client interface.
     pub fn is_local_client(&self, address: &AddressHash) -> bool {
         self.ifaces.iter().any(|iface| &iface.address == address && iface.is_local_client)
+    }
+
+    /// Get the list of active network interface addresses (excludes local clients).
+    ///
+    /// Used for per-interface announce queue management (ANNOUNCE_CAP).
+    pub fn network_interface_addresses(&self) -> Vec<AddressHash> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.is_local_client && !iface.stop.is_cancelled())
+            .map(|iface| iface.address)
+            .collect()
     }
 
     /// Send a packet from a local client to all network interfaces.

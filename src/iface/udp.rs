@@ -195,6 +195,18 @@ impl UdpInterface {
 
 impl Interface for UdpInterface {
     fn mtu() -> usize {
-        2048
+        1064 // Reticulum UDP MTU (matches Python implementation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_udp_mtu_1064() {
+        // Verify UDP MTU matches Python implementation (1064 bytes)
+        // Python: RNS/Interfaces/UDPInterface.py UDP_MTU = 1064
+        assert_eq!(UdpInterface::mtu(), 1064);
     }
 }

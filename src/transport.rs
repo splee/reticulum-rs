@@ -50,6 +50,7 @@ use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAUL
 
 mod announce_limits;
 pub mod announce_manager;
+pub mod announce_queue;
 mod announce_table;
 pub mod link_manager;
 mod link_table;
@@ -66,6 +67,7 @@ pub mod reverse_table;
 pub mod tunnel;
 
 use announce_manager::AnnounceManager;
+use announce_queue::{AnnounceQueueManager, QueuedAnnounce};
 use link_manager::LinkManager;
 use path_manager::PathManager;
 use path_request::PathRequestManager;
@@ -88,6 +90,7 @@ const INTERVAL_IFACE_CLEANUP: Duration = Duration::from_secs(10);
 const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
 const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
+const INTERVAL_ANNOUNCE_QUEUE_PROCESS: Duration = Duration::from_millis(100);
 
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
@@ -124,6 +127,9 @@ struct TransportHandler {
 
     /// Unified announce management (caching + rate limiting + events)
     announce_manager: AnnounceManager,
+
+    /// Per-interface announce queues for ANNOUNCE_CAP bandwidth limiting
+    announce_queue_manager: AnnounceQueueManager,
 
     /// Unified link management (in/out links + routing table + events)
     link_manager: LinkManager,
@@ -246,6 +252,7 @@ impl Transport {
             iface_manager: iface_manager.clone(),
             path_manager: PathManager::new(),
             announce_manager: AnnounceManager::new(announce_tx),
+            announce_queue_manager: AnnounceQueueManager::new(),
             link_manager: LinkManager::new(link_in_event_tx.clone()),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
@@ -1062,9 +1069,11 @@ impl Transport {
     // Announce Queue Methods (for rnpath CLI)
     // =========================================================================
 
-    /// Drop all queued announces from the announce table
+    /// Drop all queued announces from the announce table and per-interface queues.
     pub async fn drop_announce_queues(&self) {
-        self.handler.lock().await.announce_manager.clear();
+        let mut handler = self.handler.lock().await;
+        handler.announce_manager.clear();
+        handler.announce_queue_manager.clear_all();
     }
 
     // =========================================================================
@@ -1689,19 +1698,71 @@ async fn handle_announce<'a>(
         let should_retransmit = handler.config.retransmit || from_local_client;
         if should_retransmit {
             let transport_id = *handler.config.identity.address_hash();
-            if let Some((recv_from, packet)) = handler.announce_manager.new_packet(
+            if let Some((recv_from, retransmit_packet)) = handler.announce_manager.new_packet(
                 &dest_hash,
                 &transport_id,
             ) {
-                log::debug!(
-                    "Rebroadcasting announce for {} with hop count {}",
-                    packet.destination,
-                    packet.header.hops
-                );
-                handler.send(TxMessage {
-                    tx_type: TxMessageType::Broadcast(Some(recv_from)),
-                    packet
-                }).await;
+                let hops = retransmit_packet.header.hops;
+
+                // Local announces (hops=0) bypass bandwidth limiting
+                if hops == 0 {
+                    log::debug!(
+                        "Rebroadcasting local announce for {} with hop count {}",
+                        retransmit_packet.destination,
+                        hops
+                    );
+                    handler.send(TxMessage {
+                        tx_type: TxMessageType::Broadcast(Some(recv_from)),
+                        packet: retransmit_packet
+                    }).await;
+                } else {
+                    // For non-local announces, use per-interface bandwidth limiting
+                    let interfaces = handler.iface_manager.lock().await.network_interface_addresses();
+
+                    for iface_addr in interfaces {
+                        // Skip the interface that sent us this announce
+                        if iface_addr == recv_from {
+                            continue;
+                        }
+
+                        // Check if this interface can transmit now
+                        if handler.announce_queue_manager.can_transmit_now(&iface_addr, hops) {
+                            // Send immediately and record transmit time
+                            log::debug!(
+                                "Rebroadcasting announce for {} on {} with hop count {}",
+                                retransmit_packet.destination,
+                                iface_addr,
+                                hops
+                            );
+
+                            // Estimate packet size for timing calculation (100 bytes is reasonable)
+                            let packet_size = 100;
+                            handler.announce_queue_manager.record_transmit(&iface_addr, packet_size);
+
+                            handler.send(TxMessage {
+                                tx_type: TxMessageType::Direct(iface_addr),
+                                packet: retransmit_packet
+                            }).await;
+                        } else {
+                            // Queue for later transmission
+                            let queued = QueuedAnnounce {
+                                timestamp: std::time::Instant::now(),
+                                hops,
+                                packet: retransmit_packet,
+                                destination_hash: dest_hash,
+                                received_from: recv_from,
+                            };
+                            handler.announce_queue_manager.enqueue(&iface_addr, queued);
+
+                            log::trace!(
+                                "Queued announce for {} on {} (queue size: {})",
+                                retransmit_packet.destination,
+                                iface_addr,
+                                handler.announce_queue_manager.total_queued()
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1901,13 +1962,46 @@ async fn retransmit_announces<'a>(mut handler: MutexGuard<'a, TransportHandler>)
     }
 }
 
+/// Process announce queues for ANNOUNCE_CAP bandwidth limiting.
+///
+/// This function processes per-interface announce queues and sends queued
+/// announces when the interface is allowed to transmit (based on bandwidth cap).
+async fn process_announce_queues<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
+    // Get all ready announces from queues
+    let ready = handler.announce_queue_manager.process_queues();
+
+    if ready.is_empty() {
+        return;
+    }
+
+    for (iface_addr, queued) in ready {
+        log::debug!(
+            "Processing queued announce for {} on {} (hops={})",
+            queued.destination_hash,
+            iface_addr,
+            queued.hops
+        );
+
+        // Record the transmit time for this interface
+        let packet_size = 100; // Estimate packet size
+        handler.announce_queue_manager.record_transmit(&iface_addr, packet_size);
+
+        // Send to the specific interface
+        handler.send(TxMessage {
+            tx_type: TxMessageType::Direct(iface_addr),
+            packet: queued.packet,
+        }).await;
+    }
+}
+
 #[allow(dead_code)]
 fn create_retransmit_packet(packet: &Packet) -> Packet {
     Packet {
         header: Header {
             ifac_flag: packet.header.ifac_flag,
             header_type: packet.header.header_type,
-            propagation_type: packet.header.propagation_type,
+            context_flag: packet.header.context_flag,
+            transport_type: packet.header.transport_type,
             destination_type: packet.header.destination_type,
             packet_type: packet.header.packet_type,
             hops: packet.header.hops + 1,
@@ -2131,6 +2225,29 @@ async fn manage_transport(
                     },
                     _ = time::sleep(INTERVAL_ANNOUNCES_RETRANSMIT) => {
                         retransmit_announces(handler.lock().await).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Process announce queues for ANNOUNCE_CAP bandwidth limiting
+    if retransmit && !client_mode {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(INTERVAL_ANNOUNCE_QUEUE_PROCESS) => {
+                        process_announce_queues(handler.lock().await).await;
                     }
                 }
             }

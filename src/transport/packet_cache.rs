@@ -69,7 +69,7 @@ mod tests {
     use crate::hash::AddressHash;
     use crate::packet::{
         DestinationType, Header, HeaderType, IfacFlag, PacketContext, PacketDataBuffer,
-        PacketType, PropagationType,
+        PacketType, TransportType,
     };
 
     /// Create a test address hash with a specific byte pattern.
@@ -83,7 +83,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Data,
                 hops,
