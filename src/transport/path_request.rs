@@ -17,8 +17,8 @@ use crate::packet::{
     PacketDataBuffer, PacketType, TransportType,
 };
 
-/// Default path request timeout
-pub const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default path request timeout (matches Python's PATH_REQUEST_TIMEOUT = 15s)
+pub const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Default interval between path request retries
 pub const PATH_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(10);

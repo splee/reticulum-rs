@@ -7,6 +7,7 @@ pub mod proof;
 pub mod ratchet;
 pub mod request;
 
+use alloc::sync::Arc;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use rand_core::CryptoRngCore;
 use x25519_dalek::PublicKey;
@@ -14,6 +15,7 @@ use x25519_dalek::PublicKey;
 use core::{fmt, marker::PhantomData};
 
 use crate::{
+    destination::link::Link,
     error::RnsError,
     hash::{AddressHash, Hash},
     identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE},
@@ -23,6 +25,62 @@ use crate::{
     },
 };
 use sha2::Digest;
+
+//***************************************************************************//
+// Destination Callbacks
+//
+// These callback types match the Python API for destination callbacks:
+// - link_established_callback: Called when a link is established to this destination
+// - packet_callback: Called when a packet is received for this destination
+// - proof_requested_callback: Called when a proof is requested (for PROVE_APP strategy)
+//***************************************************************************//
+
+/// Callback type for link establishment events.
+/// Called with a reference to the established link.
+pub type LinkEstablishedCallback = Arc<dyn Fn(&Link) + Send + Sync + 'static>;
+
+/// Callback type for packet reception events.
+/// Called with the packet data and the full packet.
+pub type PacketCallback = Arc<dyn Fn(&[u8], &Packet) + Send + Sync + 'static>;
+
+/// Callback type for proof request events.
+/// Called with the packet and should return true to send a proof, false otherwise.
+pub type ProofRequestedCallback = Arc<dyn Fn(&Packet) -> bool + Send + Sync + 'static>;
+
+/// Container for destination callbacks.
+///
+/// These callbacks provide application-level hooks for destination events,
+/// matching the Python API:
+/// - `set_link_established_callback()`
+/// - `set_packet_callback()`
+/// - `set_proof_requested_callback()`
+#[derive(Clone, Default)]
+pub struct DestinationCallbacks {
+    /// Called when a link is established to this destination
+    pub link_established: Option<LinkEstablishedCallback>,
+    /// Called when a packet is received for this destination
+    pub packet: Option<PacketCallback>,
+    /// Called when a proof is requested (for PROVE_APP strategy).
+    /// Should return true to send a proof, false otherwise.
+    pub proof_requested: Option<ProofRequestedCallback>,
+}
+
+impl DestinationCallbacks {
+    /// Create a new empty callbacks container.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for DestinationCallbacks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DestinationCallbacks")
+            .field("link_established", &self.link_established.is_some())
+            .field("packet", &self.packet.is_some())
+            .field("proof_requested", &self.proof_requested.is_some())
+            .finish()
+    }
+}
 
 //***************************************************************************//
 
@@ -261,6 +319,8 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub r#type: PhantomData<T>,
     pub identity: I,
     pub desc: DestinationDesc,
+    /// Callbacks for destination events (matching Python's callback API)
+    pub callbacks: DestinationCallbacks,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -315,6 +375,7 @@ impl Destination<PrivateIdentity, Input, Single> {
                 name,
                 address_hash,
             },
+            callbacks: DestinationCallbacks::default(),
         }
     }
 
@@ -473,12 +534,71 @@ impl Destination<PrivateIdentity, Input, Single> {
             return DestinationHandleStatus::None;
         }
 
+        // Invoke packet callback if set
+        if let Some(ref callback) = self.callbacks.packet {
+            callback(packet.data.as_slice(), packet);
+        }
+
         if packet.header.packet_type == PacketType::LinkRequest {
-            // TODO: check prove strategy
-            return DestinationHandleStatus::LinkProof;
+            // Check proof_requested callback for PROVE_APP strategy
+            if let Some(ref proof_callback) = self.callbacks.proof_requested {
+                if proof_callback(packet) {
+                    return DestinationHandleStatus::LinkProof;
+                }
+            } else {
+                // Default behavior: always send proof
+                return DestinationHandleStatus::LinkProof;
+            }
         }
 
         DestinationHandleStatus::None
+    }
+
+    /// Notify destination that a link has been established.
+    ///
+    /// This invokes the link_established callback if set.
+    pub fn notify_link_established(&self, link: &Link) {
+        if let Some(ref callback) = self.callbacks.link_established {
+            callback(link);
+        }
+    }
+
+    /// Set the callback for link establishment events.
+    ///
+    /// Matches Python's `set_link_established_callback()` method.
+    pub fn set_link_established_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&Link) + Send + Sync + 'static,
+    {
+        self.callbacks.link_established = Some(Arc::new(callback));
+    }
+
+    /// Set the callback for packet reception events.
+    ///
+    /// Matches Python's `set_packet_callback()` method.
+    /// The callback receives the packet data and the full packet.
+    pub fn set_packet_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&[u8], &Packet) + Send + Sync + 'static,
+    {
+        self.callbacks.packet = Some(Arc::new(callback));
+    }
+
+    /// Set the callback for proof request events.
+    ///
+    /// Matches Python's `set_proof_requested_callback()` method.
+    /// The callback should return true to send a proof, false otherwise.
+    /// This is used with PROVE_APP proof strategy.
+    pub fn set_proof_requested_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&Packet) -> bool + Send + Sync + 'static,
+    {
+        self.callbacks.proof_requested = Some(Arc::new(callback));
+    }
+
+    /// Clear all callbacks.
+    pub fn clear_callbacks(&mut self) {
+        self.callbacks = DestinationCallbacks::default();
     }
 
     pub fn sign_key(&self) -> &SigningKey {
@@ -498,6 +618,7 @@ impl Destination<Identity, Output, Single> {
                 name,
                 address_hash,
             },
+            callbacks: DestinationCallbacks::default(),
         }
     }
 }
@@ -514,6 +635,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
                 name,
                 address_hash,
             },
+            callbacks: DestinationCallbacks::default(),
         }
     }
 }

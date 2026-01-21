@@ -10,12 +10,18 @@ use super::tcp_client::TcpClient;
 use super::tcp_options::configure_tcp_socket;
 use super::{Interface, InterfaceContext, InterfaceManager};
 
+/// TCP server interface supporting both HDLC and KISS framing.
+///
+/// Accepted client connections inherit the server's framing mode.
 pub struct TcpServer {
     addr: String,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    /// When true, use KISS framing instead of HDLC for all clients
+    kiss_framing: bool,
 }
 
 impl TcpServer {
+    /// Create a new TCP server with HDLC framing (default).
     pub fn new<T: Into<String>>(
         addr: T,
         iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
@@ -23,18 +29,42 @@ impl TcpServer {
         Self {
             addr: addr.into(),
             iface_manager,
+            kiss_framing: false,
         }
     }
 
+    /// Create a new TCP server with the specified framing mode.
+    pub fn new_with_framing<T: Into<String>>(
+        addr: T,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+        kiss_framing: bool,
+    ) -> Self {
+        Self {
+            addr: addr.into(),
+            iface_manager,
+            kiss_framing,
+        }
+    }
+
+    /// Enable KISS framing (builder pattern).
+    pub fn with_kiss_framing(mut self) -> Self {
+        self.kiss_framing = true;
+        self
+    }
+
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().await.addr.clone() };
+        let (addr, kiss_framing) = {
+            let inner = context.inner.lock().await;
+            (inner.addr.clone(), inner.kiss_framing)
+        };
         let iface_address = context.channel.address;
 
         let iface_manager = { context.inner.lock().await.iface_manager.clone() };
 
         // Create interface metadata for stats tracking
+        let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
         let metadata = Arc::new(InterfaceMetadata::new(
-            format!("TCPServerInterface[{}]", addr),
+            format!("TCPServerInterface[{}]({})", addr, framing_type),
             "TCPServer",
             "TCPServerInterface",
             addr.clone(),
@@ -109,9 +139,10 @@ impl TcpServer {
                     client = listener.accept() => {
                         if let Ok((stream, peer_addr)) = client {
                             log::info!(
-                                "tcp_server: new client <{}> connected to <{}>",
+                                "tcp_server: new client <{}> connected to <{}> ({})",
                                 peer_addr,
-                                addr
+                                addr,
+                                framing_type
                             );
 
                             // Configure TCP socket options (keepalive, nodelay, etc.)
@@ -121,8 +152,9 @@ impl TcpServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
+                            // Spawn client with the same framing mode as the server
                             iface_manager.spawn(
-                                TcpClient::new_from_stream(peer_addr.to_string(), stream),
+                                TcpClient::new_from_stream_with_framing(peer_addr.to_string(), stream, kiss_framing),
                                 TcpClient::spawn,
                             );
                         }

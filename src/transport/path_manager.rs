@@ -5,6 +5,7 @@
 //! with PathRequestTagCache (for deduplication) into a single coherent component.
 
 use crate::hash::AddressHash;
+use crate::iface::stats::InterfaceMode;
 use crate::packet::Packet;
 
 use super::path_request::PathRequestTagCache;
@@ -129,13 +130,19 @@ impl PathManager {
     }
 
     /// Process an announce packet and update the path table.
+    ///
+    /// The `iface_mode` parameter determines the path expiry duration:
+    /// - AccessPoint: 1 day
+    /// - Roaming: 6 hours
+    /// - Full/others: 1 week
     pub fn handle_announce(
         &mut self,
         announce: &Packet,
         transport_id: Option<AddressHash>,
         iface: AddressHash,
+        iface_mode: InterfaceMode,
     ) {
-        self.table.handle_announce(announce, transport_id, iface)
+        self.table.handle_announce(announce, transport_id, iface, iface_mode)
     }
 
     // =========================================================================

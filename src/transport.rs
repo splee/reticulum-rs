@@ -38,6 +38,7 @@ use crate::iface::InterfaceStatsSnapshot;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
 use crate::iface::TxMessageType;
+use crate::iface::stats::InterfaceMode;
 
 use crate::packet::DestinationType;
 use crate::packet::Header;
@@ -121,6 +122,7 @@ pub struct AnnounceEvent {
 struct TransportHandler {
     config: TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
+    interface_registry: Arc<InterfaceRegistry>,
 
     /// Unified path management (routing table + request deduplication)
     path_manager: PathManager,
@@ -250,6 +252,7 @@ impl Transport {
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
             iface_manager: iface_manager.clone(),
+            interface_registry: interface_registry.clone(),
             path_manager: PathManager::new(),
             announce_manager: AnnounceManager::new(announce_tx),
             announce_queue_manager: AnnounceQueueManager::new(),
@@ -1680,10 +1683,19 @@ async fn handle_announce<'a>(
                 from_local_client,
             );
 
+            // Get actual interface mode from interface registry for correct path expiry times
+            let interface_mode = handler
+                .interface_registry
+                .get(&iface)
+                .await
+                .map(|metadata| metadata.mode)
+                .unwrap_or(InterfaceMode::Full);
+
             handler.path_manager.handle_announce(
                 packet,
                 packet.transport,
                 iface,
+                interface_mode,
             );
         }
 

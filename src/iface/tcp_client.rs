@@ -16,41 +16,92 @@ use tokio::io::AsyncReadExt;
 use alloc::string::String;
 
 use super::hdlc::Hdlc;
+use super::kiss::Kiss;
 use super::tcp_options::configure_tcp_socket;
 use super::{Interface, InterfaceContext};
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 
+/// TCP client interface supporting both HDLC and KISS framing.
+///
+/// The framing mode determines how packets are encoded on the wire:
+/// - HDLC (default): Uses 0x7e delimiters with byte stuffing (0x7d escape)
+/// - KISS: Uses 0xC0 delimiters with 0xDB escape sequences
+///
+/// Python reference: RNS/Interfaces/TCPInterface.py supports kiss_framing config option.
 pub struct TcpClient {
     addr: String,
     stream: Option<TcpStream>,
+    /// When true, use KISS framing instead of HDLC
+    kiss_framing: bool,
 }
 
 impl TcpClient {
+    /// Create a new TCP client with HDLC framing (default).
     pub fn new<T: Into<String>>(addr: T) -> Self {
         Self {
             addr: addr.into(),
             stream: None,
+            kiss_framing: false,
         }
     }
 
+    /// Create a new TCP client from an existing stream with HDLC framing.
     pub fn new_from_stream<T: Into<String>>(addr: T, stream: TcpStream) -> Self {
         Self {
             addr: addr.into(),
             stream: Some(stream),
+            kiss_framing: false,
         }
+    }
+
+    /// Create a new TCP client with the specified framing mode.
+    ///
+    /// # Arguments
+    /// * `addr` - Address to connect to (host:port)
+    /// * `kiss_framing` - When true, use KISS framing instead of HDLC
+    pub fn new_with_framing<T: Into<String>>(addr: T, kiss_framing: bool) -> Self {
+        Self {
+            addr: addr.into(),
+            stream: None,
+            kiss_framing,
+        }
+    }
+
+    /// Create a new TCP client from an existing stream with the specified framing mode.
+    pub fn new_from_stream_with_framing<T: Into<String>>(addr: T, stream: TcpStream, kiss_framing: bool) -> Self {
+        Self {
+            addr: addr.into(),
+            stream: Some(stream),
+            kiss_framing,
+        }
+    }
+
+    /// Enable KISS framing (builder pattern).
+    pub fn with_kiss_framing(mut self) -> Self {
+        self.kiss_framing = true;
+        self
+    }
+
+    /// Check if KISS framing is enabled.
+    pub fn is_kiss_framing(&self) -> bool {
+        self.kiss_framing
     }
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
-        let addr = { context.inner.lock().await.addr.clone() };
+        let (addr, kiss_framing) = {
+            let inner = context.inner.lock().await;
+            (inner.addr.clone(), inner.kiss_framing)
+        };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().await.stream.take() };
 
         // Create interface metadata for stats tracking
+        let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
         let metadata = Arc::new(InterfaceMetadata::new(
-            format!("TCPInterface[{}]", addr),
+            format!("TCPInterface[{}]({})", addr, framing_type),
             "TCPClient",
             "TCPClientInterface",
             addr.clone(),
@@ -117,7 +168,7 @@ impl TcpClient {
                 let metadata = metadata.clone();
 
                 tokio::spawn(async move {
-                    let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
+                    let mut decode_rx_buffer = [0u8; BUFFER_SIZE];
                     let mut rx_buffer = [0u8; BUFFER_SIZE + (BUFFER_SIZE / 2)];
                     let mut tcp_buffer = [0u8; (BUFFER_SIZE * 16)];
 
@@ -140,18 +191,30 @@ impl TcpClient {
                                             // Track received bytes for stats
                                             metadata.add_rx_bytes(n as u64);
 
-                                            // TCP stream may contain several or partial HDLC frames
+                                            // TCP stream may contain several or partial frames
                                             for &byte in tcp_buffer.iter().take(n) {
                                                 // Push new byte from the end of buffer
                                                 rx_buffer[BUFFER_SIZE-1] = byte;
 
-                                                // Check if it is contains a HDLC frame
-                                                let frame = Hdlc::find(&rx_buffer[..]);
+                                                // Find frame using appropriate framing mode
+                                                let frame = if kiss_framing {
+                                                    Kiss::find(&rx_buffer[..])
+                                                } else {
+                                                    Hdlc::find(&rx_buffer[..])
+                                                };
+
                                                 if let Some(frame) = frame {
-                                                    // Decode HDLC frame and deserialize packet
+                                                    // Decode frame and deserialize packet
                                                     let frame_buffer = &mut rx_buffer[frame.0..frame.1+1];
-                                                    let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
-                                                    if Hdlc::decode(frame_buffer, &mut output).is_ok() {
+                                                    let mut output = OutputBuffer::new(&mut decode_rx_buffer[..]);
+
+                                                    let decode_result = if kiss_framing {
+                                                        Kiss::decode(frame_buffer, &mut output)
+                                                    } else {
+                                                        Hdlc::decode(frame_buffer, &mut output)
+                                                    };
+
+                                                    if decode_result.is_ok() {
                                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
                                                             if PACKET_TRACE {
                                                                 log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
@@ -161,10 +224,11 @@ impl TcpClient {
                                                             log::warn!("tcp_client: couldn't decode packet");
                                                         }
                                                     } else {
-                                                        log::warn!("tcp_client: couldn't decode hdlc frame");
+                                                        let framing = if kiss_framing { "kiss" } else { "hdlc" };
+                                                        log::warn!("tcp_client: couldn't decode {} frame", framing);
                                                     }
 
-                                                    // Remove current HDLC frame data
+                                                    // Remove current frame data
                                                     frame_buffer.fill(0);
                                                 } else {
                                                     // Move data left
@@ -196,7 +260,7 @@ impl TcpClient {
                             break;
                         }
 
-                        let mut hdlc_tx_buffer = [0u8; BUFFER_SIZE];
+                        let mut encoded_tx_buffer = [0u8; BUFFER_SIZE];
                         let mut tx_buffer = [0u8; BUFFER_SIZE];
 
                         let mut tx_channel = tx_channel.lock().await;
@@ -216,15 +280,22 @@ impl TcpClient {
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
                                 if packet.serialize(&mut output).is_ok() {
 
-                                    let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
+                                    let mut encoded_output = OutputBuffer::new(&mut encoded_tx_buffer[..]);
 
-                                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
-                                        let hdlc_slice = hdlc_output.as_slice();
+                                    // Encode using appropriate framing mode
+                                    let encode_result = if kiss_framing {
+                                        Kiss::encode(output.as_slice(), &mut encoded_output)
+                                    } else {
+                                        Hdlc::encode(output.as_slice(), &mut encoded_output)
+                                    };
+
+                                    if encode_result.is_ok() {
+                                        let encoded_slice = encoded_output.as_slice();
 
                                         // Track transmitted bytes for stats
-                                        metadata.add_tx_bytes(hdlc_slice.len() as u64);
+                                        metadata.add_tx_bytes(encoded_slice.len() as u64);
 
-                                        let _ = stream.write_all(hdlc_slice).await;
+                                        let _ = stream.write_all(encoded_slice).await;
                                         let _ = stream.flush().await;
                                     }
                                 }

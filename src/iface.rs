@@ -1,5 +1,6 @@
 pub mod auto_interface;
 pub mod hdlc;
+pub mod kiss;
 pub mod serial;
 pub mod tcp_options;
 
