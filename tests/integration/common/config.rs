@@ -57,7 +57,7 @@ impl TestConfig {
   panic_on_interface_error = No
 
 [logging]
-  loglevel = 5
+  loglevel = 2
 
 [interfaces]
 
@@ -115,7 +115,7 @@ impl TestConfig {
   panic_on_interface_error = No
 
 [logging]
-  loglevel = 5
+  loglevel = 2
 
 [interfaces]
 
@@ -175,7 +175,7 @@ impl TestConfig {
   panic_on_interface_error = No
 
 [logging]
-  loglevel = 5
+  loglevel = 2
 
 [interfaces]
 
@@ -224,7 +224,7 @@ impl TestConfig {
   panic_on_interface_error = No
 
 [logging]
-  loglevel = 5
+  loglevel = 2
 
 [interfaces]
   # No interfaces configured
@@ -236,6 +236,177 @@ impl TestConfig {
         Ok(Self {
             dir,
             tcp_port,
+            shared_port,
+            control_port,
+        })
+    }
+
+    /// Create configuration for a Python hub with KISS framing.
+    ///
+    /// The hub runs with KISS framing instead of HDLC.
+    pub fn python_hub_with_kiss() -> io::Result<Self> {
+        let ports = allocate_ports(3);
+        let tcp_port = ports[0];
+        let shared_port = ports[1];
+        let control_port = ports[2];
+
+        let dir = TempDir::new()?;
+        let config_content = format!(
+            r#"# Python Hub Configuration with KISS framing (generated for integration test)
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = Yes
+  shared_instance_port = {shared_port}
+  instance_control_port = {control_port}
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 2
+
+[interfaces]
+
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    enabled = True
+    listen_ip = 127.0.0.1
+    listen_port = {tcp_port}
+    kiss_framing = True
+"#
+        );
+
+        fs::write(dir.path().join("config"), config_content)?;
+
+        Ok(Self {
+            dir,
+            tcp_port,
+            shared_port,
+            control_port,
+        })
+    }
+
+    /// Create configuration for a Rust node with KISS framing.
+    pub fn rust_node_with_kiss(hub_port: u16) -> io::Result<Self> {
+        let ports = allocate_ports(2);
+        let shared_port = ports[0];
+        let control_port = ports[1];
+        let tcp_port = allocate_ports(1)[0];
+
+        let dir = TempDir::new()?;
+
+        let config_content = format!(
+            r#"# Rust Node Configuration with KISS framing (generated for integration test)
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = No
+  shared_instance_port = {shared_port}
+  instance_control_port = {control_port}
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 2
+
+[interfaces]
+
+  [[TCP Client Interface]]
+    type = TCPClientInterface
+    enabled = True
+    target_host = 127.0.0.1
+    target_port = {hub_port}
+    kiss_framing = True
+"#
+        );
+
+        fs::write(dir.path().join("config"), config_content)?;
+
+        Ok(Self {
+            dir,
+            tcp_port,
+            shared_port,
+            control_port,
+        })
+    }
+
+    /// Create configuration for a UDP interface hub.
+    pub fn udp_hub(bind_port: u16) -> io::Result<Self> {
+        let ports = allocate_ports(2);
+        let shared_port = ports[0];
+        let control_port = ports[1];
+
+        let dir = TempDir::new()?;
+        let config_content = format!(
+            r#"# UDP Hub Configuration (generated for integration test)
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = Yes
+  shared_instance_port = {shared_port}
+  instance_control_port = {control_port}
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 2
+
+[interfaces]
+
+  [[UDP Interface]]
+    type = UDPInterface
+    enabled = True
+    listen_ip = 127.0.0.1
+    listen_port = {bind_port}
+    forward_ip = 127.0.0.1
+    forward_port = 0
+"#
+        );
+
+        fs::write(dir.path().join("config"), config_content)?;
+
+        Ok(Self {
+            dir,
+            tcp_port: bind_port,
+            shared_port,
+            control_port,
+        })
+    }
+
+    /// Create configuration for a UDP interface node that forwards to a hub.
+    pub fn udp_node(bind_port: u16, forward_port: u16) -> io::Result<Self> {
+        let ports = allocate_ports(2);
+        let shared_port = ports[0];
+        let control_port = ports[1];
+
+        let dir = TempDir::new()?;
+        let config_content = format!(
+            r#"# UDP Node Configuration (generated for integration test)
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = No
+  shared_instance_port = {shared_port}
+  instance_control_port = {control_port}
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 2
+
+[interfaces]
+
+  [[UDP Interface]]
+    type = UDPInterface
+    enabled = True
+    listen_ip = 127.0.0.1
+    listen_port = {bind_port}
+    forward_ip = 127.0.0.1
+    forward_port = {forward_port}
+"#
+        );
+
+        fs::write(dir.path().join("config"), config_content)?;
+
+        Ok(Self {
+            dir,
+            tcp_port: bind_port,
             shared_port,
             control_port,
         })
