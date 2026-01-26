@@ -144,14 +144,17 @@ path = "examples/multihop.rs"
 [[bin]]
 name = "rnsd"
 path = "src/bin/rnsd.rs"
+test = false
 
 [[bin]]
 name = "rnstatus"
 path = "src/bin/rnstatus.rs"
+test = false
 
 [[bin]]
 name = "rnpath"
 path = "src/bin/rnpath.rs"
+test = false
 
 [[bin]]
 name = "rnid"
@@ -160,31 +163,58 @@ path = "src/bin/rnid.rs"
 [[bin]]
 name = "rnprobe"
 path = "src/bin/rnprobe.rs"
+test = false
 
 [[bin]]
 name = "test_destination"
 path = "src/bin/test_destination.rs"
+test = false
 
 [[bin]]
 name = "test_link_server"
 path = "src/bin/test_link_server.rs"
+test = false
 
 [[bin]]
 name = "test_link_client"
 path = "src/bin/test_link_client.rs"
+test = false
 
 [[bin]]
 name = "test_resource_server"
 path = "src/bin/test_resource_server.rs"
+test = false
 
 [[bin]]
 name = "test_resource_client"
 path = "src/bin/test_resource_client.rs"
+test = false
 
 [[bin]]
 name = "rnx"
 path = "src/bin/rnx.rs"
+test = false
 
 [[bin]]
 name = "rncp"
 path = "src/bin/rncp/main.rs"
+
+[[bin]]
+name = "test_packet_codec"
+path = "src/bin/test_packet_codec.rs"
+test = false
+
+[[bin]]
+name = "test_plain_hash"
+path = "src/bin/test_plain_hash.rs"
+test = false
+
+[[bin]]
+name = "test_group_crypto"
+path = "src/bin/test_group_crypto.rs"
+test = false
+
+[[bin]]
+name = "test_crypto_primitives"
+path = "src/bin/test_crypto_primitives.rs"
+test = false

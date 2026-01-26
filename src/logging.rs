@@ -323,10 +323,14 @@ mod tests {
 
         init(LogLevel::Debug, LogDestination::Callback(callback)).unwrap();
 
+        // Record baseline count (may be non-zero if other tests logged through this callback)
+        let baseline = count.load(Ordering::SeqCst);
+
         debug("Test message 1");
         debug("Test message 2");
 
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // Check that exactly 2 additional messages were logged
+        assert_eq!(count.load(Ordering::SeqCst) - baseline, 2);
     }
 
     #[test]

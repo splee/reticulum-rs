@@ -36,7 +36,7 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 
 #[tokio::test]
 async fn calculate_hop_distance() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
     let mut transport_b = build_transport("b", "127.0.0.1:8082", &["127.0.0.1:8081"]).await;
