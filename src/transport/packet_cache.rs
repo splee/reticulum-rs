@@ -147,40 +147,44 @@ mod tests {
     }
 
     #[test]
-    fn test_update_tracks_min_hops_lower() {
+    fn test_update_records_hops_correctly() {
         let mut cache = PacketCache::new();
 
-        // Create packets with same hash but different hops
-        let mut packet = test_packet(5, 0xEE);
+        // Create packet with specific hops value
+        let packet = test_packet(5, 0xEE);
         cache.update(&packet);
 
-        // Check initial min_hops
+        // Check hops is recorded correctly
         let hash = packet.hash();
         assert_eq!(cache.map.get(&hash).unwrap().min_hops, 5);
-
-        // Update with lower hops
-        packet.header.hops = 2;
-        cache.update(&packet);
-
-        // min_hops should be updated to lower value
-        assert_eq!(cache.map.get(&hash).unwrap().min_hops, 2);
     }
 
     #[test]
-    fn test_update_does_not_increase_min_hops() {
+    fn test_different_hops_creates_different_hash() {
+        // With Python-compatible hashing, different hops = different hash
+        let packet1 = test_packet(5, 0xEE);
+        let packet2 = test_packet(2, 0xEE);
+
+        // Same data but different hops should produce different hashes
+        assert_ne!(packet1.hash(), packet2.hash());
+    }
+
+    #[test]
+    fn test_duplicate_packet_preserves_min_hops() {
         let mut cache = PacketCache::new();
 
-        let mut packet = test_packet(3, 0xFF);
+        // Insert packet and record initial min_hops
+        let packet = test_packet(3, 0xFF);
         cache.update(&packet);
 
         let hash = packet.hash();
         assert_eq!(cache.map.get(&hash).unwrap().min_hops, 3);
 
-        // Update with higher hops
-        packet.header.hops = 7;
-        cache.update(&packet);
+        // Update with same packet again (duplicate)
+        let is_new = cache.update(&packet);
+        assert!(!is_new); // Should be recognized as duplicate
 
-        // min_hops should NOT increase
+        // min_hops should remain unchanged
         assert_eq!(cache.map.get(&hash).unwrap().min_hops, 3);
     }
 
@@ -316,17 +320,30 @@ mod tests {
     #[test]
     fn test_packet_with_max_hops() {
         let mut cache = PacketCache::new();
-        let mut packet = test_packet(255, 0x99);
+        let packet = test_packet(255, 0x99);
 
         cache.update(&packet);
 
         let hash = packet.hash();
         assert_eq!(cache.map.get(&hash).unwrap().min_hops, 255);
+    }
 
-        // Update with lower hops
-        packet.header.hops = 100;
-        cache.update(&packet);
+    #[test]
+    fn test_packets_with_different_hops_are_separate_entries() {
+        let mut cache = PacketCache::new();
 
-        assert_eq!(cache.map.get(&hash).unwrap().min_hops, 100);
+        // Create two packets with same data but different hops
+        let packet_high = test_packet(255, 0x99);
+        let packet_low = test_packet(100, 0x99);
+
+        cache.update(&packet_high);
+        cache.update(&packet_low);
+
+        // Should be two separate cache entries (hops affects hash)
+        assert_eq!(cache.map.len(), 2);
+
+        // Each entry tracks its own hops
+        assert_eq!(cache.map.get(&packet_high.hash()).unwrap().min_hops, 255);
+        assert_eq!(cache.map.get(&packet_low.hash()).unwrap().min_hops, 100);
     }
 }

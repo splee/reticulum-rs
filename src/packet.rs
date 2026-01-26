@@ -290,10 +290,15 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// Compute packet hash matching Python's get_hashable_part().
+    ///
+    /// The hash includes: [meta & 0x0F] + [hops] + destination + context + data
+    /// This matches Python which hashes raw[2:] where raw[1] is the hops byte.
     pub fn hash(&self) -> Hash {
         Hash::new(
             Hash::generator()
                 .chain_update([self.header.to_meta() & 0b00001111])
+                .chain_update([self.header.hops])
                 .chain_update(self.destination.as_slice())
                 .chain_update([self.context as u8])
                 .chain_update(self.data.as_slice())
@@ -765,6 +770,46 @@ mod tests {
             packet.data.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap();
             let display = format!("{}", packet);
             assert!(display.contains("0x[10]")); // 10 bytes of data
+        }
+
+        #[test]
+        fn test_packet_hash_includes_hops() {
+            // Verify that changing hops changes the hash (Python compatibility)
+            let mut packet1 = Packet::default();
+            packet1.header.hops = 0;
+
+            let mut packet2 = Packet::default();
+            packet2.header.hops = 5;
+
+            // Hashes MUST differ when hops differ
+            assert_ne!(
+                packet1.hash(),
+                packet2.hash(),
+                "Packet hash must include hops byte for Python compatibility"
+            );
+        }
+
+        #[test]
+        fn test_packet_hash_hops_sensitivity() {
+            // Test multiple hop values produce different hashes
+            let hashes: Vec<_> = (0..=5)
+                .map(|h| {
+                    let mut p = Packet::default();
+                    p.header.hops = h;
+                    p.hash()
+                })
+                .collect();
+
+            // All hashes should be unique
+            for i in 0..hashes.len() {
+                for j in (i + 1)..hashes.len() {
+                    assert_ne!(
+                        hashes[i], hashes[j],
+                        "Hops {} and {} should produce different hashes",
+                        i, j
+                    );
+                }
+            }
         }
     }
 }

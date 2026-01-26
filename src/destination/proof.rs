@@ -10,27 +10,28 @@ use crate::error::RnsError;
 use crate::hash::AddressHash;
 use crate::packet::Packet;
 
-/// Proof strategy for a destination
+/// Proof strategy for a destination.
+/// Values match Python: PROVE_NONE = 0x21, PROVE_APP = 0x22, PROVE_ALL = 0x23
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(Default)]
 pub enum ProofStrategy {
     /// Never generate proofs automatically
     #[default]
-    None = 0x00,
+    None = 0x21,
     /// Let the application decide whether to prove
-    App = 0x01,
+    App = 0x22,
     /// Always generate proofs for all packets
-    All = 0x02,
+    All = 0x23,
 }
 
 
 impl From<u8> for ProofStrategy {
     fn from(value: u8) -> Self {
         match value {
-            0x00 => ProofStrategy::None,
-            0x01 => ProofStrategy::App,
-            0x02 => ProofStrategy::All,
+            0x21 => ProofStrategy::None,
+            0x22 => ProofStrategy::App,
+            0x23 => ProofStrategy::All,
             _ => ProofStrategy::None,
         }
     }
@@ -279,10 +280,27 @@ mod tests {
     }
 
     #[test]
+    fn test_proof_strategy_values_match_python() {
+        // Python: PROVE_NONE = 0x21, PROVE_APP = 0x22, PROVE_ALL = 0x23
+        assert_eq!(ProofStrategy::None as u8, 0x21);
+        assert_eq!(ProofStrategy::App as u8, 0x22);
+        assert_eq!(ProofStrategy::All as u8, 0x23);
+    }
+
+    #[test]
     fn test_proof_strategy_from_u8() {
+        assert_eq!(ProofStrategy::from(0x21), ProofStrategy::None);
+        assert_eq!(ProofStrategy::from(0x22), ProofStrategy::App);
+        assert_eq!(ProofStrategy::from(0x23), ProofStrategy::All);
+    }
+
+    #[test]
+    fn test_proof_strategy_invalid_defaults_to_none() {
+        // Invalid values default to None (0x21)
         assert_eq!(ProofStrategy::from(0x00), ProofStrategy::None);
-        assert_eq!(ProofStrategy::from(0x01), ProofStrategy::App);
-        assert_eq!(ProofStrategy::from(0x02), ProofStrategy::All);
+        assert_eq!(ProofStrategy::from(0x01), ProofStrategy::None);
+        assert_eq!(ProofStrategy::from(0x20), ProofStrategy::None);
+        assert_eq!(ProofStrategy::from(0x24), ProofStrategy::None);
         assert_eq!(ProofStrategy::from(0xFF), ProofStrategy::None);
     }
 

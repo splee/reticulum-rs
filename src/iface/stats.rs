@@ -22,12 +22,26 @@ use crate::hash::AddressHash;
 #[repr(u8)]
 pub enum InterfaceMode {
     #[default]
-    Full = 0x00,
-    AccessPoint = 0x01,
+    Full = 0x01,
     PointToPoint = 0x02,
-    Roaming = 0x03,
-    Boundary = 0x04,
-    Gateway = 0x05,
+    AccessPoint = 0x03,
+    Roaming = 0x04,
+    Boundary = 0x05,
+    Gateway = 0x06,
+}
+
+impl From<u8> for InterfaceMode {
+    fn from(value: u8) -> Self {
+        match value {
+            0x01 => InterfaceMode::Full,
+            0x02 => InterfaceMode::PointToPoint,
+            0x03 => InterfaceMode::AccessPoint,
+            0x04 => InterfaceMode::Roaming,
+            0x05 => InterfaceMode::Boundary,
+            0x06 => InterfaceMode::Gateway,
+            _ => InterfaceMode::Full,
+        }
+    }
 }
 
 impl InterfaceMode {
@@ -284,5 +298,35 @@ mod tests {
         // Test invalid values
         assert!(InterfaceMode::from_str("invalid").is_err());
         assert!(InterfaceMode::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_interface_mode_values_match_python() {
+        // Python: MODE_FULL = 0x01, MODE_POINT_TO_POINT = 0x02,
+        // MODE_ACCESS_POINT = 0x03, MODE_ROAMING = 0x04,
+        // MODE_BOUNDARY = 0x05, MODE_GATEWAY = 0x06
+        assert_eq!(InterfaceMode::Full as u8, 0x01);
+        assert_eq!(InterfaceMode::PointToPoint as u8, 0x02);
+        assert_eq!(InterfaceMode::AccessPoint as u8, 0x03);
+        assert_eq!(InterfaceMode::Roaming as u8, 0x04);
+        assert_eq!(InterfaceMode::Boundary as u8, 0x05);
+        assert_eq!(InterfaceMode::Gateway as u8, 0x06);
+    }
+
+    #[test]
+    fn test_interface_mode_from_u8() {
+        assert_eq!(InterfaceMode::from(0x01), InterfaceMode::Full);
+        assert_eq!(InterfaceMode::from(0x02), InterfaceMode::PointToPoint);
+        assert_eq!(InterfaceMode::from(0x03), InterfaceMode::AccessPoint);
+        assert_eq!(InterfaceMode::from(0x04), InterfaceMode::Roaming);
+        assert_eq!(InterfaceMode::from(0x05), InterfaceMode::Boundary);
+        assert_eq!(InterfaceMode::from(0x06), InterfaceMode::Gateway);
+    }
+
+    #[test]
+    fn test_interface_mode_invalid_defaults_to_full() {
+        assert_eq!(InterfaceMode::from(0x00), InterfaceMode::Full);
+        assert_eq!(InterfaceMode::from(0x07), InterfaceMode::Full);
+        assert_eq!(InterfaceMode::from(0xFF), InterfaceMode::Full);
     }
 }
