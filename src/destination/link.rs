@@ -13,6 +13,7 @@ use x25519_dalek::StaticSecret;
 
 use crate::{
     buffer::OutputBuffer,
+    destination::request_receipt::SharedRequestReceipt,
     error::RnsError,
     hash::{AddressHash, Hash, ADDRESS_HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
@@ -217,6 +218,22 @@ pub struct TrackedResource {
 /// Maximum number of concurrent outgoing resources per link
 pub const MAX_OUTGOING_RESOURCES: usize = 16;
 
+// Keepalive constants (matching Python Link.py)
+/// Maximum keepalive interval
+pub const KEEPALIVE_MAX: Duration = Duration::from_secs(360);
+/// Minimum keepalive interval
+pub const KEEPALIVE_MIN: Duration = Duration::from_secs(5);
+/// RTT threshold for maximum keepalive
+pub const KEEPALIVE_MAX_RTT: f64 = 1.75;
+/// Factor to multiply keepalive by to get stale time
+pub const STALE_FACTOR: u32 = 2;
+/// Grace period after stale before teardown
+pub const STALE_GRACE: Duration = Duration::from_secs(5);
+/// Timeout factor for keepalive-based timeout
+pub const KEEPALIVE_TIMEOUT_FACTOR: u32 = 4;
+/// Default request timeout
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Link {
     id: LinkId,
     destination: DestinationDesc,
@@ -245,6 +262,23 @@ pub struct Link {
     mode: LinkMode,
     /// Negotiated MTU for this link.
     mtu: u32,
+    // Timing fields for keepalive and activity tracking
+    /// Last time we received data on this link
+    last_inbound: Option<Instant>,
+    /// Last time we sent data on this link
+    last_outbound: Option<Instant>,
+    /// Last keepalive packet sent/received
+    last_keepalive: Option<Instant>,
+    /// Last actual data (non-keepalive) activity
+    last_data: Option<Instant>,
+    /// When the link became active (handshake completed)
+    activated_at: Option<Instant>,
+    /// Calculated keepalive interval based on RTT
+    keepalive_interval: Duration,
+    /// Time after which link is considered stale
+    stale_time: Duration,
+    /// Pending requests awaiting response
+    pending_requests: HashMap<[u8; 16], SharedRequestReceipt>,
 }
 
 impl Link {
@@ -271,6 +305,14 @@ impl Link {
             remote_identity: None,
             mode: LinkMode::default(),
             mtu: DEFAULT_LINK_MTU,
+            last_inbound: None,
+            last_outbound: None,
+            last_keepalive: None,
+            last_data: None,
+            activated_at: None,
+            keepalive_interval: KEEPALIVE_MAX,
+            stale_time: KEEPALIVE_MAX * STALE_FACTOR,
+            pending_requests: HashMap::new(),
         }
     }
 
@@ -335,6 +377,14 @@ impl Link {
             remote_identity: None,
             mode,
             mtu,
+            last_inbound: Some(Instant::now()),
+            last_outbound: None,
+            last_keepalive: None,
+            last_data: None,
+            activated_at: None,
+            keepalive_interval: KEEPALIVE_MAX,
+            stale_time: KEEPALIVE_MAX * STALE_FACTOR,
+            pending_requests: HashMap::new(),
         };
 
         link.handshake(peer_identity);
@@ -1380,6 +1430,113 @@ impl Link {
     pub fn incoming_resource_count(&self) -> usize {
         self.incoming_resources.len()
     }
+
+    // ========== Timing and Keepalive Methods ==========
+
+    /// Get the last time we received data on this link.
+    pub fn last_inbound(&self) -> Option<Instant> {
+        self.last_inbound
+    }
+
+    /// Get the last time we sent data on this link.
+    pub fn last_outbound(&self) -> Option<Instant> {
+        self.last_outbound
+    }
+
+    /// Get the last keepalive time.
+    pub fn last_keepalive(&self) -> Option<Instant> {
+        self.last_keepalive
+    }
+
+    /// Get the last data activity time.
+    pub fn last_data(&self) -> Option<Instant> {
+        self.last_data
+    }
+
+    /// Get when the link was activated.
+    pub fn activated_at(&self) -> Option<Instant> {
+        self.activated_at
+    }
+
+    /// Get the current keepalive interval.
+    pub fn keepalive_interval(&self) -> Duration {
+        self.keepalive_interval
+    }
+
+    /// Get the stale time threshold.
+    pub fn stale_time(&self) -> Duration {
+        self.stale_time
+    }
+
+    /// Update timing fields when data is received.
+    pub(crate) fn record_inbound(&mut self) {
+        let now = Instant::now();
+        self.last_inbound = Some(now);
+        self.last_data = Some(now);
+    }
+
+    /// Update timing fields when data is sent.
+    pub(crate) fn record_outbound(&mut self) {
+        let now = Instant::now();
+        self.last_outbound = Some(now);
+        self.last_data = Some(now);
+    }
+
+    /// Record keepalive activity.
+    pub(crate) fn record_keepalive(&mut self) {
+        self.last_keepalive = Some(Instant::now());
+    }
+
+    /// Mark link as activated.
+    pub(crate) fn mark_activated(&mut self) {
+        self.activated_at = Some(Instant::now());
+        self.update_keepalive_from_rtt();
+    }
+
+    /// Update keepalive interval based on current RTT.
+    ///
+    /// Formula matches Python's Link._update_keepalive():
+    /// keepalive = clamp(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MIN, KEEPALIVE_MAX)
+    pub(crate) fn update_keepalive_from_rtt(&mut self) {
+        let rtt_secs = self.rtt.as_secs_f64();
+        let keepalive_secs = (rtt_secs * (KEEPALIVE_MAX.as_secs_f64() / KEEPALIVE_MAX_RTT))
+            .clamp(KEEPALIVE_MIN.as_secs_f64(), KEEPALIVE_MAX.as_secs_f64());
+        self.keepalive_interval = Duration::from_secs_f64(keepalive_secs);
+        self.stale_time = self.keepalive_interval * STALE_FACTOR;
+    }
+
+    /// Check if the link is stale (no activity for stale_time).
+    pub fn is_stale(&self) -> bool {
+        if let Some(last_data) = self.last_data {
+            last_data.elapsed() > self.stale_time
+        } else if let Some(activated) = self.activated_at {
+            activated.elapsed() > self.stale_time
+        } else {
+            false
+        }
+    }
+
+    // ========== Request/Response Methods ==========
+
+    /// Get a pending request by its ID.
+    pub fn get_pending_request(&self, request_id: &[u8; 16]) -> Option<SharedRequestReceipt> {
+        self.pending_requests.get(request_id).cloned()
+    }
+
+    /// Add a pending request.
+    pub(crate) fn add_pending_request(&mut self, request_id: [u8; 16], receipt: SharedRequestReceipt) {
+        self.pending_requests.insert(request_id, receipt);
+    }
+
+    /// Remove a pending request.
+    pub(crate) fn remove_pending_request(&mut self, request_id: &[u8; 16]) -> Option<SharedRequestReceipt> {
+        self.pending_requests.remove(request_id)
+    }
+
+    /// Get all pending requests.
+    pub fn pending_requests(&self) -> &HashMap<[u8; 16], SharedRequestReceipt> {
+        &self.pending_requests
+    }
 }
 
 fn validate_proof_packet(
@@ -1916,6 +2073,216 @@ mod tests {
             let link = Link::new(dest, tx);
 
             assert!(link.get_last_resource_eifr().is_none());
+        }
+    }
+
+    /// Tests for link timing methods.
+    mod link_timing {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn test_link_timing_fields_initial() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // All timing fields should be None initially
+            assert!(link.last_inbound().is_none());
+            assert!(link.last_outbound().is_none());
+            assert!(link.last_keepalive().is_none());
+            assert!(link.last_data().is_none());
+            assert!(link.activated_at().is_none());
+        }
+
+        #[test]
+        fn test_link_record_inbound() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            assert!(link.last_inbound().is_none());
+            assert!(link.last_data().is_none());
+
+            link.record_inbound();
+
+            assert!(link.last_inbound().is_some());
+            assert!(link.last_data().is_some());
+            // Should have just been recorded, so elapsed time should be minimal
+            assert!(link.last_inbound().unwrap().elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn test_link_record_outbound() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            assert!(link.last_outbound().is_none());
+            assert!(link.last_data().is_none());
+
+            link.record_outbound();
+
+            assert!(link.last_outbound().is_some());
+            assert!(link.last_data().is_some());
+        }
+
+        #[test]
+        fn test_link_record_keepalive() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            assert!(link.last_keepalive().is_none());
+
+            link.record_keepalive();
+
+            assert!(link.last_keepalive().is_some());
+        }
+
+        #[test]
+        fn test_link_mark_activated() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            assert!(link.activated_at().is_none());
+
+            link.mark_activated();
+
+            assert!(link.activated_at().is_some());
+            // Keepalive interval should have been calculated
+            assert!(link.keepalive_interval() > Duration::ZERO);
+        }
+
+        #[test]
+        fn test_link_keepalive_interval_defaults() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // Default keepalive interval should be between min and max
+            let interval = link.keepalive_interval();
+            assert!(interval >= KEEPALIVE_MIN);
+            assert!(interval <= KEEPALIVE_MAX);
+        }
+
+        #[test]
+        fn test_link_update_keepalive_from_rtt() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            // Set a specific RTT value
+            link.rtt = Duration::from_millis(100);
+            link.update_keepalive_from_rtt();
+
+            // Keepalive should be clamped between min and max
+            assert!(link.keepalive_interval() >= KEEPALIVE_MIN);
+            assert!(link.keepalive_interval() <= KEEPALIVE_MAX);
+
+            // Stale time should be a factor of keepalive
+            assert_eq!(link.stale_time(), link.keepalive_interval() * STALE_FACTOR);
+        }
+
+        #[test]
+        fn test_link_is_stale_before_activation() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // Without any data activity, is_stale should return false
+            // (no last_data to compare against)
+            assert!(!link.is_stale());
+        }
+
+        #[test]
+        fn test_link_is_stale_after_recent_activity() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            link.record_inbound();
+
+            // Just had activity, should not be stale
+            assert!(!link.is_stale());
+        }
+    }
+
+    /// Tests for pending request management.
+    mod pending_requests {
+        use super::*;
+        use crate::destination::request_receipt::new_shared_request_receipt;
+
+        #[test]
+        fn test_link_pending_requests_initial() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            assert!(link.pending_requests().is_empty());
+        }
+
+        #[test]
+        fn test_link_add_pending_request() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [1u8; 16];
+            let receipt = new_shared_request_receipt(request_id, std::time::Duration::from_secs(30), None);
+
+            link.add_pending_request(request_id, receipt);
+
+            assert_eq!(link.pending_requests().len(), 1);
+            assert!(link.get_pending_request(&request_id).is_some());
+        }
+
+        #[test]
+        fn test_link_remove_pending_request() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [2u8; 16];
+            let receipt = new_shared_request_receipt(request_id, std::time::Duration::from_secs(30), None);
+
+            link.add_pending_request(request_id, receipt);
+            assert_eq!(link.pending_requests().len(), 1);
+
+            let removed = link.remove_pending_request(&request_id);
+            assert!(removed.is_some());
+            assert!(link.pending_requests().is_empty());
+        }
+
+        #[test]
+        fn test_link_get_nonexistent_pending_request() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [99u8; 16];
+            assert!(link.get_pending_request(&request_id).is_none());
+        }
+
+        #[test]
+        fn test_link_multiple_pending_requests() {
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let id1: [u8; 16] = [1u8; 16];
+            let id2: [u8; 16] = [2u8; 16];
+            let id3: [u8; 16] = [3u8; 16];
+
+            link.add_pending_request(id1, new_shared_request_receipt(id1, std::time::Duration::from_secs(30), None));
+            link.add_pending_request(id2, new_shared_request_receipt(id2, std::time::Duration::from_secs(30), None));
+            link.add_pending_request(id3, new_shared_request_receipt(id3, std::time::Duration::from_secs(30), None));
+
+            assert_eq!(link.pending_requests().len(), 3);
+            assert!(link.get_pending_request(&id1).is_some());
+            assert!(link.get_pending_request(&id2).is_some());
+            assert!(link.get_pending_request(&id3).is_some());
         }
     }
 }

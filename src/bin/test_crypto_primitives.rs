@@ -38,11 +38,10 @@
 use std::io::{self, BufRead, Write as IoWrite};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hkdf::Hkdf;
 use rand_core::OsRng;
-use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use reticulum::crypt::hkdf::hkdf_into;
 use reticulum::identity::DERIVED_KEY_LENGTH;
 
 fn main() {
@@ -297,11 +296,9 @@ fn handle_hkdf_derive(args: &str, out: &mut impl IoWrite) -> Result<(), String> 
         None
     };
 
-    // Derive key using HKDF-SHA256 (matching Python implementation)
+    // Derive key using Python-compatible HKDF-SHA256
     let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    let hkdf = Hkdf::<Sha256>::new(salt.as_deref(), &secret_bytes);
-    hkdf.expand(&[], &mut derived_key)
-        .map_err(|e| format!("HKDF expand failed: {}", e))?;
+    hkdf_into(&secret_bytes, salt.as_deref(), None, &mut derived_key);
 
     writeln!(out, "DERIVED_KEY={}", hex::encode(derived_key)).ok();
     writeln!(out, "STATUS=OK").ok();

@@ -192,8 +192,8 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
         }
 
         RpcRequest::GetRateTable => {
-            // Rate table not yet implemented
-            RpcResponse::success(RpcResult::RateTable(std::collections::HashMap::new()))
+            let rate_table = get_rate_table(transport).await;
+            RpcResponse::success(RpcResult::RateTable(rate_table))
         }
 
         RpcRequest::GetNextHop { destination_hash } => {
@@ -207,8 +207,8 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
         }
 
         RpcRequest::GetBlackholeIdentities => {
-            // Blackhole list not yet implemented
-            RpcResponse::success(RpcResult::BlackholeList(vec![]))
+            let blackhole_list = get_blackhole_identities(transport).await;
+            RpcResponse::success(RpcResult::BlackholeList(blackhole_list))
         }
 
         RpcRequest::DropPath { destination_hash } => {
@@ -226,18 +226,26 @@ async fn process_request(request: RpcRequest, transport: &Transport) -> RpcRespo
         }
 
         RpcRequest::DropAnnounceQueues => {
-            // Not yet implemented
+            transport.drop_announce_queues().await;
             RpcResponse::success(RpcResult::Ok)
         }
 
-        RpcRequest::BlackholeIdentity { .. } => {
-            // Not yet implemented
-            RpcResponse::success(RpcResult::Ok)
+        RpcRequest::BlackholeIdentity {
+            identity_hash,
+            until,
+            reason: _,
+        } => {
+            match blackhole_identity(transport, &identity_hash, until).await {
+                Ok(_) => RpcResponse::success(RpcResult::Ok),
+                Err(e) => RpcResponse::error(e),
+            }
         }
 
-        RpcRequest::UnblackholeIdentity { .. } => {
-            // Not yet implemented
-            RpcResponse::success(RpcResult::Ok)
+        RpcRequest::UnblackholeIdentity { identity_hash } => {
+            match unblackhole_identity(transport, &identity_hash).await {
+                Ok(_) => RpcResponse::success(RpcResult::Ok),
+                Err(e) => RpcResponse::error(e),
+            }
         }
 
         RpcRequest::GetDiscoveredInterfaces => {
@@ -305,6 +313,92 @@ async fn drop_path(_transport: &Transport, _destination_hash: &[u8]) -> Result<(
 /// Drop all paths via a specific hop.
 async fn drop_all_via(_transport: &Transport, _destination_hash: &[u8]) -> Result<(), String> {
     // Not yet implemented
+    Ok(())
+}
+
+/// Get the rate table from the transport.
+///
+/// Returns a map of destination hash (hex) -> blocked until timestamp (0 if not blocked).
+async fn get_rate_table(transport: &Transport) -> std::collections::HashMap<String, u64> {
+    let rate_infos = transport.get_rate_table().await;
+    let mut result = std::collections::HashMap::new();
+
+    for info in rate_infos {
+        // Convert blocked_until Option<f64> to u64 timestamp (0 if not blocked)
+        let blocked_until = info.blocked_until.map(|t| t as u64).unwrap_or(0);
+        result.insert(info.destination, blocked_until);
+    }
+
+    result
+}
+
+/// Get the list of blackholed identities.
+async fn get_blackhole_identities(transport: &Transport) -> Vec<super::protocol::BlackholeEntry> {
+    let identities = transport.get_blackholed_identities().await;
+
+    identities
+        .into_iter()
+        .map(|hash| {
+            // Convert AddressHash to hex string
+            let hex: String = hash
+                .as_slice()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+
+            super::protocol::BlackholeEntry {
+                identity_hash: hex,
+                until: 0.0, // Permanent for now, could track expiry in BlackholeEntry
+                reason: String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Blackhole an identity.
+async fn blackhole_identity(
+    transport: &Transport,
+    identity_hash: &[u8],
+    until: f64,
+) -> Result<(), String> {
+    use crate::hash::AddressHash;
+
+    if identity_hash.len() < 16 {
+        return Err("Invalid identity hash length".to_string());
+    }
+
+    let hash = AddressHash::new_from_slice(identity_hash);
+
+    if until > 0.0 {
+        // Temporary blackhole
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let duration_secs = (until - now).max(0.0);
+        transport
+            .blackhole_identity_temporary(hash, Duration::from_secs_f64(duration_secs))
+            .await;
+    } else {
+        // Permanent blackhole
+        transport.blackhole_identity(hash).await;
+    }
+
+    Ok(())
+}
+
+/// Remove an identity from the blackhole.
+async fn unblackhole_identity(transport: &Transport, identity_hash: &[u8]) -> Result<(), String> {
+    use crate::hash::AddressHash;
+
+    if identity_hash.len() < 16 {
+        return Err("Invalid identity hash length".to_string());
+    }
+
+    let hash = AddressHash::new_from_slice(identity_hash);
+    transport.unblackhole_identity(&hash).await;
+
     Ok(())
 }
 

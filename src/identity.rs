@@ -1,10 +1,14 @@
 use alloc::fmt::Write;
-use hkdf::Hkdf;
 use rand_core::CryptoRngCore;
+use std::fs::File;
+use std::io::{Read, Write as IoWrite};
+use std::path::Path;
 
 use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
+
+use crate::crypt::hkdf::hkdf_into;
 
 use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
@@ -197,6 +201,52 @@ impl Identity {
 
     pub fn derive_key<R: CryptoRngCore + Copy>(&self, rng: R, salt: Option<&[u8]>) -> DerivedKey {
         DerivedKey::new_from_ephemeral_key(rng, &self.public_key, salt)
+    }
+
+    /// Create a public Identity from 64-byte raw data.
+    ///
+    /// Format: [32 bytes X25519 public key][32 bytes Ed25519 verifying key]
+    ///
+    /// This matches Python's public identity format used in announces and
+    /// stored in known_destinations.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RnsError> {
+        if bytes.len() < PUBLIC_KEY_LENGTH * 2 {
+            return Err(RnsError::IncorrectHash);
+        }
+
+        Ok(Self::new_from_slices(
+            &bytes[0..PUBLIC_KEY_LENGTH],
+            &bytes[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2],
+        ))
+    }
+
+    /// Load a public Identity from a file.
+    ///
+    /// The file should contain 64 bytes of raw binary data in the format:
+    /// [32 bytes X25519 public key][32 bytes Ed25519 verifying key]
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RnsError> {
+        let mut file = File::open(path).map_err(|_| RnsError::IoError)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| RnsError::IoError)?;
+
+        Self::from_bytes(&bytes)
+    }
+
+    /// Export the public identity as 64 bytes.
+    ///
+    /// Format: [32 bytes X25519 public key][32 bytes Ed25519 verifying key]
+    pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_LENGTH * 2] {
+        let mut bytes = [0u8; PUBLIC_KEY_LENGTH * 2];
+        bytes[0..PUBLIC_KEY_LENGTH].copy_from_slice(self.public_key.as_bytes());
+        bytes[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2]
+            .copy_from_slice(self.verifying_key.as_bytes());
+        bytes
+    }
+
+    /// Save the public identity to a file.
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<(), RnsError> {
+        let mut file = File::create(path).map_err(|_| RnsError::IoError)?;
+        file.write_all(&self.to_bytes()).map_err(|_| RnsError::IoError)
     }
 }
 
@@ -410,6 +460,25 @@ impl PrivateIdentity {
         bytes
     }
 
+    /// Load a private identity from a file (Python-compatible format).
+    ///
+    /// The file should contain 64 bytes of raw binary data.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RnsError> {
+        let mut file = File::open(path).map_err(|_| RnsError::IoError)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| RnsError::IoError)?;
+
+        Self::new_from_bytes(&bytes)
+    }
+
+    /// Save the private identity to a file.
+    ///
+    /// Writes 64 bytes of raw binary data in Python-compatible format.
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<(), RnsError> {
+        let mut file = File::create(path).map_err(|_| RnsError::IoError)?;
+        file.write_all(&self.to_bytes()).map_err(|_| RnsError::IoError)
+    }
+
     pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<(), RnsError> {
         self.identity.verify(data, signature)
     }
@@ -491,10 +560,14 @@ pub struct DerivedKey {
 }
 
 impl DerivedKey {
+    /// Create a new derived key from a shared secret using Python-compatible HKDF.
+    ///
+    /// Uses the custom HKDF implementation that matches Python's RNS/Cryptography/HKDF.py.
     pub fn new(shared_key: &SharedSecret, salt: Option<&[u8]>) -> Self {
         let mut key = [0u8; DERIVED_KEY_LENGTH];
 
-        let _ = Hkdf::<Sha256>::new(salt, shared_key.as_bytes()).expand(&[], &mut key[..]);
+        // Use Python-compatible HKDF with empty context (matching Python's default)
+        hkdf_into(shared_key.as_bytes(), salt, None, &mut key[..]);
 
         Self { key }
     }
@@ -615,5 +688,113 @@ mod tests {
         let bob_shared = ratchet_exchange(&bob_priv, &alice_pub);
 
         assert_eq!(alice_shared, bob_shared);
+    }
+
+    #[test]
+    fn test_identity_to_bytes_from_bytes_roundtrip() {
+        // Create a private identity and extract its public identity
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+
+        // Convert to bytes
+        let bytes = public_id.to_bytes();
+        assert_eq!(bytes.len(), PUBLIC_KEY_LENGTH * 2); // 64 bytes
+
+        // Convert back from bytes
+        let recovered = Identity::from_bytes(&bytes).expect("valid identity bytes");
+
+        // Verify keys match
+        assert_eq!(
+            recovered.public_key.as_bytes(),
+            public_id.public_key.as_bytes()
+        );
+        assert_eq!(
+            recovered.verifying_key.as_bytes(),
+            public_id.verifying_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_identity_from_bytes_invalid_length() {
+        // Too short
+        let short_bytes = [0u8; 32];
+        let result = Identity::from_bytes(&short_bytes);
+        assert!(result.is_err());
+
+        // Empty
+        let empty_bytes: [u8; 0] = [];
+        let result = Identity::from_bytes(&empty_bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_identity_file_roundtrip() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_identity_roundtrip.bin");
+
+        // Create identity and save to file
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+        public_id.to_file(&test_file).expect("save identity");
+
+        // Load from file
+        let loaded = Identity::from_file(&test_file).expect("load identity");
+
+        // Verify keys match
+        assert_eq!(
+            loaded.public_key.as_bytes(),
+            public_id.public_key.as_bytes()
+        );
+        assert_eq!(
+            loaded.verifying_key.as_bytes(),
+            public_id.verifying_key.as_bytes()
+        );
+
+        // Cleanup
+        fs::remove_file(&test_file).ok();
+    }
+
+    #[test]
+    fn test_private_identity_to_bytes_from_bytes_roundtrip() {
+        let original = PrivateIdentity::new_from_rand(OsRng);
+
+        // Convert to bytes
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 64); // 32 bytes private key + 32 bytes sign key
+
+        // Convert back
+        let recovered = PrivateIdentity::new_from_bytes(&bytes).expect("valid private identity");
+
+        // Verify keys match
+        assert_eq!(
+            recovered.private_key.as_bytes(),
+            original.private_key.as_bytes()
+        );
+        assert_eq!(recovered.sign_key.as_bytes(), original.sign_key.as_bytes());
+    }
+
+    #[test]
+    fn test_private_identity_file_roundtrip() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_private_identity_roundtrip.bin");
+
+        // Create and save
+        let original = PrivateIdentity::new_from_rand(OsRng);
+        original.to_file(&test_file).expect("save private identity");
+
+        // Load
+        let loaded = PrivateIdentity::from_file(&test_file).expect("load private identity");
+
+        // Verify
+        assert_eq!(
+            loaded.private_key.as_bytes(),
+            original.private_key.as_bytes()
+        );
+        assert_eq!(loaded.sign_key.as_bytes(), original.sign_key.as_bytes());
+
+        // Cleanup
+        fs::remove_file(&test_file).ok();
     }
 }

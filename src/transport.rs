@@ -49,6 +49,7 @@ use crate::packet::PacketType;
 use crate::receipt::{PacketReceipt, ReceiptManager};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
 
+pub mod announce_handler;
 mod announce_limits;
 pub mod announce_manager;
 pub mod announce_queue;
@@ -67,6 +68,7 @@ pub mod remote_management;
 pub mod reverse_table;
 pub mod tunnel;
 
+use announce_handler::{AnnounceCallback, AnnounceHandlerConfig, AnnounceHandlerHandle, AnnounceHandlerRegistry};
 use announce_manager::AnnounceManager;
 use announce_queue::{AnnounceQueueManager, QueuedAnnounce};
 use link_manager::LinkManager;
@@ -135,6 +137,12 @@ struct TransportHandler {
 
     /// Unified link management (in/out links + routing table + events)
     link_manager: LinkManager,
+
+    /// Blackhole manager for blocking specific identities
+    blackhole_manager: blackhole::BlackholeManager,
+
+    /// Registry of announce handlers for receiving announce notifications
+    announce_handler_registry: AnnounceHandlerRegistry,
 
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
@@ -257,6 +265,8 @@ impl Transport {
             announce_manager: AnnounceManager::new(announce_tx),
             announce_queue_manager: AnnounceQueueManager::new(),
             link_manager: LinkManager::new(link_in_event_tx.clone()),
+            blackhole_manager: blackhole::BlackholeManager::new(),
+            announce_handler_registry: AnnounceHandlerRegistry::new(),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
@@ -1077,6 +1087,94 @@ impl Transport {
         let mut handler = self.handler.lock().await;
         handler.announce_manager.clear();
         handler.announce_queue_manager.clear_all();
+    }
+
+    // =========================================================================
+    // Blackhole Methods
+    // =========================================================================
+
+    /// Add an identity to the blackhole.
+    ///
+    /// Blackholed identities will have their announces and packets blocked.
+    pub async fn blackhole_identity(&self, identity_hash: AddressHash) {
+        self.handler.lock().await.blackhole_manager.add(identity_hash);
+    }
+
+    /// Add an identity to the blackhole with a duration.
+    ///
+    /// The identity will be automatically unblackholed after the duration expires.
+    pub async fn blackhole_identity_temporary(
+        &self,
+        identity_hash: AddressHash,
+        duration: std::time::Duration,
+    ) {
+        self.handler
+            .lock()
+            .await
+            .blackhole_manager
+            .add_temporary(identity_hash, duration);
+    }
+
+    /// Remove an identity from the blackhole.
+    pub async fn unblackhole_identity(&self, identity_hash: &AddressHash) {
+        self.handler.lock().await.blackhole_manager.remove(identity_hash);
+    }
+
+    /// Check if an identity is blackholed.
+    pub async fn is_blackholed(&self, identity_hash: &AddressHash) -> bool {
+        self.handler.lock().await.blackhole_manager.is_blackholed(identity_hash)
+    }
+
+    /// Get list of all blackholed identities.
+    pub async fn get_blackholed_identities(&self) -> Vec<AddressHash> {
+        self.handler.lock().await.blackhole_manager.list()
+    }
+
+    // =========================================================================
+    // Announce Handler Methods
+    // =========================================================================
+
+    /// Register an announce handler.
+    ///
+    /// The handler will be called when announces matching its configuration are received.
+    /// This mirrors Python's `Transport.register_announce_handler()` API.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for the handler (aspect filter, path response settings)
+    /// * `callback` - The callback to invoke when matching announces are received
+    ///
+    /// # Returns
+    ///
+    /// A handle that can be used to deregister the handler later.
+    pub async fn register_announce_handler(
+        &self,
+        config: AnnounceHandlerConfig,
+        callback: Arc<dyn AnnounceCallback>,
+    ) -> AnnounceHandlerHandle {
+        self.handler
+            .lock()
+            .await
+            .announce_handler_registry
+            .register(config, callback)
+    }
+
+    /// Deregister an announce handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The handle returned from `register_announce_handler()`
+    pub async fn deregister_announce_handler(&self, handle: AnnounceHandlerHandle) {
+        self.handler
+            .lock()
+            .await
+            .announce_handler_registry
+            .deregister(handle);
+    }
+
+    /// Get the number of registered announce handlers.
+    pub async fn announce_handler_count(&self) -> usize {
+        self.handler.lock().await.announce_handler_registry.len()
     }
 
     // =========================================================================
@@ -2313,5 +2411,131 @@ mod tests {
 
         // Packet should have been removed from cache (stale)
         assert!(handler.lock().await.filter_duplicate_packets(&duplicate).await);
+    }
+
+    #[tokio::test]
+    async fn test_blackhole_identity() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity_hash = AddressHash::new_from_slice(&[0xABu8; 32]);
+
+        // Initially not blackholed
+        assert!(!transport.is_blackholed(&identity_hash).await);
+        assert!(transport.get_blackholed_identities().await.is_empty());
+
+        // Blackhole the identity
+        transport.blackhole_identity(identity_hash).await;
+
+        // Should now be blackholed
+        assert!(transport.is_blackholed(&identity_hash).await);
+        assert_eq!(transport.get_blackholed_identities().await.len(), 1);
+
+        // Unblackhole
+        transport.unblackhole_identity(&identity_hash).await;
+
+        // Should no longer be blackholed
+        assert!(!transport.is_blackholed(&identity_hash).await);
+        assert!(transport.get_blackholed_identities().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blackhole_identity_temporary() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity_hash = AddressHash::new_from_slice(&[0xCDu8; 32]);
+
+        // Blackhole temporarily for 1 hour
+        transport
+            .blackhole_identity_temporary(identity_hash, Duration::from_secs(3600))
+            .await;
+
+        // Should be blackholed
+        assert!(transport.is_blackholed(&identity_hash).await);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_blackholed_identities() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let id1 = AddressHash::new_from_slice(&[1u8; 32]);
+        let id2 = AddressHash::new_from_slice(&[2u8; 32]);
+        let id3 = AddressHash::new_from_slice(&[3u8; 32]);
+
+        transport.blackhole_identity(id1).await;
+        transport.blackhole_identity(id2).await;
+        transport.blackhole_identity(id3).await;
+
+        assert_eq!(transport.get_blackholed_identities().await.len(), 3);
+        assert!(transport.is_blackholed(&id1).await);
+        assert!(transport.is_blackholed(&id2).await);
+        assert!(transport.is_blackholed(&id3).await);
+
+        // Remove one
+        transport.unblackhole_identity(&id2).await;
+        assert_eq!(transport.get_blackholed_identities().await.len(), 2);
+        assert!(!transport.is_blackholed(&id2).await);
+    }
+
+    #[tokio::test]
+    async fn test_register_announce_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        // Initially no handlers
+        assert_eq!(transport.announce_handler_count().await, 0);
+
+        // Register a handler
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let handle = transport
+            .register_announce_handler(
+                AnnounceHandlerConfig::default(),
+                Arc::new(move |_data: announce_handler::AnnounceData| {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        assert_eq!(transport.announce_handler_count().await, 1);
+
+        // Deregister
+        transport.deregister_announce_handler(handle).await;
+        assert_eq!(transport.announce_handler_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_announce_handlers() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let handle1 = transport
+            .register_announce_handler(
+                AnnounceHandlerConfig::default(),
+                Arc::new(|_: announce_handler::AnnounceData| {}),
+            )
+            .await;
+
+        let handle2 = transport
+            .register_announce_handler(
+                AnnounceHandlerConfig::default().receive_path_responses(),
+                Arc::new(|_: announce_handler::AnnounceData| {}),
+            )
+            .await;
+
+        assert_eq!(transport.announce_handler_count().await, 2);
+
+        // Remove first handler
+        transport.deregister_announce_handler(handle1).await;
+        assert_eq!(transport.announce_handler_count().await, 1);
+
+        // Remove second handler
+        transport.deregister_announce_handler(handle2).await;
+        assert_eq!(transport.announce_handler_count().await, 0);
     }
 }

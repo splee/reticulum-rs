@@ -12,14 +12,13 @@ use std::time::Duration;
 use clap::Parser;
 use data_encoding::{BASE32, BASE64};
 use ed25519_dalek::Signature;
-use hkdf::Hkdf;
 use rand_core::OsRng;
-use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use reticulum::cli::format::{format_hash, spinner_char};
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::crypt::fernet::{Fernet, PlainText, Token};
+use reticulum::crypt::hkdf::hkdf_into;
 use reticulum::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
 use reticulum::hash::AddressHash;
 use reticulum::identity::{Identity, PrivateIdentity, DERIVED_KEY_LENGTH};
@@ -992,11 +991,9 @@ fn encrypt_for_identity<'a>(
     // Derive shared secret using ephemeral key and recipient's public key
     let shared_secret = ephemeral_secret.diffie_hellman(&identity.public_key);
 
-    // Derive encryption key using HKDF
+    // Derive encryption key using Python-compatible HKDF
     let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-    hkdf.expand(&[], &mut derived_key)
-        .map_err(|_| "HKDF expand failed")?;
+    hkdf_into(shared_secret.as_bytes(), None, None, &mut derived_key);
 
     // Write ephemeral public key to output
     let mut offset = 0;
@@ -1043,11 +1040,9 @@ fn decrypt_with_identity<'a>(
     // Derive shared secret
     let shared_secret = static_secret.diffie_hellman(&ephemeral_public);
 
-    // Derive decryption key using HKDF
+    // Derive decryption key using Python-compatible HKDF
     let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-    hkdf.expand(&[], &mut derived_key)
-        .map_err(|_| "HKDF expand failed")?;
+    hkdf_into(shared_secret.as_bytes(), None, None, &mut derived_key);
 
     // Decrypt with Fernet
     let fernet = Fernet::new_from_slices(

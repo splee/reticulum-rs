@@ -2,10 +2,12 @@ pub mod group;
 pub mod link;
 pub mod link_map;
 pub mod link_stats;
+pub mod link_watchdog;
 pub mod plain;
 pub mod proof;
 pub mod ratchet;
 pub mod request;
+pub mod request_receipt;
 
 use alloc::sync::Arc;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
@@ -18,11 +20,15 @@ use crate::{
     destination::link::Link,
     error::RnsError,
     hash::{AddressHash, Hash},
-    identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE},
+    identity::{
+        DecryptIdentity, EmptyIdentity, EncryptIdentity, HashIdentity, Identity, PrivateIdentity,
+        PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE,
+    },
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
         PacketDataBuffer, PacketType, TransportType,
     },
+    persistence::RatchetManager,
 };
 use sha2::Digest;
 
@@ -577,6 +583,118 @@ impl Destination<PrivateIdentity, Input, Single> {
     pub fn sign_key(&self) -> &SigningKey {
         self.identity.sign_key()
     }
+
+    /// Sign a message using this destination's identity.
+    ///
+    /// Mirrors Python's `Destination.sign()` method.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The message bytes to sign
+    ///
+    /// # Returns
+    ///
+    /// A 64-byte Ed25519 signature.
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.identity.sign(message)
+    }
+
+    /// Encrypt plaintext for this destination.
+    ///
+    /// Mirrors Python's `Destination.encrypt()` method for SINGLE destinations.
+    /// Uses the destination's identity for encryption and optionally includes
+    /// a ratchet for forward secrecy.
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - Random number generator for ephemeral key generation
+    /// * `plaintext` - The data to encrypt
+    /// * `ratchet_manager` - Optional ratchet manager for forward secrecy
+    ///
+    /// # Returns
+    ///
+    /// Encrypted ciphertext bytes.
+    pub fn encrypt<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+        ratchet_manager: Option<&RatchetManager>,
+    ) -> Result<Vec<u8>, RnsError> {
+        // Get the selected ratchet if available
+        let dest_hash: [u8; 16] = self.desc.address_hash.as_slice().try_into()
+            .map_err(|_| RnsError::InvalidArgument)?;
+        let selected_ratchet = ratchet_manager
+            .and_then(|rm| rm.get(&dest_hash));
+
+        // Use identity's encrypt with optional ratchet
+        self.encrypt_with_ratchet(rng, plaintext, selected_ratchet.as_deref())
+    }
+
+    /// Encrypt plaintext with an explicit ratchet key.
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - Random number generator
+    /// * `plaintext` - The data to encrypt
+    /// * `ratchet` - Optional ratchet public key for forward secrecy (not yet used)
+    fn encrypt_with_ratchet<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+        _ratchet: Option<&[u8]>,
+    ) -> Result<Vec<u8>, RnsError> {
+        let pub_identity = self.identity.as_identity();
+        let derived_key = pub_identity.derive_key(rng, None);
+
+        // Build the output buffer
+        let max_size = plaintext.len() + PUBLIC_KEY_LENGTH + 64 + 32; // overhead estimate
+        let mut out_buf = vec![0u8; max_size];
+
+        let encrypted = pub_identity.encrypt(rng, plaintext, &derived_key, &mut out_buf)?;
+
+        Ok(encrypted.to_vec())
+    }
+
+    /// Decrypt ciphertext from this destination.
+    ///
+    /// Mirrors Python's `Destination.decrypt()` method for SINGLE destinations.
+    /// Uses the destination's private identity for decryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - Random number generator
+    /// * `ciphertext` - The encrypted data
+    /// * `ratchets` - Optional list of ratchet keys to try for decryption (not yet used)
+    ///
+    /// # Returns
+    ///
+    /// Decrypted plaintext bytes.
+    pub fn decrypt<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        ciphertext: &[u8],
+        _ratchets: Option<&[Vec<u8>]>,
+    ) -> Result<Vec<u8>, RnsError> {
+        if ciphertext.len() <= PUBLIC_KEY_LENGTH {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        // Extract ephemeral public key from ciphertext
+        let mut ephemeral_bytes = [0u8; 32];
+        ephemeral_bytes.copy_from_slice(&ciphertext[..PUBLIC_KEY_LENGTH]);
+        let ephemeral_public = x25519_dalek::PublicKey::from(ephemeral_bytes);
+
+        // Derive decryption key
+        let derived_key = self.identity.derive_key(&ephemeral_public, None);
+
+        // Decrypt
+        let mut out_buf = vec![0u8; ciphertext.len()];
+        let decrypted = self
+            .identity
+            .decrypt(rng, &ciphertext[PUBLIC_KEY_LENGTH..], &derived_key, &mut out_buf)?;
+
+        Ok(decrypted.to_vec())
+    }
 }
 
 impl Destination<Identity, Output, Single> {
@@ -593,6 +711,46 @@ impl Destination<Identity, Output, Single> {
             },
             callbacks: DestinationCallbacks::default(),
         }
+    }
+
+    /// Encrypt plaintext for this destination.
+    ///
+    /// Mirrors Python's `Destination.encrypt()` method for SINGLE destinations.
+    /// Uses the destination's public identity for encryption.
+    ///
+    /// Note: This is an Output destination with only a public key, so only
+    /// encryption is possible (no decryption or signing).
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - Random number generator for ephemeral key generation
+    /// * `plaintext` - The data to encrypt
+    /// * `ratchet_manager` - Optional ratchet manager for forward secrecy
+    ///
+    /// # Returns
+    ///
+    /// Encrypted ciphertext bytes.
+    pub fn encrypt<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+        ratchet_manager: Option<&RatchetManager>,
+    ) -> Result<Vec<u8>, RnsError> {
+        // Get the selected ratchet if available
+        let dest_hash: [u8; 16] = self.desc.address_hash.as_slice().try_into()
+            .map_err(|_| RnsError::InvalidArgument)?;
+        let _selected_ratchet = ratchet_manager
+            .and_then(|rm| rm.get(&dest_hash));
+
+        let derived_key = self.identity.derive_key(rng, None);
+
+        // Build the output buffer
+        let max_size = plaintext.len() + PUBLIC_KEY_LENGTH + 64 + 32; // overhead estimate
+        let mut out_buf = vec![0u8; max_size];
+
+        let encrypted = self.identity.encrypt(rng, plaintext, &derived_key, &mut out_buf)?;
+
+        Ok(encrypted.to_vec())
     }
 }
 

@@ -11,6 +11,9 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::identity::{Identity, RATCHET_ID_LENGTH};
 
 /// Length of truncated hash in bytes (128 bits / 8)
 pub const TRUNCATED_HASH_LENGTH: usize = 16;
@@ -209,6 +212,20 @@ impl KnownDestinations {
             .and_then(|kd| kd.app_data)
     }
 
+    /// Recall an Identity for a destination.
+    ///
+    /// This creates an `Identity` object from the stored public key bytes.
+    /// Mirrors Python's `Identity.recall(destination_hash)`.
+    pub fn recall_identity(&self, destination_hash: &[u8; TRUNCATED_HASH_LENGTH]) -> Option<Identity> {
+        self.recall(destination_hash).and_then(|kd| {
+            if kd.public_key.len() >= FULL_PUBLIC_KEY_LENGTH {
+                Some(Identity::from_bytes(&kd.public_key).ok()?)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Get the number of known destinations
     pub fn len(&self) -> usize {
         self.cache.read().map(|c| c.len()).unwrap_or(0)
@@ -365,6 +382,25 @@ impl RatchetManager {
             .read()
             .ok()
             .and_then(|cache| cache.get(destination_hash).cloned())
+    }
+
+    /// Get the current ratchet ID for a destination.
+    ///
+    /// The ratchet ID is the first 10 bytes of SHA-256 hash of the ratchet public key.
+    /// This matches Python's `Identity._get_ratchet_id()`.
+    pub fn current_ratchet_id(
+        &self,
+        destination_hash: &[u8; TRUNCATED_HASH_LENGTH],
+    ) -> Option<[u8; RATCHET_ID_LENGTH]> {
+        self.get(destination_hash).map(|ratchet| {
+            let mut hasher = Sha256::new();
+            hasher.update(&ratchet);
+            let hash = hasher.finalize();
+
+            let mut id = [0u8; RATCHET_ID_LENGTH];
+            id.copy_from_slice(&hash[..RATCHET_ID_LENGTH]);
+            id
+        })
     }
 
     /// Clean expired ratchets from memory and disk
@@ -563,5 +599,97 @@ mod tests {
 
         let converted = hex_to_bytes(&hex).unwrap();
         assert_eq!(converted, bytes);
+    }
+
+    #[test]
+    fn test_recall_identity() {
+        use rand_core::OsRng;
+        use crate::identity::PrivateIdentity;
+
+        let temp = temp_dir().join("rns_test_recall_identity");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        // Create a real identity and get its public key bytes
+        let priv_id = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = priv_id.as_identity();
+        let public_key_bytes = pub_id.to_bytes();
+
+        let dest_hash = [0xAAu8; TRUNCATED_HASH_LENGTH];
+        let packet_hash = vec![0xBBu8; 32];
+
+        // Remember the destination with proper public key
+        kd.remember(&dest_hash, &packet_hash, &public_key_bytes, None)
+            .unwrap();
+
+        // Recall should return a valid Identity
+        let recalled_identity = kd.recall_identity(&dest_hash);
+        assert!(recalled_identity.is_some());
+
+        let recalled = recalled_identity.unwrap();
+        // Verify the public keys match
+        assert_eq!(recalled.public_key.as_bytes(), pub_id.public_key.as_bytes());
+        assert_eq!(recalled.verifying_key.as_bytes(), pub_id.verifying_key.as_bytes());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recall_identity_nonexistent() {
+        let temp = temp_dir().join("rns_test_recall_identity_nonexistent");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        let dest_hash = [0xFFu8; TRUNCATED_HASH_LENGTH];
+
+        // Should return None for non-existent destination
+        let recalled = kd.recall_identity(&dest_hash);
+        assert!(recalled.is_none());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_current_ratchet_id() {
+        use rand_core::OsRng;
+        use crate::identity::{generate_ratchet, ratchet_public_bytes, get_ratchet_id};
+
+        let temp = temp_dir().join("rns_test_current_ratchet_id");
+        let _ = fs::remove_dir_all(&temp);
+        let rm = RatchetManager::new(&temp);
+
+        let dest_hash = [0x11u8; TRUNCATED_HASH_LENGTH];
+
+        // Generate a ratchet and get its public bytes
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Remember the ratchet public key
+        rm.remember(&dest_hash, &ratchet_pub).unwrap();
+
+        // Get the ratchet ID from the manager
+        let ratchet_id = rm.current_ratchet_id(&dest_hash);
+        assert!(ratchet_id.is_some());
+
+        // It should match what get_ratchet_id produces
+        let expected_id = get_ratchet_id(&ratchet_pub);
+        assert_eq!(ratchet_id.unwrap(), expected_id);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_current_ratchet_id_nonexistent() {
+        let temp = temp_dir().join("rns_test_ratchet_id_nonexistent");
+        let _ = fs::remove_dir_all(&temp);
+        let rm = RatchetManager::new(&temp);
+
+        let dest_hash = [0x22u8; TRUNCATED_HASH_LENGTH];
+
+        // Should return None for non-existent ratchet
+        let ratchet_id = rm.current_ratchet_id(&dest_hash);
+        assert!(ratchet_id.is_none());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

@@ -20,9 +20,9 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../..', 'reticulum-python'))
 
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
+
+# Import RNS's custom HKDF instead of the cryptography library's HKDF
+from RNS.Cryptography.HKDF import hkdf as rns_hkdf
 
 
 def ed25519_sign(priv_hex: str, msg_hex: str) -> dict:
@@ -114,7 +114,13 @@ def x25519_exchange(priv_hex: str, peer_pub_hex: str) -> dict:
 
 
 def hkdf_derive(secret_hex: str, salt_hex: str = None) -> dict:
-    """Derive a key using HKDF-SHA256."""
+    """Derive a key using RNS's custom HKDF-SHA256.
+
+    Uses RNS/Cryptography/HKDF.py which has custom behavior:
+    - Counter: (i + 1) % 256 as single byte
+    - Salt defaults to 32 zero bytes when None or empty
+    - Context/info defaults to empty bytes
+    """
     secret_bytes = bytes.fromhex(secret_hex)
     salt_bytes = bytes.fromhex(salt_hex) if salt_hex else None
 
@@ -122,15 +128,13 @@ def hkdf_derive(secret_hex: str, salt_hex: str = None) -> dict:
     # Default is 64 bytes (512 / 8) for non-fernet-aes128 feature
     derived_key_length = 64
 
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
+    # Use RNS's custom HKDF implementation
+    derived_key = rns_hkdf(
         length=derived_key_length,
+        derive_from=secret_bytes,
         salt=salt_bytes,
-        info=b"",  # Empty info, matching Rust
-        backend=default_backend()
+        context=None  # Empty context, matching Rust
     )
-
-    derived_key = hkdf.derive(secret_bytes)
 
     return {
         'derived_key': derived_key.hex()
