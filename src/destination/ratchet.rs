@@ -305,7 +305,7 @@ mod tests {
 
         // This should generate a new ratchet (but will fail to persist)
         // For a real test, we'd need a valid path
-        let result = state.rotate_if_needed(&identity);
+        let _result = state.rotate_if_needed(&identity);
         // Note: This will fail because the path doesn't exist,
         // but we can test the rotation logic separately
     }

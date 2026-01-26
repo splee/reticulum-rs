@@ -79,17 +79,11 @@ impl PathTable {
         }
     }
 
-    /// Check if a path to destination exists
+    /// Check if a path to destination exists and is not expired.
     pub fn has_path(&self, destination: &AddressHash) -> bool {
-        if let Some(entry) = self.map.get(destination) {
-            // Check if path has expired (using stored expiry duration)
-            if entry.timestamp.elapsed() > entry.expiry_duration {
-                return false;
-            }
-            true
-        } else {
-            false
-        }
+        self.map
+            .get(destination)
+            .is_some_and(|entry| entry.timestamp.elapsed() <= entry.expiry_duration)
     }
 
     /// Get the number of hops to destination

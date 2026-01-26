@@ -31,6 +31,20 @@ pub const CMD_DATA: u8 = 0x00;
 pub struct Kiss;
 
 impl Kiss {
+    /// Write escaped data to the buffer.
+    ///
+    /// Escapes FEND and FESC bytes according to KISS protocol.
+    fn write_escaped(data: &[u8], buffer: &mut OutputBuffer) -> Result<(), RnsError> {
+        for &byte in data {
+            match byte {
+                FEND => buffer.write(&[FESC, TFEND])?,
+                FESC => buffer.write(&[FESC, TFESC])?,
+                _ => buffer.write_byte(byte)?,
+            };
+        }
+        Ok(())
+    }
+
     /// Encode data into a KISS frame.
     ///
     /// Format: FEND + CMD_DATA + escaped_data + FEND
@@ -42,30 +56,10 @@ impl Kiss {
     /// # Returns
     /// Number of bytes written to the buffer
     pub fn encode(data: &[u8], buffer: &mut OutputBuffer) -> Result<usize, RnsError> {
-        // Start frame
         buffer.write_byte(FEND)?;
-
-        // Command byte (data frame on port 0)
         buffer.write_byte(CMD_DATA)?;
-
-        // Escape and write data
-        for &byte in data {
-            match byte {
-                FEND => {
-                    buffer.write(&[FESC, TFEND])?;
-                }
-                FESC => {
-                    buffer.write(&[FESC, TFESC])?;
-                }
-                _ => {
-                    buffer.write_byte(byte)?;
-                }
-            }
-        }
-
-        // End frame
+        Self::write_escaped(data, buffer)?;
         buffer.write_byte(FEND)?;
-
         Ok(buffer.offset())
     }
 
@@ -81,30 +75,10 @@ impl Kiss {
     /// # Returns
     /// Number of bytes written to the buffer
     pub fn encode_with_port(data: &[u8], port: u8, buffer: &mut OutputBuffer) -> Result<usize, RnsError> {
-        // Start frame
         buffer.write_byte(FEND)?;
-
-        // Command byte with port (port << 4 | command)
         buffer.write_byte((port.min(15) << 4) | CMD_DATA)?;
-
-        // Escape and write data
-        for &byte in data {
-            match byte {
-                FEND => {
-                    buffer.write(&[FESC, TFEND])?;
-                }
-                FESC => {
-                    buffer.write(&[FESC, TFESC])?;
-                }
-                _ => {
-                    buffer.write_byte(byte)?;
-                }
-            }
-        }
-
-        // End frame
+        Self::write_escaped(data, buffer)?;
         buffer.write_byte(FEND)?;
-
         Ok(buffer.offset())
     }
 

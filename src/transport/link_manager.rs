@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_out_link_operations() {
         let (tx, _rx) = broadcast::channel(16);
-        let mut manager = LinkManager::new(tx);
+        let manager = LinkManager::new(tx);
         let dest = zero_address_hash();
 
         // Initially no link

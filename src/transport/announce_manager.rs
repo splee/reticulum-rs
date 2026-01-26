@@ -155,10 +155,6 @@ impl AnnounceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::PacketDataBuffer;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-    use crate::destination::SingleOutputDestination;
 
     fn zero_address_hash() -> AddressHash {
         AddressHash::new_from_slice(&[0u8; 16])

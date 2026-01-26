@@ -324,14 +324,13 @@ impl AnnounceQueueManager {
     /// Process all queues and return announces ready to transmit.
     ///
     /// Returns a list of (interface, announce) pairs.
+    /// Processes at most one announce per interface per call to spread transmissions.
     pub fn process_queues(&mut self) -> Vec<(AddressHash, QueuedAnnounce)> {
         let mut ready = Vec::new();
 
         for (interface, queue) in &mut self.queues {
-            while let Some(announce) = queue.dequeue() {
+            if let Some(announce) = queue.dequeue() {
                 ready.push((*interface, announce));
-                // Only process one per interface per call to spread transmissions
-                break;
             }
         }
 
@@ -377,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_queue_basic() {
-        let mut queue = InterfaceAnnounceQueue::new();
+        let queue = InterfaceAnnounceQueue::new();
 
         // Should be able to transmit initially
         assert!(queue.can_transmit_now(1));
