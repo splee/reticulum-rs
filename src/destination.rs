@@ -403,6 +403,20 @@ impl DestinationAnnounce {
 
         identity.verify(signed_data.as_slice(), &signature)?;
 
+        // Verify destination hash is correctly derived from name_hash + identity_hash.
+        // Prevents accepting announces with valid signatures but forged destination
+        // hashes in the packet header (Python: Identity.py:443-446).
+        let expected_address_hash = AddressHash::new_from_hash(&Hash::new(
+            Hash::generator()
+                .chain_update(name_hash)
+                .chain_update(identity.as_address_hash_slice())
+                .finalize()
+                .into(),
+        ));
+        if destination_hash.as_slice() != expected_address_hash.as_slice() {
+            return Err(RnsError::IncorrectHash);
+        }
+
         Ok(AnnounceValidation {
             destination: SingleOutputDestination::new(
                 identity,
@@ -957,7 +971,7 @@ mod tests {
     use rand_core::OsRng;
 
     use crate::buffer::OutputBuffer;
-    use crate::hash::Hash;
+    use crate::hash::{AddressHash, Hash, ADDRESS_HASH_SIZE};
     use crate::identity::PrivateIdentity;
     use crate::serde::Serialize;
 
@@ -1118,6 +1132,71 @@ mod tests {
             validation.destination.desc.name.hash.as_slice(),
             "Name hash from validated announce should match original"
         );
+    }
+
+    #[test]
+    fn test_validate_full_rejects_forged_destination_hash() {
+        // Test that validate_full rejects an announce where the destination hash
+        // in the packet header doesn't match the one derived from name_hash + identity_hash.
+        // This prevents an attacker from claiming a destination hash they don't own.
+        use crate::packet::{Packet, PacketDataBuffer, Header, HeaderType, IfacFlag, TransportType, DestinationType, PacketType, PacketContext};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "service");
+        let address_hash = crate::destination::create_address_hash(priv_identity.as_identity(), &name);
+
+        let pub_key = priv_identity.as_identity().public_key_bytes();
+        let verifying_key = priv_identity.as_identity().verifying_key_bytes();
+        let name_hash = name.as_name_hash_slice();
+        let rand_hash: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22];
+        let app_data = b"test app data";
+
+        // Sign with the correct destination hash so the signature is valid
+        let signed_data = PacketDataBuffer::new()
+            .chain_write(address_hash.as_slice()).unwrap()
+            .chain_write(pub_key).unwrap()
+            .chain_write(verifying_key).unwrap()
+            .chain_write(name_hash).unwrap()
+            .chain_write(&rand_hash).unwrap()
+            .chain_write(app_data).unwrap()
+            .finalize();
+
+        let signature = priv_identity.sign(signed_data.as_slice());
+
+        let packet_data = PacketDataBuffer::new()
+            .chain_write(pub_key).unwrap()
+            .chain_write(verifying_key).unwrap()
+            .chain_write(name_hash).unwrap()
+            .chain_write(&rand_hash).unwrap()
+            .chain_write(&signature.to_bytes()).unwrap()
+            .chain_write(app_data).unwrap()
+            .finalize();
+
+        // Use a forged (wrong) destination hash in the packet header
+        let forged_hash = AddressHash::new([0xDE; ADDRESS_HASH_SIZE]);
+
+        let announce = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: forged_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        };
+
+        // The signature verification will fail first because the signed data
+        // includes the real destination hash, but the packet header has a forged one.
+        // Either way, validation must not succeed.
+        let result = DestinationAnnounce::validate_full(&announce);
+        assert!(result.is_err(), "Announce with forged destination hash should be rejected");
     }
 
     #[test]
