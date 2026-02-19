@@ -48,6 +48,7 @@ use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::receipt::{PacketReceipt, ReceiptManager, EXPLICIT_PROOF_LENGTH};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
+use crate::persistence::KnownDestinations;
 
 pub mod announce_handler;
 mod announce_limits;
@@ -140,6 +141,9 @@ struct TransportHandler {
 
     /// Blackhole manager for blocking specific identities
     blackhole_manager: blackhole::BlackholeManager,
+
+    /// Known destinations cache for collision detection and identity recall
+    known_destinations: KnownDestinations,
 
     /// Registry of announce handlers for receiving announce notifications
     announce_handler_registry: AnnounceHandlerRegistry,
@@ -266,6 +270,7 @@ impl Transport {
             announce_queue_manager: AnnounceQueueManager::new(),
             link_manager: LinkManager::new(link_in_event_tx.clone()),
             blackhole_manager: blackhole::BlackholeManager::new(),
+            known_destinations: KnownDestinations::new(std::env::temp_dir()),
             announce_handler_registry: AnnounceHandlerRegistry::new(),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
@@ -1844,6 +1849,21 @@ async fn handle_announce<'a>(
         return;
     }
 
+    // Early blackhole rejection — reject announces from blackholed identities
+    // before expensive signature verification (Python: Identity.py:433-436).
+    // The identity hash is SHA256(public_key || verifying_key)[..16], and the
+    // raw keys sit at offset 0..64 of packet.data.
+    if packet.data.len() >= 64 {
+        let identity_hash = AddressHash::new_from_slice(&packet.data.as_slice()[..64]);
+        if handler.blackhole_manager.is_blackholed(&identity_hash) {
+            log::debug!(
+                "handle_announce: dropped announce from blackholed identity {}",
+                identity_hash
+            );
+            return;
+        }
+    }
+
     let destination_known = handler.has_destination(&packet.destination);
     log::debug!(
         "handle_announce: destination_known={} for {}",
@@ -1856,6 +1876,44 @@ async fn handle_announce<'a>(
         let destination = result.0;
         let app_data = result.1;
         let dest_hash = destination.identity.address_hash;
+
+        // Build the full 64-byte public key (encryption + signing) for comparison
+        let announced_pub_key = {
+            let mut key = Vec::with_capacity(64);
+            key.extend_from_slice(destination.identity.public_key_bytes());
+            key.extend_from_slice(destination.identity.verifying_key_bytes());
+            key
+        };
+
+        // Convert destination hash to fixed-size array for KnownDestinations API
+        let dest_hash_bytes: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(packet.destination.as_slice());
+            buf
+        };
+
+        // Hash collision detection (Python: Identity.py:449-455).
+        // If a different public key is already known for this destination hash,
+        // reject the announce as a possible collision or attack.
+        if let Some(known) = handler.known_destinations.recall(&dest_hash_bytes) {
+            if known.public_key != announced_pub_key {
+                log::error!(
+                    "Announce for {} has valid signature but public key differs from known key. \
+                     Possible hash collision or attack. Rejecting.",
+                    packet.destination
+                );
+                return;
+            }
+        }
+
+        // Remember this destination (Python: Identity.py:457)
+        let _ = handler.known_destinations.remember(
+            &dest_hash_bytes,
+            &[],  // packet_hash — not currently tracked at this layer
+            &announced_pub_key,
+            if app_data.is_empty() { None } else { Some(app_data) },
+        );
+
         let destination = Arc::new(Mutex::new(destination));
 
         // Get hop count for logging
@@ -2645,5 +2703,159 @@ mod tests {
         // Remove second handler
         transport.deregister_announce_handler(handle2).await;
         assert_eq!(transport.announce_handler_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_blackhole_rejects_announce() {
+        use crate::destination::{DestinationName, SingleInputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Create an identity and build a valid announce packet
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app"));
+        let announce = destination
+            .announce(OsRng, None)
+            .expect("valid announce packet");
+
+        // Compute the identity hash (SHA256 of public_key || verifying_key, truncated)
+        let identity_hash = identity.as_identity().address_hash;
+
+        // Blackhole this identity
+        handler.lock().await.blackhole_manager.add(identity_hash);
+
+        // The announce should be silently dropped (blackhole check fires before validate)
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        // Destination should NOT have been stored in single_out_destinations
+        assert!(
+            !handler
+                .lock()
+                .await
+                .single_out_destinations
+                .contains_key(&announce.destination),
+            "Blackholed identity's announce should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hash_collision_rejects_announce() {
+        use crate::destination::{DestinationName, SingleInputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Create two different identities
+        let identity_a = PrivateIdentity::new_from_rand(OsRng);
+        let identity_b = PrivateIdentity::new_from_rand(OsRng);
+
+        // Create a valid announce from identity A
+        let dest_a =
+            SingleInputDestination::new(identity_a.clone(), DestinationName::new("test", "app"));
+        let announce_a = dest_a
+            .announce(OsRng, None)
+            .expect("valid announce packet");
+
+        // Pre-populate known_destinations with identity B's key under identity A's
+        // destination hash — simulating a collision scenario.
+        let dest_hash: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(announce_a.destination.as_slice());
+            buf
+        };
+        let fake_key_b = {
+            let mut key = Vec::with_capacity(64);
+            key.extend_from_slice(identity_b.as_identity().public_key_bytes());
+            key.extend_from_slice(identity_b.as_identity().verifying_key_bytes());
+            key
+        };
+        handler
+            .lock()
+            .await
+            .known_destinations
+            .remember(&dest_hash, &[], &fake_key_b, None)
+            .expect("remember should succeed");
+
+        // Process the announce from identity A — should be rejected because the
+        // stored key (B) differs from the announced key (A).
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce_a, handler.lock().await, iface, false).await;
+
+        assert!(
+            !handler
+                .lock()
+                .await
+                .single_out_destinations
+                .contains_key(&announce_a.destination),
+            "Announce with colliding hash should be rejected"
+        );
+
+        // The stored key should still be identity B's (unchanged)
+        let stored = handler
+            .lock()
+            .await
+            .known_destinations
+            .recall(&dest_hash)
+            .expect("destination should still be in known_destinations");
+        assert_eq!(
+            stored.public_key, fake_key_b,
+            "Known key should not have been overwritten by the rejected announce"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_announce_remembered() {
+        use crate::destination::{DestinationName, SingleInputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app"));
+        let announce = destination
+            .announce(OsRng, None)
+            .expect("valid announce packet");
+
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        // Validated announces are stored in single_out_destinations (remote destinations
+        // learned via announces), not single_in_destinations (locally-owned destinations).
+        assert!(
+            handler
+                .lock()
+                .await
+                .single_out_destinations
+                .contains_key(&announce.destination),
+            "Valid announce should be accepted and stored in single_out_destinations"
+        );
+
+        // KnownDestinations should remember the key
+        let dest_hash: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(announce.destination.as_slice());
+            buf
+        };
+        let stored = handler
+            .lock()
+            .await
+            .known_destinations
+            .recall(&dest_hash)
+            .expect("destination should be remembered after valid announce");
+
+        let expected_key = {
+            let mut key = Vec::with_capacity(64);
+            key.extend_from_slice(identity.as_identity().public_key_bytes());
+            key.extend_from_slice(identity.as_identity().verifying_key_bytes());
+            key
+        };
+        assert_eq!(stored.public_key, expected_key);
     }
 }

@@ -115,6 +115,7 @@ fn test_announce_propagation_through_relay() {
 
 /// Test reverse announce propagation (hub -> relay -> endpoint).
 #[test]
+#[ignore = "flaky: requires available port and serial device /dev/tty.usbserial-0001"]
 fn test_reverse_announce_propagation() {
     let mut ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
