@@ -314,33 +314,42 @@ impl PacketReceipt {
     pub fn validate_link_proof(
         &mut self,
         proof: &[u8],
-        _link_key: &[u8],
+        peer_identity: &Identity,
         metrics: Option<PhysicalMetrics>,
     ) -> bool {
-        // For link proofs, we use HMAC instead of signature verification
-        // This is a simplified version - real implementation would use link-specific validation
-        if proof.len() < HASH_LENGTH {
+        // Link proofs are explicit proofs: hash + signature (matches Python)
+        if proof.len() < EXPLICIT_PROOF_LENGTH {
             return false;
         }
 
         let proof_hash = &proof[..HASH_LENGTH];
+        let signature_bytes = &proof[HASH_LENGTH..HASH_LENGTH + SIGNATURE_LENGTH];
 
         // Verify proof hash matches our packet hash
-        if proof_hash == self.hash.as_slice() {
-            self.status = ReceiptStatus::Delivered;
-            self.proved = true;
-            self.concluded_at = Some(Instant::now());
-            self.proof_data = Some(proof.to_vec());
-            self.metrics = metrics;
-
-            if let Some(ref callback) = self.callbacks.delivery {
-                callback(self);
-            }
-
-            true
-        } else {
-            false
+        if proof_hash != self.hash.as_slice() {
+            return false;
         }
+
+        let signature = match ed25519_dalek::Signature::from_slice(signature_bytes) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+
+        if peer_identity.verify(&self.hash, &signature).is_err() {
+            return false;
+        }
+
+        self.status = ReceiptStatus::Delivered;
+        self.proved = true;
+        self.concluded_at = Some(Instant::now());
+        self.proof_data = Some(proof.to_vec());
+        self.metrics = metrics;
+
+        if let Some(ref callback) = self.callbacks.delivery {
+            callback(self);
+        }
+
+        true
     }
 
     /// Mark the receipt as failed

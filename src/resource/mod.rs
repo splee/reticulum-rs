@@ -18,7 +18,7 @@ use sha2::Digest;
 
 use crate::error::RnsError;
 use crate::hash::Hash;
-use crate::packet::PACKET_MDU;
+use crate::packet::RETICULUM_MDU;
 
 // Submodules
 mod advertising;
@@ -177,7 +177,9 @@ impl Resource {
         config: ResourceConfig,
         metadata: Option<&[u8]>,
     ) -> Result<Self, RnsError> {
-        let sdu = PACKET_MDU - 64; // Leave room for headers
+        // Resource parts are sent as PacketContext::RESOURCE (link-level plaintext),
+        // so SDU should match plain Reticulum MDU (MTU - header max - IFAC min).
+        let sdu = RETICULUM_MDU;
 
         // Handle metadata
         let (metadata_bytes, has_metadata) = if let Some(meta) = metadata {
@@ -234,9 +236,9 @@ impl Resource {
         final_data.extend_from_slice(&random_hash);
         final_data.extend_from_slice(&processed_data);
 
-        // In production, this would be encrypted using link.encrypt()
-        // For now, we just mark it as encrypted
-        // TODO: For now, don't encrypt at resource level.
+        // In production, this would be encrypted using link.encrypt().
+        // NOTE: Resource-level encryption is currently disabled in Rust and is
+        // not Python-compatible. This will be addressed in parity work.
         // Full implementation requires passing link key to encrypt the data stream.
         // Python encrypts the entire data stream with link.encrypt() before splitting into parts.
         let encrypted = false;

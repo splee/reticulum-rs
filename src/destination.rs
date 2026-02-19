@@ -11,18 +11,19 @@ pub mod request_receipt;
 
 use alloc::sync::Arc;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
-use rand_core::CryptoRngCore;
-use x25519_dalek::PublicKey;
+use rand_core::{CryptoRngCore, OsRng};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use core::{fmt, marker::PhantomData};
 
 use crate::{
     destination::link::Link,
+    crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
     hash::{AddressHash, Hash},
     identity::{
-        DecryptIdentity, EmptyIdentity, EncryptIdentity, HashIdentity, Identity, PrivateIdentity,
-        PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE,
+        DerivedKey, EmptyIdentity, HashIdentity, Identity,
+        PrivateIdentity, DERIVED_KEY_LENGTH, PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE,
     },
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
@@ -31,6 +32,99 @@ use crate::{
     persistence::RatchetManager,
 };
 use sha2::Digest;
+use crate::destination::proof::ProofStrategy;
+
+// ============================================================================
+// SINGLE Destination Crypto Helpers (Python-compatible)
+// ============================================================================
+
+fn encrypt_single<R: CryptoRngCore + Copy>(
+    rng: R,
+    target_pub: &PublicKey,
+    salt: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, RnsError> {
+    // Generate ephemeral keypair (X25519) and derive shared secret
+    let secret = EphemeralSecret::random_from_rng(rng);
+    let ep_pub = PublicKey::from(&secret);
+    let shared = secret.diffie_hellman(target_pub);
+
+    // Derive key using Python-compatible HKDF (salt = identity hash)
+    let derived = DerivedKey::new(&shared, Some(salt));
+
+    // Allocate output buffer: ephemeral pub (32) + token (plaintext + overhead + padding)
+    let mut out = vec![0u8; PUBLIC_KEY_LENGTH + plaintext.len() + 64];
+    out[..PUBLIC_KEY_LENGTH].copy_from_slice(ep_pub.as_bytes());
+
+    let token = Fernet::new_from_slices(
+        &derived.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+        &derived.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+        rng,
+    )
+    .encrypt(PlainText::from(plaintext), &mut out[PUBLIC_KEY_LENGTH..])?;
+
+    let total_len = PUBLIC_KEY_LENGTH + token.len();
+    out.truncate(total_len);
+    Ok(out)
+}
+
+fn decrypt_single<R: CryptoRngCore + Copy>(
+    rng: R,
+    salt: &[u8],
+    identity: &PrivateIdentity,
+    ciphertext: &[u8],
+    ratchets: Option<&[Vec<u8>]>,
+) -> Result<Vec<u8>, RnsError> {
+    if ciphertext.len() <= PUBLIC_KEY_LENGTH {
+        return Err(RnsError::InvalidArgument);
+    }
+
+    let mut ep_bytes = [0u8; PUBLIC_KEY_LENGTH];
+    ep_bytes.copy_from_slice(&ciphertext[..PUBLIC_KEY_LENGTH]);
+    let ep_pub = PublicKey::from(ep_bytes);
+    let token_bytes = &ciphertext[PUBLIC_KEY_LENGTH..];
+
+    let mut out_buf = vec![0u8; token_bytes.len()];
+
+    // Try ratchets first (if provided)
+    if let Some(ratchets) = ratchets {
+        for ratchet in ratchets {
+            if ratchet.len() != RATCHET_KEY_SIZE {
+                continue;
+            }
+            let mut rbytes = [0u8; RATCHET_KEY_SIZE];
+            rbytes.copy_from_slice(&ratchet[..]);
+            let ratchet_prv = StaticSecret::from(rbytes);
+            let shared = ratchet_prv.diffie_hellman(&ep_pub);
+            let derived = DerivedKey::new(&shared, Some(salt));
+
+            let fernet = Fernet::new_from_slices(
+                &derived.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+                &derived.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+                rng,
+            );
+            let token = Token::from(token_bytes);
+            if let Ok(verified) = fernet.verify(token) {
+                if let Ok(plain) = fernet.decrypt(verified, &mut out_buf) {
+                    return Ok(plain.as_slice().to_vec());
+                }
+            }
+        }
+    }
+
+    // Fallback to identity private key
+    let shared = identity.exchange(&ep_pub);
+    let derived = DerivedKey::new(&shared, Some(salt));
+    let fernet = Fernet::new_from_slices(
+        &derived.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+        &derived.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+        rng,
+    );
+    let token = Token::from(token_bytes);
+    let verified = fernet.verify(token)?;
+    let plain = fernet.decrypt(verified, &mut out_buf)?;
+    Ok(plain.as_slice().to_vec())
+}
 
 //***************************************************************************//
 // Destination Callbacks
@@ -327,11 +421,45 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub desc: DestinationDesc,
     /// Callbacks for destination events (matching Python's callback API)
     pub callbacks: DestinationCallbacks,
+    /// Proof strategy for responding to incoming packets
+    pub proof_strategy: ProofStrategy,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
     pub fn destination_type(&self) -> packet::DestinationType {
         <T as Type>::destination_type()
+    }
+
+    /// Set the proof strategy for this destination.
+    ///
+    /// Matches Python's `set_proof_strategy()` behavior.
+    pub fn set_proof_strategy(&mut self, strategy: ProofStrategy) {
+        self.proof_strategy = strategy;
+    }
+
+    /// Get the current proof strategy.
+    pub fn get_proof_strategy(&self) -> ProofStrategy {
+        self.proof_strategy
+    }
+
+    /// Decide whether to send a proof for a given packet.
+    ///
+    /// Matches Python behavior:
+    /// - PROVE_ALL => always prove
+    /// - PROVE_APP => call proof_requested callback if set
+    /// - PROVE_NONE => never prove
+    pub fn should_prove(&self, packet: &Packet) -> bool {
+        match self.proof_strategy {
+            ProofStrategy::All => true,
+            ProofStrategy::App => {
+                if let Some(ref callback) = self.callbacks.proof_requested {
+                    callback(packet)
+                } else {
+                    false
+                }
+            }
+            ProofStrategy::None => false,
+        }
     }
 }
 
@@ -355,6 +483,7 @@ impl Destination<PrivateIdentity, Input, Single> {
                 address_hash,
             },
             callbacks: DestinationCallbacks::default(),
+            proof_strategy: ProofStrategy::None,
         }
     }
 
@@ -519,15 +648,8 @@ impl Destination<PrivateIdentity, Input, Single> {
         }
 
         if packet.header.packet_type == PacketType::LinkRequest {
-            // Check proof_requested callback for PROVE_APP strategy
-            if let Some(ref proof_callback) = self.callbacks.proof_requested {
-                if proof_callback(packet) {
-                    return DestinationHandleStatus::LinkProof;
-                }
-            } else {
-                // Default behavior: always send proof
-                return DestinationHandleStatus::LinkProof;
-            }
+            // Always prove link requests (matching Python's default behavior).
+            return DestinationHandleStatus::LinkProof;
         }
 
         DestinationHandleStatus::None
@@ -636,23 +758,26 @@ impl Destination<PrivateIdentity, Input, Single> {
     ///
     /// * `rng` - Random number generator
     /// * `plaintext` - The data to encrypt
-    /// * `ratchet` - Optional ratchet public key for forward secrecy (not yet used)
+    /// * `ratchet` - Optional ratchet public key for forward secrecy
     fn encrypt_with_ratchet<R: CryptoRngCore + Copy>(
         &self,
         rng: R,
         plaintext: &[u8],
-        _ratchet: Option<&[u8]>,
+        ratchet: Option<&[u8]>,
     ) -> Result<Vec<u8>, RnsError> {
-        let pub_identity = self.identity.as_identity();
-        let derived_key = pub_identity.derive_key(rng, None);
+        let salt = self.desc.address_hash.as_slice();
+        let target_pub = if let Some(ratchet) = ratchet {
+            if ratchet.len() != RATCHET_KEY_SIZE {
+                return Err(RnsError::InvalidArgument);
+            }
+            let mut rbytes = [0u8; RATCHET_KEY_SIZE];
+            rbytes.copy_from_slice(ratchet);
+            PublicKey::from(rbytes)
+        } else {
+            self.identity.as_identity().public_key
+        };
 
-        // Build the output buffer
-        let max_size = plaintext.len() + PUBLIC_KEY_LENGTH + 64 + 32; // overhead estimate
-        let mut out_buf = vec![0u8; max_size];
-
-        let encrypted = pub_identity.encrypt(rng, plaintext, &derived_key, &mut out_buf)?;
-
-        Ok(encrypted.to_vec())
+        encrypt_single(rng, &target_pub, salt, plaintext)
     }
 
     /// Decrypt ciphertext from this destination.
@@ -664,7 +789,7 @@ impl Destination<PrivateIdentity, Input, Single> {
     ///
     /// * `rng` - Random number generator
     /// * `ciphertext` - The encrypted data
-    /// * `ratchets` - Optional list of ratchet keys to try for decryption (not yet used)
+    /// * `ratchets` - Optional list of ratchet keys to try for decryption
     ///
     /// # Returns
     ///
@@ -673,27 +798,62 @@ impl Destination<PrivateIdentity, Input, Single> {
         &self,
         rng: R,
         ciphertext: &[u8],
-        _ratchets: Option<&[Vec<u8>]>,
+        ratchets: Option<&[Vec<u8>]>,
     ) -> Result<Vec<u8>, RnsError> {
-        if ciphertext.len() <= PUBLIC_KEY_LENGTH {
-            return Err(RnsError::InvalidArgument);
+        let salt = self.desc.address_hash.as_slice();
+        decrypt_single(rng, salt, &self.identity, ciphertext, ratchets)
+    }
+
+    /// Receive and decrypt an incoming packet for this destination.
+    ///
+    /// Returns true if the packet was successfully decrypted and processed.
+    /// Mirrors Python's `Destination.receive()` for SINGLE destinations.
+    pub fn receive(&self, packet: &Packet) -> bool {
+        if packet.header.packet_type == PacketType::LinkRequest {
+            // Link requests are handled by transport separately.
+            return false;
         }
 
-        // Extract ephemeral public key from ciphertext
-        let mut ephemeral_bytes = [0u8; 32];
-        ephemeral_bytes.copy_from_slice(&ciphertext[..PUBLIC_KEY_LENGTH]);
-        let ephemeral_public = x25519_dalek::PublicKey::from(ephemeral_bytes);
+        if packet.header.packet_type != PacketType::Data {
+            return false;
+        }
 
-        // Derive decryption key
-        let derived_key = self.identity.derive_key(&ephemeral_public, None);
+        let plaintext = match self.decrypt(OsRng, packet.data.as_slice(), None) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
 
-        // Decrypt
-        let mut out_buf = vec![0u8; ciphertext.len()];
-        let decrypted = self
-            .identity
-            .decrypt(rng, &ciphertext[PUBLIC_KEY_LENGTH..], &derived_key, &mut out_buf)?;
+        if let Some(ref callback) = self.callbacks.packet {
+            callback(plaintext.as_slice(), packet);
+        }
 
-        Ok(decrypted.to_vec())
+        true
+    }
+
+    /// Create a proof packet for a received data packet.
+    ///
+    /// Proof format: packet_hash + signature (explicit proof).
+    /// Destination is the truncated hash of the proved packet.
+    pub fn proof_packet(&self, packet: &Packet) -> Packet {
+        let hash = packet.hash();
+        let signature = self.identity.sign(hash.as_slice());
+
+        let mut packet_data = PacketDataBuffer::new();
+        packet_data.safe_write(hash.as_slice());
+        packet_data.safe_write(&signature.to_bytes());
+
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new_from_hash(&hash),
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        }
     }
 }
 
@@ -710,6 +870,7 @@ impl Destination<Identity, Output, Single> {
                 address_hash,
             },
             callbacks: DestinationCallbacks::default(),
+            proof_strategy: ProofStrategy::None,
         }
     }
 
@@ -739,18 +900,22 @@ impl Destination<Identity, Output, Single> {
         // Get the selected ratchet if available
         let dest_hash: [u8; 16] = self.desc.address_hash.as_slice().try_into()
             .map_err(|_| RnsError::InvalidArgument)?;
-        let _selected_ratchet = ratchet_manager
+        let selected_ratchet = ratchet_manager
             .and_then(|rm| rm.get(&dest_hash));
 
-        let derived_key = self.identity.derive_key(rng, None);
+        let salt = self.desc.address_hash.as_slice();
+        let target_pub = if let Some(ratchet) = selected_ratchet.as_deref() {
+            if ratchet.len() != RATCHET_KEY_SIZE {
+                return Err(RnsError::InvalidArgument);
+            }
+            let mut rbytes = [0u8; RATCHET_KEY_SIZE];
+            rbytes.copy_from_slice(ratchet);
+            PublicKey::from(rbytes)
+        } else {
+            self.identity.public_key
+        };
 
-        // Build the output buffer
-        let max_size = plaintext.len() + PUBLIC_KEY_LENGTH + 64 + 32; // overhead estimate
-        let mut out_buf = vec![0u8; max_size];
-
-        let encrypted = self.identity.encrypt(rng, plaintext, &derived_key, &mut out_buf)?;
-
-        Ok(encrypted.to_vec())
+        encrypt_single(rng, &target_pub, salt, plaintext)
     }
 }
 
@@ -767,6 +932,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
                 address_hash,
             },
             callbacks: DestinationCallbacks::default(),
+            proof_strategy: ProofStrategy::None,
         }
     }
 }

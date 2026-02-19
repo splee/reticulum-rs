@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use reticulum::destination::link::LinkEvent;
 use reticulum::hash::AddressHash;
-use reticulum::packet::PACKET_MDU;
+use reticulum::packet::RETICULUM_MDU;
 use reticulum::resource::{Resource, ResourceAdvertisement};
 use reticulum::transport::{Transport, TransportConfig};
 
@@ -334,7 +334,7 @@ async fn handle_advertisement_event(
         println!("Receiving file ({} bytes)", adv.data_size);
     }
 
-    let sdu = PACKET_MDU - 64;
+    let sdu = RETICULUM_MDU;
     let mut resource = match Resource::from_advertisement(&adv, sdu) {
         Ok(r) => r,
         Err(e) => {

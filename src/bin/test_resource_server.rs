@@ -19,7 +19,7 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::resource::{Resource, ResourceAdvertisement};
-use reticulum::packet::PACKET_MDU;
+use reticulum::packet::RETICULUM_MDU;
 use reticulum::transport::{Transport, TransportConfig};
 use tokio::sync::RwLock;
 
@@ -289,8 +289,8 @@ async fn handle_link_event(
                     );
 
                     // Create an incoming resource from the advertisement
-                    // SDU is PACKET_MDU minus some overhead for headers
-                    let sdu = PACKET_MDU - 64;
+                    // SDU matches plain Reticulum MDU (MTU - header max - IFAC min)
+                    let sdu = RETICULUM_MDU;
 
                     // Debug: Log hashmap and random_hash info
                     log::debug!(

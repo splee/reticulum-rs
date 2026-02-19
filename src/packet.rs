@@ -6,7 +6,18 @@ use crate::buffer::StaticBuffer;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 
-pub const PACKET_MDU: usize = 2048usize;
+// Reticulum core sizing constants (match Python defaults in RNS/Reticulum.py)
+pub const RETICULUM_MTU: usize = 500;
+pub const TRUNCATED_HASH_LEN: usize = 16; // 128-bit truncated hashes
+pub const HEADER_MIN_SIZE: usize = 2 + 1 + TRUNCATED_HASH_LEN; // header + context + destination
+pub const HEADER_MAX_SIZE: usize = 2 + 1 + (TRUNCATED_HASH_LEN * 2); // header + context + transport + destination
+pub const IFAC_MIN_SIZE: usize = 1; // minimum IFAC size in bytes
+pub const RETICULUM_MDU: usize = RETICULUM_MTU - HEADER_MAX_SIZE - IFAC_MIN_SIZE;
+pub const AES_BLOCK_SIZE: usize = 16;
+pub const TOKEN_OVERHEAD: usize = 48; // 16-byte IV + 32-byte HMAC
+
+// Packet payload buffer size (plain MDU)
+pub const PACKET_MDU: usize = RETICULUM_MDU;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -292,13 +303,13 @@ pub struct Packet {
 impl Packet {
     /// Compute packet hash matching Python's get_hashable_part().
     ///
-    /// The hash includes: [meta & 0x0F] + [hops] + destination + context + data
-    /// This matches Python which hashes raw[2:] where raw[1] is the hops byte.
+    /// The hash includes: [meta & 0x0F] + destination + context + data
+    /// This matches Python's get_hashable_part(), which excludes hops and
+    /// (for HEADER_2) excludes the transport ID.
     pub fn hash(&self) -> Hash {
         Hash::new(
             Hash::generator()
                 .chain_update([self.header.to_meta() & 0b00001111])
-                .chain_update([self.header.hops])
                 .chain_update(self.destination.as_slice())
                 .chain_update([self.context as u8])
                 .chain_update(self.data.as_slice())
@@ -774,24 +785,24 @@ mod tests {
 
         #[test]
         fn test_packet_hash_includes_hops() {
-            // Verify that changing hops changes the hash (Python compatibility)
+            // Verify that changing hops does NOT change the hash (Python compatibility)
             let mut packet1 = Packet::default();
             packet1.header.hops = 0;
 
             let mut packet2 = Packet::default();
             packet2.header.hops = 5;
 
-            // Hashes MUST differ when hops differ
-            assert_ne!(
+            // Hashes MUST match when only hops differ
+            assert_eq!(
                 packet1.hash(),
                 packet2.hash(),
-                "Packet hash must include hops byte for Python compatibility"
+                "Packet hash must ignore hops byte for Python compatibility"
             );
         }
 
         #[test]
         fn test_packet_hash_hops_sensitivity() {
-            // Test multiple hop values produce different hashes
+            // Test multiple hop values produce identical hashes
             let hashes: Vec<_> = (0..=5)
                 .map(|h| {
                     let mut p = Packet::default();
@@ -800,12 +811,12 @@ mod tests {
                 })
                 .collect();
 
-            // All hashes should be unique
+            // All hashes should be identical
             for i in 0..hashes.len() {
                 for j in (i + 1)..hashes.len() {
-                    assert_ne!(
+                    assert_eq!(
                         hashes[i], hashes[j],
-                        "Hops {} and {} should produce different hashes",
+                        "Hops {} and {} should produce identical hashes",
                         i, j
                     );
                 }

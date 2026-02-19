@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::constants::{AUTO_COMPRESS_MAX_SIZE, MAX_ADV_RETRIES, MAX_EFFICIENT_SIZE, MAX_RETRIES};
 use super::status::ResourceStatus;
-use crate::packet::PACKET_MDU;
+use crate::packet::RETICULUM_MDU;
 
 /// Progress information for resource transfer
 #[derive(Debug, Clone)]
@@ -50,7 +50,7 @@ impl ResourceProgress {
 
         // For split resources, calculate based on segments
         let max_parts_per_segment =
-            (MAX_EFFICIENT_SIZE as f64 / PACKET_MDU as f64).ceil() as usize;
+            (MAX_EFFICIENT_SIZE as f64 / RETICULUM_MDU as f64).ceil() as usize;
         let previously_processed = (self.segment_index - 1) * max_parts_per_segment;
 
         let current_segment_factor = if self.total_parts < max_parts_per_segment {

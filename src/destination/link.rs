@@ -19,6 +19,7 @@ use crate::{
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
+        RETICULUM_MTU,
     },
     resource::{Resource, ResourceAdvertisement},
 };
@@ -166,6 +167,8 @@ pub enum LinkHandleResult {
     None,
     Activated,
     KeepAlive,
+    /// A data packet (context NONE) was successfully decrypted and delivered
+    DataReceived,
 }
 
 #[derive(Clone)]
@@ -338,7 +341,7 @@ impl Link {
         );
 
         // Parse MTU and mode from signalling bytes if present
-        let (mtu, mode) = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
+        let (mut mtu, mode) = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
             let sig_start = PUBLIC_KEY_LENGTH * 2;
             let sig_bytes = &packet.data.as_slice()[sig_start..sig_start + LINK_MTU_SIZE];
             let mtu_value = ((sig_bytes[0] as u32) << 16)
@@ -355,6 +358,11 @@ impl Link {
         } else {
             (DEFAULT_LINK_MTU, LinkMode::default())
         };
+
+        // Clamp MTU to Reticulum's standard MTU to match Rust packet buffer limits.
+        if mtu > RETICULUM_MTU as u32 {
+            mtu = RETICULUM_MTU as u32;
+        }
 
         let link_id = LinkId::from(packet);
         log::debug!("link: create from request {} (mtu={}, mode={:?})", link_id, mtu, mode);
@@ -477,6 +485,7 @@ impl Link {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
                     self.post_event(LinkEvent::Data(LinkPayload::new_from_slice(plain_text)));
+                    return LinkHandleResult::DataReceived;
                 } else {
                     log::error!("link({}): can't decrypt packet", self.id);
                 }
@@ -645,6 +654,31 @@ impl Link {
         }
 
         LinkHandleResult::None
+    }
+
+    /// Create a proof packet for a received link data packet.
+    ///
+    /// Proof format: packet_hash + signature (explicit proof), not encrypted.
+    pub fn proof_packet(&self, packet: &Packet) -> Packet {
+        let hash = packet.hash();
+        let signature = self.priv_identity.sign(hash.as_slice());
+
+        let mut packet_data = PacketDataBuffer::new();
+        packet_data.safe_write(hash.as_slice());
+        packet_data.safe_write(&signature.to_bytes());
+
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        }
     }
 
     pub fn handle_packet(&mut self, packet: &Packet) -> LinkHandleResult {
@@ -933,6 +967,11 @@ impl Link {
         &self.id
     }
 
+    /// Get the peer identity used for link proof verification.
+    pub fn peer_identity(&self) -> &Identity {
+        &self.peer_identity
+    }
+
     /// Get round-trip time measurement
     pub fn rtt(&self) -> Duration {
         self.rtt
@@ -1027,13 +1066,20 @@ impl Link {
     }
 
     /// Get the maximum data unit size for this link.
-    /// This is the maximum payload size that can be sent in a single packet.
+    /// This is the maximum plaintext payload size that can be sent in a single packet.
     pub fn mdu(&self) -> usize {
-        // Link MDU is determined by the underlying transport
-        // For now, use the standard PACKET_MDU minus encryption overhead
-        // AES-256-CBC: 16-byte IV + padding (up to 16 bytes) + HMAC (32 bytes)
-        // Total overhead is approximately 64 bytes max
-        PACKET_MDU.saturating_sub(64)
+        // Match Python Link.update_mdu():
+        // mdu = floor((mtu - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD)/AES_BLOCKSIZE)*AES_BLOCKSIZE - 1
+        use crate::packet::{AES_BLOCK_SIZE, HEADER_MIN_SIZE, IFAC_MIN_SIZE, TOKEN_OVERHEAD};
+
+        let mtu = self.mtu as isize;
+        let base = mtu - (IFAC_MIN_SIZE as isize) - (HEADER_MIN_SIZE as isize) - (TOKEN_OVERHEAD as isize);
+        if base <= 0 {
+            return 0;
+        }
+
+        let blocks = (base as usize) / AES_BLOCK_SIZE;
+        blocks.saturating_mul(AES_BLOCK_SIZE).saturating_sub(1)
     }
 
     // ========================================================================
@@ -1929,10 +1975,18 @@ mod tests {
             let link = Link::new(dest, tx);
 
             let mdu = link.mdu();
-            // MDU should be PACKET_MDU minus encryption overhead (~64 bytes)
+            // MDU should match Python formula:
+            // floor((mtu - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD)/AES_BLOCKSIZE)*AES_BLOCKSIZE - 1
+            use crate::packet::{AES_BLOCK_SIZE, HEADER_MIN_SIZE, IFAC_MIN_SIZE, TOKEN_OVERHEAD};
+            let base = (DEFAULT_LINK_MTU as usize)
+                .saturating_sub(IFAC_MIN_SIZE + HEADER_MIN_SIZE + TOKEN_OVERHEAD);
+            let expected = (base / AES_BLOCK_SIZE)
+                .saturating_mul(AES_BLOCK_SIZE)
+                .saturating_sub(1);
+
             assert!(mdu > 0);
             assert!(mdu < PACKET_MDU);
-            assert_eq!(mdu, PACKET_MDU - 64);
+            assert_eq!(mdu, expected);
         }
 
         #[test]

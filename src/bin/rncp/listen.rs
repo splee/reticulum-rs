@@ -17,7 +17,7 @@ use rand_core::OsRng;
 use reticulum::cli::format::format_hash;
 use reticulum::destination::link::{LinkEvent, LinkEventData, LinkId};
 use reticulum::destination::DestinationName;
-use reticulum::packet::PACKET_MDU;
+use reticulum::packet::RETICULUM_MDU;
 use reticulum::resource::{Resource, ResourceAdvertisement, ResourceConfig};
 use reticulum::transport::{Transport, TransportConfig};
 use tokio::sync::RwLock;
@@ -342,7 +342,7 @@ async fn handle_resource_advertisement(
             );
 
             // Create an incoming resource from the advertisement
-            let sdu = PACKET_MDU - 64;
+            let sdu = RETICULUM_MDU;
             let has_metadata = adv.flags.has_metadata;
 
             match Resource::from_advertisement(&adv, sdu) {

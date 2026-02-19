@@ -46,7 +46,7 @@ use crate::packet::Packet;
 use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
-use crate::receipt::{PacketReceipt, ReceiptManager};
+use crate::receipt::{PacketReceipt, ReceiptManager, EXPLICIT_PROOF_LENGTH};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
 
 pub mod announce_handler;
@@ -1378,9 +1378,14 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
     }
 
     // Handle packet proofs (for receipts)
-    // The proof packet's destination is the truncated hash of the proved packet
+    // For explicit proofs, use the proof hash (first 32 bytes) to locate receipt.
     if packet.context != PacketContext::LinkRequestProof {
-        let truncated_hash: [u8; 16] = {
+        let truncated_hash: [u8; 16] = if packet.data.len() == EXPLICIT_PROOF_LENGTH {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&packet.data.as_slice()[..16]);
+            arr
+        } else {
+            // Fallback to packet destination (non-link proofs)
             let slice = packet.destination.as_slice();
             let mut arr = [0u8; 16];
             arr.copy_from_slice(&slice[..16]);
@@ -1388,22 +1393,52 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         };
 
         if let Some(receipt) = handler.receipt_manager.get(&truncated_hash).await {
-            // Get the destination identity for proof validation
-            let mut receipt_guard = receipt.lock().await;
-            if let Some(dest_hash) = receipt_guard.destination_hash() {
-                // Look up the destination's identity
-                let dest_hash_arr = AddressHash::new_from_slice(dest_hash);
-                if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
-                    let dest_lock = dest.blocking_lock();
-                    let identity = &dest_lock.identity;
-                    let proof_data = packet.data.as_slice();
+            let proof_data = packet.data.as_slice();
 
-                    if receipt_guard.validate_proof(proof_data, identity) {
+            if packet.header.destination_type == DestinationType::Link {
+                // Link proof: validate with the link peer identity
+                let mut peer_identity = None;
+                if let Some(link) = handler.link_manager.get_in_link(&packet.destination) {
+                    let link_guard = link.lock().await;
+                    peer_identity = Some(*link_guard.peer_identity());
+                } else {
+                    let out_links: Vec<Arc<Mutex<Link>>> =
+                        handler.link_manager.out_link_values().cloned().collect();
+                    for link in out_links {
+                        let link_guard = link.lock().await;
+                        if *link_guard.id() == packet.destination {
+                            peer_identity = Some(*link_guard.peer_identity());
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(identity) = peer_identity {
+                    let mut receipt_guard = receipt.lock().await;
+                    if receipt_guard.validate_link_proof(proof_data, &identity, None) {
                         log::debug!(
-                            "tp({}): validated proof for packet {}",
+                            "tp({}): validated link proof for packet {}",
                             handler.config.name,
                             packet.destination
                         );
+                    }
+                }
+            } else {
+                let mut receipt_guard = receipt.lock().await;
+                if let Some(dest_hash) = receipt_guard.destination_hash() {
+                    // Non-link proof: validate with destination identity
+                    let dest_hash_arr = AddressHash::new(*dest_hash);
+                    if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
+                        let dest_lock = dest.blocking_lock();
+                        let identity = &dest_lock.identity;
+
+                        if receipt_guard.validate_proof(proof_data, identity) {
+                            log::debug!(
+                                "tp({}): validated proof for packet {}",
+                                handler.config.name,
+                                packet.destination
+                            );
+                        }
                     }
                 }
             }
@@ -1652,17 +1687,73 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
 
     if packet.header.destination_type == DestinationType::Link {
         if let Some(link) = handler.link_manager.get_in_link(&packet.destination) {
-            let mut link = link.lock().await;
-            let result = link.handle_packet(packet);
+            let link_arc = link.clone();
+            let (result, dest_hash, initiator) = {
+                let mut link = link_arc.lock().await;
+                let result = link.handle_packet(packet);
+                (result, link.destination().address_hash, link.is_initiator())
+            };
+
             if let LinkHandleResult::KeepAlive = result {
+                let link = link_arc.lock().await;
                 let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
                 handler.send_packet(packet).await;
             }
+
+            if let LinkHandleResult::DataReceived = result {
+                let should_prove = if initiator {
+                    if let Some(dest) = handler.single_out_destinations.get(&dest_hash) {
+                        let dest = dest.lock().await;
+                        dest.should_prove(packet)
+                    } else {
+                        false
+                    }
+                } else if let Some(dest) = handler.single_in_destinations.get(&dest_hash) {
+                    let dest = dest.lock().await;
+                    dest.should_prove(packet)
+                } else {
+                    false
+                };
+
+                if should_prove {
+                    let link = link_arc.lock().await;
+                    let proof = link.proof_packet(packet);
+                    handler.send_packet(proof).await;
+                }
+            }
         }
 
-        for link in handler.link_manager.out_link_values() {
-            let mut link = link.lock().await;
-            let _ = link.handle_packet(packet);
+        let out_links: Vec<Arc<Mutex<Link>>> =
+            handler.link_manager.out_link_values().cloned().collect();
+        for link_arc in out_links {
+            let (result, dest_hash, initiator) = {
+                let mut link = link_arc.lock().await;
+                let result = link.handle_packet(packet);
+                (result, link.destination().address_hash, link.is_initiator())
+            };
+
+            if let LinkHandleResult::DataReceived = result {
+                let should_prove = if initiator {
+                    if let Some(dest) = handler.single_out_destinations.get(&dest_hash) {
+                        let dest = dest.lock().await;
+                        dest.should_prove(packet)
+                    } else {
+                        false
+                    }
+                } else if let Some(dest) = handler.single_in_destinations.get(&dest_hash) {
+                    let dest = dest.lock().await;
+                    dest.should_prove(packet)
+                } else {
+                    false
+                };
+
+                if should_prove {
+                    let link = link_arc.lock().await;
+                    let proof = link.proof_packet(packet);
+                    handler.send_packet(proof).await;
+                }
+            }
+
             data_handled = true;
         }
 
@@ -1684,17 +1775,34 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
     }
 
     if packet.header.destination_type == DestinationType::Single {
-        if let Some(_destination) = handler
+        if let Some(destination) = handler
             .single_in_destinations
             .get(&packet.destination)
             .cloned()
         {
             data_handled = true;
 
-            handler.received_data_tx.send(ReceivedData {
-                destination: packet.destination,
-                data: packet.data,
-            }).ok();
+            let (received, proof_packet) = {
+                let dest = destination.lock().await;
+                let received = dest.receive(packet);
+                let proof_packet = if received && dest.should_prove(packet) {
+                    Some(dest.proof_packet(packet))
+                } else {
+                    None
+                };
+                (received, proof_packet)
+            };
+
+            if received {
+                handler.received_data_tx.send(ReceivedData {
+                    destination: packet.destination,
+                    data: packet.data,
+                }).ok();
+            }
+
+            if let Some(proof) = proof_packet {
+                handler.send_packet(proof).await;
+            }
         } else {
             data_handled = send_to_next_hop(packet, &handler, None).await;
         }

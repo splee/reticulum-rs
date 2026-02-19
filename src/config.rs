@@ -491,6 +491,7 @@ impl ReticulumConfig {
                     listen_port: subsection.get_int("listen_port").map(|p| p as u16),
                     outgoing: subsection.get_bool("outgoing").unwrap_or(true),
                     bitrate: subsection.get_int("bitrate").map(|b| b as u64),
+                    fixed_mtu: subsection.get_int("mtu").map(|m| m as usize),
                     extra: subsection.values.clone(),
                 });
             }
@@ -527,6 +528,8 @@ pub struct InterfaceConfig {
     pub outgoing: bool,
     /// Interface bitrate in bits per second
     pub bitrate: Option<u64>,
+    /// Fixed interface MTU (bytes), if configured
+    pub fixed_mtu: Option<usize>,
     /// Additional configuration values
     pub extra: HashMap<String, String>,
 }

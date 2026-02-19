@@ -6,6 +6,7 @@
 use crate::error::RnsError;
 
 use super::constants::{MAPHASH_LEN, RANDOM_HASH_SIZE, WINDOW_MAX};
+use crate::packet::{AES_BLOCK_SIZE, HEADER_MIN_SIZE, IFAC_MIN_SIZE, RETICULUM_MTU, TOKEN_OVERHEAD};
 use super::status::ResourceFlags;
 
 /// Resource advertisement for announcing a resource
@@ -40,7 +41,13 @@ impl ResourceAdvertisement {
     pub const OVERHEAD: usize = 134;
 
     /// Maximum hashmap entries that fit in an advertisement
-    pub const HASHMAP_MAX_LEN: usize = (464 - Self::OVERHEAD) / MAPHASH_LEN; // Approximate MDU - overhead
+    pub const HASHMAP_MAX_LEN: usize = {
+        // Match Python: floor((Link.MDU - OVERHEAD)/MAPHASH_LEN)
+        // Link.MDU = floor((mtu - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD)/AES_BLOCKSIZE)*AES_BLOCKSIZE - 1
+        let base = (RETICULUM_MTU - IFAC_MIN_SIZE - HEADER_MIN_SIZE - TOKEN_OVERHEAD) / AES_BLOCK_SIZE;
+        let link_mdu = base * AES_BLOCK_SIZE - 1;
+        (link_mdu - Self::OVERHEAD) / MAPHASH_LEN
+    };
 
     /// Collision guard size for hashmap
     pub const COLLISION_GUARD_SIZE: usize = 2 * WINDOW_MAX + Self::HASHMAP_MAX_LEN;

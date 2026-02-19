@@ -161,12 +161,12 @@ mod tests {
 
     #[test]
     fn test_different_hops_creates_different_hash() {
-        // With Python-compatible hashing, different hops = different hash
+        // With Python-compatible hashing, different hops = same hash
         let packet1 = test_packet(5, 0xEE);
         let packet2 = test_packet(2, 0xEE);
 
-        // Same data but different hops should produce different hashes
-        assert_ne!(packet1.hash(), packet2.hash());
+        // Same data but different hops should produce identical hashes
+        assert_eq!(packet1.hash(), packet2.hash());
     }
 
     #[test]
@@ -339,11 +339,11 @@ mod tests {
         cache.update(&packet_high);
         cache.update(&packet_low);
 
-        // Should be two separate cache entries (hops affects hash)
-        assert_eq!(cache.map.len(), 2);
+        // Should be one cache entry (hops does not affect hash)
+        assert_eq!(cache.map.len(), 1);
 
-        // Each entry tracks its own hops
-        assert_eq!(cache.map.get(&packet_high.hash()).unwrap().min_hops, 255);
-        assert_eq!(cache.map.get(&packet_low.hash()).unwrap().min_hops, 100);
+        // Entry tracks minimum hops
+        let hash = packet_high.hash();
+        assert_eq!(cache.map.get(&hash).unwrap().min_hops, 100);
     }
 }

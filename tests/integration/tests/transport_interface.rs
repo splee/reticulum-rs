@@ -379,16 +379,13 @@ fn test_hdlc_python_rust_parity() {
 /// Test 18: MTU autoconfiguration.
 ///
 /// Verifies that MTU is correctly reported for each interface type.
-/// The standard Reticulum MTU is 500 bytes, with MDU (max data unit) of 2048 bytes.
+/// The standard Reticulum MTU is 500 bytes, with MDU (max data unit) of 464 bytes.
 #[test]
 fn test_mtu_autoconfiguration() {
     use reticulum::packet::PACKET_MDU;
 
     // Verify the MDU constant matches expected value
-    assert_eq!(
-        PACKET_MDU, 2048,
-        "PACKET_MDU should be 2048 bytes"
-    );
+    assert_eq!(PACKET_MDU, 464, "PACKET_MDU should be 464 bytes");
 
     // Test that packet structure overhead is accounted for correctly
     // Type1: meta(1) + hops(1) + dest(16) + context(1) = 19 bytes overhead
@@ -406,8 +403,8 @@ fn test_mtu_autoconfiguration() {
 
     assert_eq!(TYPE1_OVERHEAD, 19, "Type1 header overhead should be 19 bytes");
     assert_eq!(TYPE2_OVERHEAD, 35, "Type2 header overhead should be 35 bytes");
-    assert_eq!(type1_max_data, 2029, "Type1 max data should be 2029 bytes");
-    assert_eq!(type2_max_data, 2013, "Type2 max data should be 2013 bytes");
+    assert_eq!(type1_max_data, 445, "Type1 max data should be 445 bytes");
+    assert_eq!(type2_max_data, 429, "Type2 max data should be 429 bytes");
 
     eprintln!("test_mtu_autoconfiguration passed");
 }

@@ -533,10 +533,6 @@ impl DecryptIdentity for PrivateIdentity {
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
-        if data.len() <= PUBLIC_KEY_LENGTH {
-            return Err(RnsError::InvalidArgument);
-        }
-
         let fernet = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
