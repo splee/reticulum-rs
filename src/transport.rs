@@ -114,6 +114,10 @@ pub struct TransportConfig {
     /// When true, this transport is in client mode (connected to a daemon).
     /// Client mode transports don't run announce retransmission - the daemon handles that.
     client_mode: bool,
+    /// When true, proofs contain only the signature (implicit).
+    /// When false, proofs contain hash + signature (explicit).
+    /// Default: true, matching Python's default behavior.
+    use_implicit_proof: bool,
 }
 
 #[derive(Clone)]
@@ -182,6 +186,7 @@ impl TransportConfig {
             broadcast: enable_transport,
             retransmit: enable_transport,
             client_mode: false,
+            use_implicit_proof: true,
         }
     }
 
@@ -196,6 +201,7 @@ impl TransportConfig {
             broadcast: false,
             retransmit: false,
             client_mode: true,
+            use_implicit_proof: true,
         }
     }
 
@@ -210,6 +216,10 @@ impl TransportConfig {
     pub fn set_broadcast(&mut self, broadcast: bool) {
         self.broadcast = broadcast;
     }
+
+    pub fn set_use_implicit_proof(&mut self, use_implicit_proof: bool) {
+        self.use_implicit_proof = use_implicit_proof;
+    }
 }
 
 impl Default for TransportConfig {
@@ -220,6 +230,7 @@ impl Default for TransportConfig {
             broadcast: false,
             retransmit: false,
             client_mode: false,
+            use_implicit_proof: true,
         }
     }
 }
@@ -1791,7 +1802,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
                 let mut dest = destination.lock().await;
                 let received = dest.receive(packet);
                 let proof_packet = if received && dest.should_prove(packet) {
-                    Some(dest.proof_packet(packet))
+                    Some(dest.proof_packet(packet, handler.config.use_implicit_proof))
                 } else {
                     None
                 };

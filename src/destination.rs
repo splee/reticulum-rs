@@ -940,29 +940,12 @@ impl Destination<PrivateIdentity, Input, Single> {
 
     /// Create a proof packet for a received data packet.
     ///
-    /// Proof format: packet_hash + signature (explicit proof).
-    /// Destination is the truncated hash of the proved packet.
-    pub fn proof_packet(&self, packet: &Packet) -> Packet {
-        let hash = packet.hash();
-        let signature = self.identity.sign(hash.as_slice());
-
-        let mut packet_data = PacketDataBuffer::new();
-        packet_data.safe_write(hash.as_slice());
-        packet_data.safe_write(&signature.to_bytes());
-
-        Packet {
-            header: Header {
-                destination_type: DestinationType::Single,
-                packet_type: PacketType::Proof,
-                ..Default::default()
-            },
-            ifac: None,
-            destination: AddressHash::new_from_hash(&hash),
-            transport: None,
-            context: PacketContext::None,
-            data: packet_data,
-            ratchet_id: None,
-        }
+    /// Delegates to `PrivateIdentity::prove()` which respects the
+    /// `use_implicit_proof` setting. Implicit proofs contain only the
+    /// signature (64 bytes), while explicit proofs contain hash + signature
+    /// (96 bytes).
+    pub fn proof_packet(&self, packet: &Packet, use_implicit_proof: bool) -> Packet {
+        self.identity.prove(packet, use_implicit_proof)
     }
 }
 
@@ -1556,5 +1539,39 @@ mod tests {
         assert!(received, "receive should succeed via identity key");
         assert!(destination.latest_ratchet_id.is_none(),
             "latest_ratchet_id should be None when identity key was used");
+    }
+
+    #[test]
+    fn test_destination_proof_packet_delegates_to_identity() {
+        use crate::packet::{Header, PacketDataBuffer, PacketType, DestinationType};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "prooftest");
+        let destination = SingleInputDestination::new(priv_identity, name);
+
+        // Build a test data packet
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(b"proof test payload");
+        let packet = crate::packet::Packet {
+            header: Header {
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination: destination.desc.address_hash,
+            data,
+            ..Default::default()
+        };
+
+        // Implicit proof: signature only (64 bytes)
+        let implicit = destination.proof_packet(&packet, true);
+        assert_eq!(implicit.data.as_slice().len(), ed25519_dalek::SIGNATURE_LENGTH);
+
+        // Explicit proof: hash (32 bytes) + signature (64 bytes) = 96 bytes
+        let explicit = destination.proof_packet(&packet, false);
+        assert_eq!(
+            explicit.data.as_slice().len(),
+            crate::hash::HASH_SIZE + ed25519_dalek::SIGNATURE_LENGTH
+        );
     }
 }

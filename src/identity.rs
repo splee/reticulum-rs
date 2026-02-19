@@ -14,6 +14,7 @@ use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
     hash::{AddressHash, Hash},
+    packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType},
 };
 
 pub const PUBLIC_KEY_LENGTH: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
@@ -494,6 +495,42 @@ impl PrivateIdentity {
     pub fn derive_key(&self, public_key: &PublicKey, salt: Option<&[u8]>) -> DerivedKey {
         DerivedKey::new_from_private_key(&self.private_key, public_key, salt)
     }
+
+    /// Create a proof packet for a received data packet.
+    ///
+    /// Matches Python's `Identity.prove(packet, destination)`.
+    /// Signs the packet hash and creates a proof with either implicit
+    /// (signature only) or explicit (hash + signature) format.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - The packet to prove receipt of
+    /// * `use_implicit_proof` - If true, proof contains only the signature (64 bytes).
+    ///   If false, proof contains hash + signature (96 bytes).
+    pub fn prove(&self, packet: &Packet, use_implicit_proof: bool) -> Packet {
+        let hash = packet.hash();
+        let signature = self.sign(hash.as_slice());
+
+        let mut packet_data = PacketDataBuffer::new();
+        if !use_implicit_proof {
+            packet_data.safe_write(hash.as_slice());
+        }
+        packet_data.safe_write(&signature.to_bytes());
+
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new_from_hash(&hash),
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+            ratchet_id: None,
+        }
+    }
 }
 
 impl HashIdentity for PrivateIdentity {
@@ -792,5 +829,89 @@ mod tests {
 
         // Cleanup
         fs::remove_file(&test_file).ok();
+    }
+
+    /// Helper to build a minimal test Packet for proof tests.
+    fn make_test_packet() -> Packet {
+        use crate::hash::AddressHash;
+        use crate::packet::{DestinationType, Header, PacketDataBuffer, PacketType};
+
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(b"test payload");
+
+        Packet {
+            header: Header {
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination: AddressHash::new([0xAB; 16]),
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_prove_implicit_proof() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let packet = make_test_packet();
+
+        let proof = identity.prove(&packet, true);
+
+        // Implicit proof: signature only (64 bytes)
+        assert_eq!(proof.data.as_slice().len(), ed25519_dalek::SIGNATURE_LENGTH);
+        assert_eq!(proof.header.packet_type, PacketType::Proof);
+        assert_eq!(proof.header.destination_type, DestinationType::Single);
+    }
+
+    #[test]
+    fn test_prove_explicit_proof() {
+        use crate::hash::HASH_SIZE;
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let packet = make_test_packet();
+
+        let proof = identity.prove(&packet, false);
+
+        // Explicit proof: hash (32 bytes) + signature (64 bytes) = 96 bytes
+        assert_eq!(
+            proof.data.as_slice().len(),
+            HASH_SIZE + ed25519_dalek::SIGNATURE_LENGTH
+        );
+
+        // First 32 bytes should match the packet hash
+        let hash = packet.hash();
+        assert_eq!(&proof.data.as_slice()[..HASH_SIZE], hash.as_slice());
+    }
+
+    #[test]
+    fn test_prove_destination_is_truncated_hash() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let packet = make_test_packet();
+
+        let proof = identity.prove(&packet, true);
+
+        // Proof packet's destination should be the truncated hash of the proved packet
+        let expected = AddressHash::new_from_hash(&packet.hash());
+        assert_eq!(proof.destination.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_prove_signature_validates() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let packet = make_test_packet();
+        let hash = packet.hash();
+
+        // Test implicit proof signature
+        let implicit_proof = identity.prove(&packet, true);
+        let sig_bytes = implicit_proof.data.as_slice();
+        let sig = ed25519_dalek::Signature::from_slice(sig_bytes).expect("valid signature bytes");
+        identity.verify(hash.as_slice(), &sig).expect("implicit proof signature should validate");
+
+        // Test explicit proof signature
+        let explicit_proof = identity.prove(&packet, false);
+        let sig_bytes = &explicit_proof.data.as_slice()[32..]; // skip hash
+        let sig = ed25519_dalek::Signature::from_slice(sig_bytes).expect("valid signature bytes");
+        identity.verify(hash.as_slice(), &sig).expect("explicit proof signature should validate");
     }
 }

@@ -517,11 +517,9 @@ impl Reticulum {
         skip_interfaces: bool,
         cancel: CancellationToken,
     ) -> Result<Arc<Transport>, ReticulumError> {
-        let transport = Transport::new(TransportConfig::new(
-            "reticulum",
-            identity,
-            config.enable_transport,
-        ));
+        let mut tc = TransportConfig::new("reticulum", identity, config.enable_transport);
+        tc.set_use_implicit_proof(config.use_implicit_proof);
+        let transport = Transport::new(tc);
         let transport_arc = Arc::new(transport);
 
         // Start LocalServerInterface for IPC
@@ -565,11 +563,9 @@ impl Reticulum {
         skip_interfaces: bool,
         _cancel: CancellationToken,
     ) -> Result<Transport, ReticulumError> {
-        let transport = Transport::new(TransportConfig::new(
-            "reticulum",
-            identity,
-            config.enable_transport,
-        ));
+        let mut tc = TransportConfig::new("reticulum", identity, config.enable_transport);
+        tc.set_use_implicit_proof(config.use_implicit_proof);
+        let transport = Transport::new(tc);
 
         if !skip_interfaces {
             let transport_arc = Arc::new(transport);
