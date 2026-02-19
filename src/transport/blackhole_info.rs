@@ -77,7 +77,8 @@ impl BlackholeInfoService {
     pub fn new(identity: &PrivateIdentity) -> Self {
         let destination = SingleInputDestination::new(
             identity.clone(),
-            DestinationName::new("rnstransport", "info.blackhole"),
+            DestinationName::new("rnstransport", "info.blackhole")
+                .expect("valid destination name"),
         );
 
         let mut router = RequestRouter::new();

@@ -1913,7 +1913,7 @@ mod tests {
             DestinationDesc {
                 address_hash: identity.address_hash,
                 identity,
-                name: DestinationName::new("test", "link"),
+                name: DestinationName::new("test", "link").unwrap(),
             }
         }
 

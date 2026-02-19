@@ -435,7 +435,13 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
         );
 
         // Create destination to get its hash
-        let dest_name = DestinationName::new(APP_NAME, ASPECT);
+        let dest_name = match DestinationName::new(APP_NAME, ASPECT) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Invalid destination name: {}", e);
+                return 1;
+            }
+        };
         // Create a minimal transport just to get the destination hash
         let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
         let destination = transport.add_destination(identity.clone(), dest_name).await;
@@ -477,7 +483,13 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Create destination
-    let dest_name = DestinationName::new(APP_NAME, ASPECT);
+    let dest_name = match DestinationName::new(APP_NAME, ASPECT) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Invalid destination name: {}", e);
+            return 1;
+        }
+    };
     let destination = transport.add_destination(identity.clone(), dest_name).await;
 
     let dest_hash = destination.lock().await.desc.address_hash;

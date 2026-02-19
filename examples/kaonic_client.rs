@@ -43,7 +43,7 @@ async fn main() {
         .await
         .add_destination(
             identity,
-            DestinationName::new("example_utilities", "linkexample"),
+            DestinationName::new("example_utilities", "linkexample").unwrap(),
         )
         .await;
 

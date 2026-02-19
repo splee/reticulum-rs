@@ -27,7 +27,7 @@ async fn main() {
     let in_destination = transport
         .add_destination(
             identity,
-            DestinationName::new("example_utilities", "linkexample"),
+            DestinationName::new("example_utilities", "linkexample").unwrap(),
         )
         .await;
 

@@ -596,7 +596,7 @@ fn test_rust_ratchet_announce_to_python() {
 
     // Create Rust identity and destination
     let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-    let name = DestinationName::new("test_app", "ratchettest");
+    let name = DestinationName::new("test_app", "ratchettest").unwrap();
     let destination = SingleInputDestination::new(priv_identity, name);
 
     // Generate a ratchet key

@@ -383,7 +383,8 @@ impl Transport {
 
         // Pre-compute the discovery aspect name hash for filtering
         // Only announces for "rnstransport.discovery.interface" should be processed
-        let discovery_name = DestinationName::new("rnstransport", "discovery.interface");
+        let discovery_name = DestinationName::new("rnstransport", "discovery.interface")
+            .expect("valid destination name");
 
         // Subscribe to announces
         let mut announce_rx = self.handler.lock().await.announce_manager.subscribe();
@@ -1693,6 +1694,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
     // Check for path request control packets (PLAIN destination type)
     if packet.header.destination_type == DestinationType::Plain {
         let path_request_hash = *PlainDestination::new("rnstransport", "path.request")
+            .expect("valid destination name")
             .address_hash();
 
         if packet.destination == path_request_hash {
@@ -2728,7 +2730,7 @@ mod tests {
         // Create an identity and build a valid announce packet
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let destination =
-            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app"));
+            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app").unwrap());
         let announce = destination
             .announce(OsRng, None)
             .expect("valid announce packet");
@@ -2768,7 +2770,7 @@ mod tests {
 
         // Create a valid announce from identity A
         let dest_a =
-            SingleInputDestination::new(identity_a.clone(), DestinationName::new("test", "app"));
+            SingleInputDestination::new(identity_a.clone(), DestinationName::new("test", "app").unwrap());
         let announce_a = dest_a
             .announce(OsRng, None)
             .expect("valid announce packet");
@@ -2830,7 +2832,7 @@ mod tests {
 
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let destination =
-            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app"));
+            SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app").unwrap());
         let announce = destination
             .announce(OsRng, None)
             .expect("valid announce packet");

@@ -116,7 +116,8 @@ impl RemoteManagementService {
     pub fn new(identity: &PrivateIdentity, config: RemoteManagementConfig) -> Self {
         let destination = SingleInputDestination::new(
             identity.clone(),
-            DestinationName::new("rnstransport", "remote.management"),
+            DestinationName::new("rnstransport", "remote.management")
+                .expect("valid destination name"),
         );
 
         let mut router = RequestRouter::new();

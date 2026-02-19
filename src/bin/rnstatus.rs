@@ -662,7 +662,13 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
     };
 
     // Create destination descriptor for link establishment
-    let dest_name = DestinationName::new("rnstransport", "remote.management");
+    let dest_name = match DestinationName::new("rnstransport", "remote.management") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Invalid destination name: {}", e);
+            return 1;
+        }
+    };
     let dest_desc = SingleOutputDestination::new(remote_identity, dest_name);
 
     // Establish link
@@ -891,7 +897,8 @@ fn load_or_create_identity(config: &ReticulumConfig) -> PrivateIdentity {
 /// Compute the management destination hash from a transport identity hash.
 fn compute_management_destination_hash(transport_identity_hash: &[u8; 16]) -> AddressHash {
     // Name hash for "rnstransport.remote.management"
-    let name = DestinationName::new("rnstransport", "remote.management");
+    let name = DestinationName::new("rnstransport", "remote.management")
+        .expect("valid destination name");
     let name_hash = name.as_name_hash_slice();
 
     // Destination hash = truncated(sha256(name_hash || identity_hash))

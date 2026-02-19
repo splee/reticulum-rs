@@ -21,6 +21,7 @@ use sha2::{Sha256, Digest as Sha2Digest};
 use tokio::sync::Mutex;
 
 use crate::config::ReticulumConfig;
+use crate::error::RnsError;
 use crate::destination::{DestinationName, SingleOutputDestination};
 use crate::destination::link::{Link, LinkEvent, LinkStatus};
 use crate::destination::request::RequestRouter;
@@ -161,7 +162,7 @@ pub fn load_identity(path: &PathBuf) -> Result<PrivateIdentity, RemoteError> {
 /// `truncated(sha256(name_hash || identity_hash))`
 ///
 /// This matches Python's `Destination.hash_from_name_and_identity()`.
-pub fn compute_destination_hash(aspect: &str, transport_identity_hash: &[u8; 16]) -> AddressHash {
+pub fn compute_destination_hash(aspect: &str, transport_identity_hash: &[u8; 16]) -> Result<AddressHash, RnsError> {
     // Parse aspect into app_name and aspects
     // e.g., "rnstransport.remote.management" -> ("rnstransport", "remote.management")
     let parts: Vec<&str> = aspect.splitn(2, '.').collect();
@@ -171,7 +172,7 @@ pub fn compute_destination_hash(aspect: &str, transport_identity_hash: &[u8; 16]
         (aspect, "")
     };
 
-    let name = DestinationName::new(app_name, aspects);
+    let name = DestinationName::new(app_name, aspects)?;
     let name_hash = name.as_name_hash_slice();
 
     // Destination hash = truncated(sha256(name_hash || identity_hash))
@@ -180,7 +181,7 @@ pub fn compute_destination_hash(aspect: &str, transport_identity_hash: &[u8; 16]
     hasher.update(transport_identity_hash);
     let result = hasher.finalize();
 
-    AddressHash::new_from_hash(&Hash::new(result.into()))
+    Ok(AddressHash::new_from_hash(&Hash::new(result.into())))
 }
 
 /// Wait for a path to be established.
@@ -350,7 +351,8 @@ impl RemoteClient {
         aspect: &str,
         transport_identity_hash: &[u8; 16],
     ) -> Result<Arc<Mutex<Link>>, RemoteError> {
-        let dest_hash = compute_destination_hash(aspect, transport_identity_hash);
+        let dest_hash = compute_destination_hash(aspect, transport_identity_hash)
+            .map_err(|e| RemoteError::Other(e.to_string()))?;
 
         // Request path to the management destination
         self.transport.request_path(&dest_hash, None).await;
@@ -374,7 +376,8 @@ impl RemoteClient {
             (aspect, "")
         };
 
-        let dest_name = DestinationName::new(app_name, aspects);
+        let dest_name = DestinationName::new(app_name, aspects)
+            .map_err(|e| RemoteError::Other(e.to_string()))?;
         let dest_desc = SingleOutputDestination::new(remote_identity, dest_name);
 
         // Establish link

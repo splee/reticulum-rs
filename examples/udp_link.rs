@@ -29,7 +29,7 @@ async fn main() {
     log::info!(">>> UDP LINK APP <<<");
 
     let id = PrivateIdentity::new_from_rand(OsRng);
-    let destination = SingleInputDestination::new(id.clone(), DestinationName::new("example", "app"));
+    let destination = SingleInputDestination::new(id.clone(), DestinationName::new("example", "app").unwrap());
     let transport = Transport::new(TransportConfig::new("server", &id, true));
 
     let _ = transport.iface_manager().lock().await.spawn(

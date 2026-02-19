@@ -269,7 +269,14 @@ impl DestinationName {
     /// The resulting hash is truncated to `NAME_HASH_LENGTH` bytes to match
     /// the wire protocol format. This ensures that locally-created names
     /// can be compared directly with names received from announce packets.
-    pub fn new(app_name: &str, aspects: &str) -> Self {
+    ///
+    /// Returns an error if `app_name` contains a dot, since dots are used
+    /// as the separator between name components (matching Python's validation).
+    pub fn new(app_name: &str, aspects: &str) -> Result<Self, RnsError> {
+        if app_name.contains('.') {
+            return Err(RnsError::InvalidArgument);
+        }
+
         let full_hash: [u8; 32] = Hash::generator()
             .chain_update(app_name.as_bytes())
             .chain_update(".".as_bytes())
@@ -281,9 +288,9 @@ impl DestinationName {
         let mut truncated_hash = [0u8; 32];
         truncated_hash[..NAME_HASH_LENGTH].copy_from_slice(&full_hash[..NAME_HASH_LENGTH]);
 
-        Self {
+        Ok(Self {
             hash: Hash::new(truncated_hash),
-        }
+        })
     }
 
     /// Create a destination name from a hash slice (typically from an announce packet).
@@ -1072,7 +1079,7 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
 
         let single_in_destination =
-            SingleInputDestination::new(identity, DestinationName::new("test", "in"));
+            SingleInputDestination::new(identity, DestinationName::new("test", "in").unwrap());
 
         let announce_packet = single_in_destination
             .announce(OsRng, None)
@@ -1083,7 +1090,7 @@ mod tests {
 
     #[test]
     fn create_path_request_hash() {
-        let name = DestinationName::new("rnstransport", "path.request");
+        let name = DestinationName::new("rnstransport", "path.request").unwrap();
 
         println!("PathRequest Name Hash {}", name.hash);
         println!(
@@ -1112,7 +1119,7 @@ mod tests {
 
         let destination = SingleInputDestination::new(
             priv_identity,
-            DestinationName::new("example_utilities", "announcesample.fruits"),
+            DestinationName::new("example_utilities", "announcesample.fruits").unwrap(),
         );
 
         println!("destination name hash {}", destination.desc.name.hash);
@@ -1136,7 +1143,7 @@ mod tests {
 
         let destination = SingleInputDestination::new(
             priv_identity,
-            DestinationName::new("example_utilities", "announcesample.fruits"),
+            DestinationName::new("example_utilities", "announcesample.fruits").unwrap(),
         );
 
         let announce = destination
@@ -1151,7 +1158,7 @@ mod tests {
         use super::NAME_HASH_LENGTH;
 
         // Create a name hash locally
-        let local_name = DestinationName::new("rrc.v2", "hub");
+        let local_name = DestinationName::new("rrc_v2", "hub").unwrap();
         let local_hash = local_name.hash.as_slice();
 
         // Verify only the first NAME_HASH_LENGTH bytes are non-zero
@@ -1178,7 +1185,7 @@ mod tests {
         // This test verifies the full round-trip: create destination, announce,
         // validate announce, and compare the resulting name hash with original
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let original_name = DestinationName::new("test.app", "service");
+        let original_name = DestinationName::new("testapp", "service").unwrap();
 
         let destination = SingleInputDestination::new(priv_identity, original_name);
 
@@ -1199,7 +1206,7 @@ mod tests {
     fn test_validate_full_without_ratchet() {
         // Test that validate_full works for announces without ratchet
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let original_name = DestinationName::new("test.app", "service");
+        let original_name = DestinationName::new("testapp", "service").unwrap();
 
         let destination = SingleInputDestination::new(priv_identity, original_name);
 
@@ -1230,7 +1237,7 @@ mod tests {
         use crate::packet::{Packet, PacketDataBuffer, Header, HeaderType, IfacFlag, TransportType, DestinationType, PacketType, PacketContext};
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "service");
+        let name = DestinationName::new("testapp", "service").unwrap();
         let address_hash = crate::destination::create_address_hash(priv_identity.as_identity(), &name);
 
         let pub_key = priv_identity.as_identity().public_key_bytes();
@@ -1295,7 +1302,7 @@ mod tests {
 
         // Create identity and destination
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "ratchetservice");
+        let name = DestinationName::new("testapp", "ratchetservice").unwrap();
         let address_hash = crate::destination::create_address_hash(priv_identity.as_identity(), &name);
 
         // Generate a ratchet key
@@ -1379,7 +1386,7 @@ mod tests {
 
         // Create identity and destination
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "ratchetservice");
+        let name = DestinationName::new("testapp", "ratchetservice").unwrap();
         let destination = SingleInputDestination::new(priv_identity, name);
 
         // Generate a ratchet key
@@ -1425,7 +1432,7 @@ mod tests {
         use crate::identity::{generate_ratchet, ratchet_public_bytes, get_ratchet_id};
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "ratchetcrypto");
+        let name = DestinationName::new("testapp", "ratchetcrypto").unwrap();
         let mut destination = SingleInputDestination::new(priv_identity, name);
 
         // Generate ratchet key
@@ -1457,7 +1464,7 @@ mod tests {
         use crate::identity::{generate_ratchet, ratchet_public_bytes};
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "enforcetest");
+        let name = DestinationName::new("testapp", "enforcetest").unwrap();
         let mut destination = SingleInputDestination::new(priv_identity, name);
 
         // Generate ratchet and encrypt with it
@@ -1484,7 +1491,7 @@ mod tests {
         use crate::identity::generate_ratchet;
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "fallbacktest");
+        let name = DestinationName::new("testapp", "fallbacktest").unwrap();
         let mut destination = SingleInputDestination::new(priv_identity, name);
 
         // Encrypt with identity key (no ratchet)
@@ -1511,7 +1518,7 @@ mod tests {
         use crate::packet::{Header, PacketDataBuffer, PacketType, DestinationType};
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "receivetest");
+        let name = DestinationName::new("testapp", "receivetest").unwrap();
         let mut destination = SingleInputDestination::new(priv_identity, name);
 
         // Encrypt a data packet with the identity key (no ratchet)
@@ -1546,7 +1553,7 @@ mod tests {
         use crate::packet::{Header, PacketDataBuffer, PacketType, DestinationType};
 
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("test.app", "prooftest");
+        let name = DestinationName::new("testapp", "prooftest").unwrap();
         let destination = SingleInputDestination::new(priv_identity, name);
 
         // Build a test data packet
@@ -1573,5 +1580,11 @@ mod tests {
             explicit.data.as_slice().len(),
             crate::hash::HASH_SIZE + ed25519_dalek::SIGNATURE_LENGTH
         );
+    }
+
+    #[test]
+    fn test_dot_in_app_name_rejected() {
+        assert!(DestinationName::new("bad.app", "aspect").is_err());
+        assert!(DestinationName::new("good_app", "aspect.sub").is_ok());
     }
 }

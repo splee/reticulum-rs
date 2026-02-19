@@ -42,7 +42,7 @@ async fn main() {
     let transport_id = identity.address_hash().clone();
 
     let last_hop_id = PrivateIdentity::new_from_name("last_hop");
-    let last_hop_name = DestinationName::new("last_hop", "app");
+    let last_hop_name = DestinationName::new("last_hop", "app").unwrap();
 
     let last_hop_destination = SingleInputDestination::new(
         last_hop_id.clone(),
@@ -78,7 +78,7 @@ async fn main() {
             ).await;
         } else {
             let id = PrivateIdentity::new_from_rand(OsRng);
-            let name = DestinationName::new(&format!("hop-{}", our_hop), "app");
+            let name = DestinationName::new(&format!("hop-{}", our_hop), "app").unwrap();
             destination = transport.add_destination(id, name).await;
         }
 

@@ -85,7 +85,13 @@ pub async fn run_listen_mode(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Create destination
-    let dest_name = DestinationName::new(APP_NAME, ASPECT_RECEIVE);
+    let dest_name = match DestinationName::new(APP_NAME, ASPECT_RECEIVE) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Invalid destination name: {}", e);
+            return 1;
+        }
+    };
     let destination = transport.add_destination(identity.clone(), dest_name).await;
 
     let dest_hash = destination.lock().await.desc.address_hash;

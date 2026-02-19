@@ -48,15 +48,15 @@ async fn calculate_hop_distance() {
     let id_c = PrivateIdentity::new_from_name("c");
 
     let dest_a = transport_a
-        .add_destination(id_a, DestinationName::new("test", "hop"))
+        .add_destination(id_a, DestinationName::new("test", "hop").unwrap())
         .await;
 
     let dest_b = transport_b
-        .add_destination(id_b, DestinationName::new("test", "hop"))
+        .add_destination(id_b, DestinationName::new("test", "hop").unwrap())
         .await;
 
     let dest_c = transport_c
-        .add_destination(id_c, DestinationName::new("test", "hop"))
+        .add_destination(id_c, DestinationName::new("test", "hop").unwrap())
         .await;
 
     time::sleep(Duration::from_secs(2)).await;

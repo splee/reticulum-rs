@@ -133,7 +133,8 @@ fn main() {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Create destination
-        let dest_name = DestinationName::new(&args.app_name, &args.aspect);
+        let dest_name = DestinationName::new(&args.app_name, &args.aspect)
+            .expect("valid destination name");
         let destination = transport.add_destination(identity.clone(), dest_name).await;
 
         let dest_hash = destination.lock().await.desc.address_hash;

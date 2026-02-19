@@ -17,7 +17,7 @@ fn main() {
     let app_name = &args[1];
     let aspects = &args[2];
 
-    let dest = PlainDestination::new(app_name, aspects);
+    let dest = PlainDestination::new(app_name, aspects).expect("valid destination name");
     let hash_hex = hex::encode(dest.address_hash().as_slice());
 
     println!("PLAIN_HASH={}", hash_hex);

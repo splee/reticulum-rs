@@ -573,7 +573,13 @@ fn handle_destination_hash(identity: &Identity, aspects: &str) -> i32 {
     let app_name = parts[0];
     let aspect_parts = parts[1..].join(".");
 
-    let name = DestinationName::new(app_name, &aspect_parts);
+    let name = match DestinationName::new(app_name, &aspect_parts) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Invalid destination name: {}", e);
+            return EXIT_GENERAL_ERROR;
+        }
+    };
     let dest = SingleOutputDestination::new(*identity, name);
 
     println!(
@@ -907,7 +913,13 @@ async fn handle_announce(args: &Args, identity: &PrivateIdentity, aspects: &str)
         }
     };
 
-    let name = DestinationName::new(app_name, &aspect_parts);
+    let name = match DestinationName::new(app_name, &aspect_parts) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Invalid destination name: {}", e);
+            return EXIT_GENERAL_ERROR;
+        }
+    };
     let destination = SingleInputDestination::new(identity.clone(), name);
 
     log::info!(
@@ -1425,10 +1437,10 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
 
         // Same identity + aspects should produce same hash
-        let name1 = DestinationName::new("myapp", "test.aspect");
+        let name1 = DestinationName::new("myapp", "test.aspect").unwrap();
         let dest1 = SingleOutputDestination::new(*identity.as_identity(), name1);
 
-        let name2 = DestinationName::new("myapp", "test.aspect");
+        let name2 = DestinationName::new("myapp", "test.aspect").unwrap();
         let dest2 = SingleOutputDestination::new(*identity.as_identity(), name2);
 
         assert_eq!(
@@ -1441,10 +1453,10 @@ mod tests {
     fn test_destination_hash_different_aspects() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
 
-        let name1 = DestinationName::new("myapp", "aspect1");
+        let name1 = DestinationName::new("myapp", "aspect1").unwrap();
         let dest1 = SingleOutputDestination::new(*identity.as_identity(), name1);
 
-        let name2 = DestinationName::new("myapp", "aspect2");
+        let name2 = DestinationName::new("myapp", "aspect2").unwrap();
         let dest2 = SingleOutputDestination::new(*identity.as_identity(), name2);
 
         // Different aspects should produce different hashes
@@ -1459,7 +1471,7 @@ mod tests {
         let identity1 = PrivateIdentity::new_from_rand(OsRng);
         let identity2 = PrivateIdentity::new_from_rand(OsRng);
 
-        let name = DestinationName::new("myapp", "test");
+        let name = DestinationName::new("myapp", "test").unwrap();
 
         let dest1 = SingleOutputDestination::new(*identity1.as_identity(), name);
         let dest2 = SingleOutputDestination::new(*identity2.as_identity(), name);

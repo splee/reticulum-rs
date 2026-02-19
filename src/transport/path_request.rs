@@ -238,6 +238,7 @@ impl PathRequestManager {
     /// nodes listen on for incoming path requests.
     pub fn path_request_destination_hash() -> AddressHash {
         *PlainDestination::new("rnstransport", "path.request")
+            .expect("valid destination name")
             .address_hash()
     }
 

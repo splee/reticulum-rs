@@ -10,6 +10,7 @@
 
 use sha2::Digest;
 
+use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 
 /// A PLAIN destination that does not use encryption
@@ -30,16 +31,23 @@ impl PlainDestination {
     ///
     /// PLAIN destinations do not require an identity - their address hash
     /// is computed solely from the app name and aspects.
-    pub fn new(app_name: &str, aspects: &str) -> Self {
+    ///
+    /// Returns an error if `app_name` contains a dot, since dots are used
+    /// as the separator between name components (matching Python's validation).
+    pub fn new(app_name: &str, aspects: &str) -> Result<Self, RnsError> {
+        if app_name.contains('.') {
+            return Err(RnsError::InvalidArgument);
+        }
+
         let full_name = format!("{}.{}", app_name, aspects);
         let address_hash = Self::compute_address_hash(app_name, aspects);
 
-        Self {
+        Ok(Self {
             address_hash,
             app_name: app_name.to_string(),
             aspects: aspects.to_string(),
             full_name,
-        }
+        })
     }
 
     /// Compute the address hash for a PLAIN destination
@@ -105,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_plain_destination_creation() {
-        let dest = PlainDestination::new("test_app", "plain.test");
+        let dest = PlainDestination::new("test_app", "plain.test").unwrap();
         assert!(!dest.address_hash().as_slice().is_empty());
         assert_eq!(dest.app_name(), "test_app");
         assert_eq!(dest.aspects(), "plain.test");
@@ -114,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_plain_encrypt_decrypt() {
-        let dest = PlainDestination::new("test_app", "plain.test");
+        let dest = PlainDestination::new("test_app", "plain.test").unwrap();
         let data = b"Hello, PLAIN world!";
 
         let encrypted = dest.encrypt(data);
@@ -127,16 +135,16 @@ mod tests {
 
     #[test]
     fn test_same_name_produces_same_address() {
-        let dest1 = PlainDestination::new("app", "aspect");
-        let dest2 = PlainDestination::new("app", "aspect");
+        let dest1 = PlainDestination::new("app", "aspect").unwrap();
+        let dest2 = PlainDestination::new("app", "aspect").unwrap();
 
         assert_eq!(dest1.address_hash().as_slice(), dest2.address_hash().as_slice());
     }
 
     #[test]
     fn test_different_name_produces_different_address() {
-        let dest1 = PlainDestination::new("app1", "aspect");
-        let dest2 = PlainDestination::new("app2", "aspect");
+        let dest1 = PlainDestination::new("app1", "aspect").unwrap();
+        let dest2 = PlainDestination::new("app2", "aspect").unwrap();
 
         assert_ne!(dest1.address_hash().as_slice(), dest2.address_hash().as_slice());
     }
