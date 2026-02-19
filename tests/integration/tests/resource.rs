@@ -27,7 +27,7 @@ fn test_python_sends_resource_to_rust() {
                 "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "resourceserver",
-                "-i", "5",  // announce interval
+                "-i", "3",  // announce interval
                 "-n", "1",  // exit after 1 resource
                 "-t", "50", // timeout
             ],
@@ -129,7 +129,7 @@ fn test_python_sends_larger_resource_to_rust() {
                 "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "resourceserver2",
-                "-i", "5",  // announce interval
+                "-i", "3",  // announce interval
                 "-n", "1",  // exit after 1 resource
                 "-t", "50", // timeout
                 "-v",       // verbose
@@ -499,7 +499,7 @@ fn test_python_sends_1kb_resource_to_rust() {
                 "--tcp-client", &format!("127.0.0.1:{}", hub.port()),
                 "-a", "test_app",
                 "-A", "resourceserver_1kb",
-                "-i", "5",
+                "-i", "3",
                 "-n", "1",
                 "-t", "90",
                 "-v",

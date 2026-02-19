@@ -1,0 +1,11 @@
+# nextest configuration
+# Integration tests must run serially because port allocation uses a
+# process-local atomic counter (starting at 20000). Since nextest spawns
+# each test as a separate process, parallel tests collide on the same ports.
+
+[test-groups]
+serial-integration = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(integration)'
+test-group = 'serial-integration'

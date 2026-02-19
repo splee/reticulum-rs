@@ -19,6 +19,10 @@ link_instance = None
 resource_done = False
 resource_success = False
 
+def announce_handler(destination_hash, announced_identity, app_data):
+    """Callback when an announce is received."""
+    print(f"ANNOUNCE_RECEIVED={destination_hash.hex()}", flush=True)
+
 def link_established_callback(link):
     """Called when link is established."""
     global link_established, link_instance
@@ -108,6 +112,9 @@ share_instance = No
     # Wait for interfaces to initialize
     time.sleep(2)
 
+    # Register announce handler so the RNS stack fully processes incoming announces
+    RNS.Transport.register_announce_handler(announce_handler)
+
     # Parse destination hash
     try:
         dest_hash = bytes.fromhex(args.destination)
@@ -117,17 +124,23 @@ share_instance = No
 
     print(f"TARGET_DESTINATION={args.destination}", flush=True)
 
-    # Request path to destination
+    # Discover path to destination — check cache first, then request.
+    # Re-request periodically in case the initial request was missed.
     print("STATUS=REQUESTING_PATH", flush=True)
-    RNS.Transport.request_path(dest_hash)
-
-    # Wait for path
-    start_time = time.time()
-    while not RNS.Transport.has_path(dest_hash):
-        if time.time() - start_time > args.timeout / 2:
-            print("STATUS=PATH_TIMEOUT", flush=True)
-            sys.exit(1)
-        time.sleep(0.1)
+    if not RNS.Transport.has_path(dest_hash):
+        RNS.Transport.request_path(dest_hash)
+        start_time = time.time()
+        last_request = start_time
+        while not RNS.Transport.has_path(dest_hash):
+            if time.time() - start_time > args.timeout / 2:
+                print("STATUS=PATH_TIMEOUT", flush=True)
+                sys.exit(1)
+            # Re-request path every 5 seconds in case the first request was lost
+            if time.time() - last_request > 5:
+                RNS.log("Re-requesting path", RNS.LOG_DEBUG)
+                RNS.Transport.request_path(dest_hash)
+                last_request = time.time()
+            time.sleep(0.1)
 
     print("STATUS=PATH_FOUND", flush=True)
 
