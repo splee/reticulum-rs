@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::hash::AddressHash;
-use crate::identity::{Identity, RATCHET_ID_LENGTH};
+use crate::identity::{Identity, RATCHET_ID_LENGTH, RATCHET_KEY_SIZE};
 
 /// Length of truncated hash in bytes (128 bits / 8)
 pub const TRUNCATED_HASH_LENGTH: usize = 16;
@@ -122,11 +122,24 @@ impl KnownDestinations {
                 io::Error::other("Failed to acquire read lock")
             })?;
 
-            // Convert to Vec<u8> keys for serialization
-            let serializable: HashMap<Vec<u8>, &KnownDestination> = cache
+            // Start with cloned cache entries
+            let mut merged: HashMap<Vec<u8>, KnownDestination> = cache
                 .iter()
-                .map(|(k, v)| (k.to_vec(), v))
+                .map(|(k, v)| (k.to_vec(), v.clone()))
                 .collect();
+
+            // Merge entries from disk that aren't in memory.
+            // This handles multi-process writes — Python: Identity.py:184-198
+            if self.storage_path.exists() {
+                if let Ok(file) = File::open(&self.storage_path) {
+                    let reader = BufReader::new(file);
+                    if let Ok(disk_entries) = rmp_serde::from_read::<_, HashMap<Vec<u8>, KnownDestination>>(reader) {
+                        for (k, v) in disk_entries {
+                            merged.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
 
             // Ensure directory exists
             if let Some(parent) = self.storage_path.parent() {
@@ -138,7 +151,7 @@ impl KnownDestinations {
             let file = File::create(&temp_path)?;
             let mut writer = BufWriter::new(file);
 
-            rmp_serde::encode::write(&mut writer, &serializable).map_err(|e| {
+            rmp_serde::encode::write(&mut writer, &merged).map_err(|e| {
                 io::Error::other(format!("MessagePack error: {}", e))
             })?;
 
@@ -331,6 +344,12 @@ impl RatchetManager {
                     if let Ok(file) = File::open(&path) {
                         let reader = BufReader::new(file);
                         if let Ok(stored_ratchet) = rmp_serde::from_read::<_, StoredRatchet>(reader) {
+                            // Validate ratchet size (corrupted file protection)
+                            if stored_ratchet.ratchet.len() != RATCHET_KEY_SIZE {
+                                let _ = fs::remove_file(&path);
+                                continue;
+                            }
+
                             // Check if expired
                             if now <= stored_ratchet.received + RATCHET_EXPIRY as f64 {
                                 // Parse the destination hash from filename
@@ -356,6 +375,14 @@ impl RatchetManager {
 
     /// Remember a ratchet for a destination
     pub fn remember(&self, destination_hash: &[u8; TRUNCATED_HASH_LENGTH], ratchet: &[u8]) -> io::Result<()> {
+        // Validate ratchet size
+        if ratchet.len() != RATCHET_KEY_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid ratchet length: {} (expected {})", ratchet.len(), RATCHET_KEY_SIZE),
+            ));
+        }
+
         // Check if we already have this exact ratchet
         {
             let cache = self.cache.read().map_err(|_| {
@@ -414,12 +441,43 @@ impl RatchetManager {
         Ok(())
     }
 
-    /// Get the ratchet for a destination
+    /// Get the ratchet for a destination.
+    ///
+    /// Checks the in-memory cache first, then falls back to reading
+    /// from disk on cache miss (Python: Identity.py:365-388).
     pub fn get(&self, destination_hash: &[u8; TRUNCATED_HASH_LENGTH]) -> Option<Vec<u8>> {
-        self.cache
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(destination_hash).cloned())
+        // Check in-memory cache first
+        if let Some(ratchet) = self.cache.read().ok().and_then(|c| c.get(destination_hash).cloned()) {
+            return Some(ratchet);
+        }
+
+        // Lazy load from disk on cache miss
+        let hex_hash = bytes_to_hex(destination_hash);
+        let ratchet_path = self.storage_dir.join(&hex_hash);
+
+        if !ratchet_path.is_file() {
+            return None;
+        }
+
+        let file = File::open(&ratchet_path).ok()?;
+        let reader = BufReader::new(file);
+        let stored: StoredRatchet = rmp_serde::from_read(reader).ok()?;
+
+        // Validate size and expiry
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if stored.ratchet.len() != RATCHET_KEY_SIZE || now > stored.received + RATCHET_EXPIRY as f64 {
+            return None;
+        }
+
+        // Cache for future lookups
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(*destination_hash, stored.ratchet.clone());
+        }
+
+        Some(stored.ratchet)
     }
 
     /// Get the current ratchet ID for a destination.
@@ -508,53 +566,6 @@ impl RatchetManager {
     }
 }
 
-/// Identity file persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedIdentity {
-    /// Private encryption key bytes (32 bytes)
-    pub private_key: Vec<u8>,
-    /// Private signing key bytes (32 bytes)
-    pub sign_key: Vec<u8>,
-}
-
-impl PersistedIdentity {
-    /// Create from raw key bytes
-    pub fn new(private_key: &[u8], sign_key: &[u8]) -> Self {
-        Self {
-            private_key: private_key.to_vec(),
-            sign_key: sign_key.to_vec(),
-        }
-    }
-
-    /// Save identity to a file
-    pub fn save_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-
-        rmp_serde::encode::write(&mut writer, self).map_err(|e| {
-            io::Error::other(format!("MessagePack error: {}", e))
-        })?;
-
-        writer.flush()?;
-        Ok(())
-    }
-
-    /// Load identity from a file
-    pub fn load_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-
-        rmp_serde::from_read(reader).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("MessagePack error: {}", e))
-        })
-    }
-}
-
 /// Convert bytes to hexadecimal string
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -607,24 +618,6 @@ mod tests {
 
         let recalled = rm.get(&dest_hash).unwrap();
         assert_eq!(recalled, ratchet);
-
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_persisted_identity() {
-        let temp = temp_dir().join("rns_test_identity");
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap();
-
-        let identity = PersistedIdentity::new(&[1u8; 32], &[2u8; 32]);
-
-        let path = temp.join("test_identity");
-        identity.save_to_file(&path).unwrap();
-
-        let loaded = PersistedIdentity::load_from_file(&path).unwrap();
-        assert_eq!(loaded.private_key, vec![1u8; 32]);
-        assert_eq!(loaded.sign_key, vec![2u8; 32]);
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -808,6 +801,121 @@ mod tests {
         // A random identity hash should return None
         let random_hash = [0x00u8; TRUNCATED_HASH_LENGTH];
         assert!(kd.recall_identity_by_identity_hash(&random_hash).is_none());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_ratchet_reject_invalid_size() {
+        let temp = temp_dir().join("rns_test_ratchet_reject_invalid_size");
+        let _ = fs::remove_dir_all(&temp);
+        let rm = RatchetManager::new(&temp);
+
+        let dest_hash = [0xAAu8; TRUNCATED_HASH_LENGTH];
+
+        // Too short — should be rejected
+        let short_ratchet = vec![1u8; RATCHET_KEY_SIZE - 1];
+        let err = rm.remember(&dest_hash, &short_ratchet).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Too long — should be rejected
+        let long_ratchet = vec![1u8; RATCHET_KEY_SIZE + 1];
+        let err = rm.remember(&dest_hash, &long_ratchet).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Correct size — should succeed
+        let valid_ratchet = vec![1u8; RATCHET_KEY_SIZE];
+        rm.remember(&dest_hash, &valid_ratchet).unwrap();
+        assert_eq!(rm.get(&dest_hash).unwrap(), valid_ratchet);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_ratchet_load_skips_corrupted() {
+        let temp = temp_dir().join("rns_test_ratchet_load_skips_corrupted");
+        let _ = fs::remove_dir_all(&temp);
+        let ratchet_dir = temp.join("ratchets");
+        fs::create_dir_all(&ratchet_dir).unwrap();
+
+        let dest_hash = [0xBBu8; TRUNCATED_HASH_LENGTH];
+        let hex_hash = bytes_to_hex(&dest_hash);
+
+        // Write a StoredRatchet with wrong-sized ratchet data directly to disk
+        let bad_stored = StoredRatchet {
+            ratchet: vec![0u8; RATCHET_KEY_SIZE + 5], // wrong size
+            received: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        };
+        let path = ratchet_dir.join(&hex_hash);
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        rmp_serde::encode::write(&mut writer, &bad_stored).unwrap();
+        writer.flush().unwrap();
+
+        // load() should skip the corrupted entry and remove the file
+        let rm = RatchetManager::new(&temp);
+        rm.load().unwrap();
+        assert!(rm.get(&dest_hash).is_none());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_save_merges_disk_entries() {
+        let temp = temp_dir().join("rns_test_save_merges_disk_entries");
+        let _ = fs::remove_dir_all(&temp);
+
+        let kd = KnownDestinations::new(&temp);
+
+        // Remember destination A in memory and save to disk
+        let hash_a = [0x01u8; TRUNCATED_HASH_LENGTH];
+        let public_key = vec![2u8; FULL_PUBLIC_KEY_LENGTH];
+        kd.remember(&hash_a, &[0xAAu8; 32], &public_key, None).unwrap();
+        kd.save().unwrap();
+
+        // Create a new instance (simulating another process) with only destination B
+        let kd2 = KnownDestinations::new(&temp);
+        let hash_b = [0x02u8; TRUNCATED_HASH_LENGTH];
+        kd2.remember(&hash_b, &[0xBBu8; 32], &public_key, None).unwrap();
+
+        // Save — should merge disk entry A with in-memory entry B
+        kd2.save().unwrap();
+
+        // Load fresh and verify both entries survived
+        let kd3 = KnownDestinations::new(&temp);
+        kd3.load().unwrap();
+        assert!(kd3.recall(&hash_a).is_some(), "disk-only entry A should survive merge");
+        assert!(kd3.recall(&hash_b).is_some(), "in-memory entry B should be saved");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_ratchet_lazy_load_from_disk() {
+        let temp = temp_dir().join("rns_test_ratchet_lazy_load");
+        let _ = fs::remove_dir_all(&temp);
+
+        let dest_hash = [0xCCu8; TRUNCATED_HASH_LENGTH];
+        let ratchet_data = vec![0x42u8; RATCHET_KEY_SIZE];
+
+        // Use one manager to persist a ratchet to disk
+        let rm1 = RatchetManager::new(&temp);
+        rm1.remember(&dest_hash, &ratchet_data).unwrap();
+
+        // Create a fresh manager (empty cache, no load() call)
+        let rm2 = RatchetManager::new(&temp);
+
+        // get() should find the ratchet via lazy disk load
+        let result = rm2.get(&dest_hash);
+        assert_eq!(result.as_deref(), Some(ratchet_data.as_slice()));
+
+        // Second call should hit the now-populated cache
+        let result2 = rm2.get(&dest_hash);
+        assert_eq!(result2.as_deref(), Some(ratchet_data.as_slice()));
 
         let _ = fs::remove_dir_all(&temp);
     }
