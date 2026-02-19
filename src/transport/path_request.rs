@@ -297,6 +297,7 @@ impl PathRequestManager {
             transport: None,
             context: PacketContext::None,
             data,
+            ratchet_id: None,
         };
 
         (packet, tag)

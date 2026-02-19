@@ -422,6 +422,7 @@ impl Link {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         };
 
         self.status = LinkStatus::Pending;
@@ -470,6 +471,7 @@ impl Link {
             transport: None,
             context: PacketContext::LinkRequestProof,
             data: packet_data,
+            ratchet_id: None,
         }
     }
 
@@ -678,6 +680,7 @@ impl Link {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         }
     }
 
@@ -755,6 +758,7 @@ impl Link {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -786,6 +790,7 @@ impl Link {
             transport: None,
             context: PacketContext::Channel,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -817,6 +822,7 @@ impl Link {
             transport: None,
             context: PacketContext::Request,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -848,6 +854,7 @@ impl Link {
             transport: None,
             context: PacketContext::Response,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -868,6 +875,7 @@ impl Link {
             transport: None,
             context: PacketContext::KeepAlive,
             data: packet_data,
+            ratchet_id: None,
         }
     }
 
@@ -916,6 +924,7 @@ impl Link {
             transport: None,
             context: PacketContext::LinkRTT,
             data: packet_data,
+            ratchet_id: None,
         }
     }
 
@@ -1062,6 +1071,7 @@ impl Link {
             transport: None,
             context: PacketContext::LinkIdentify,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1297,6 +1307,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceAdvrtisement,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1329,6 +1340,7 @@ impl Link {
             transport: None,
             context: PacketContext::Resource,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1356,6 +1368,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceRequest,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1383,6 +1396,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceHashUpdate,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1410,6 +1424,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceProof,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1437,6 +1452,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceInitiatorCancel,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -1464,6 +1480,7 @@ impl Link {
             transport: None,
             context: PacketContext::ResourceReceiverCancel,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 

@@ -94,6 +94,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new_from_slice(&[data_byte; 32]),
+            ratchet_id: None,
         }
     }
 

@@ -1788,7 +1788,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
             data_handled = true;
 
             let (received, proof_packet) = {
-                let dest = destination.lock().await;
+                let mut dest = destination.lock().await;
                 let received = dest.receive(packet);
                 let proof_packet = if received && dest.should_prove(packet) {
                     Some(dest.proof_packet(packet))
@@ -2287,6 +2287,7 @@ fn create_retransmit_packet(packet: &Packet) -> Packet {
         transport: packet.transport,
         context: packet.context,
         data: packet.data,
+        ratchet_id: None,
     }
 }
 

@@ -217,6 +217,7 @@ async fn create_keepalive_packet(link: &Arc<RwLock<Link>>) -> Option<Packet> {
         transport: None,
         context: PacketContext::KeepAlive,
         data: PacketDataBuffer::new(),
+        ratchet_id: None,
     };
 
     Some(packet)

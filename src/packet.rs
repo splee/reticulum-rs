@@ -5,6 +5,7 @@ use sha2::Digest;
 use crate::buffer::StaticBuffer;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
+use crate::identity::RATCHET_ID_LENGTH;
 
 // Reticulum core sizing constants (match Python defaults in RNS/Reticulum.py)
 pub const RETICULUM_MTU: usize = 500;
@@ -298,6 +299,8 @@ pub struct Packet {
     pub transport: Option<AddressHash>,
     pub context: PacketContext,
     pub data: PacketDataBuffer,
+    /// Ratchet ID used for encryption/decryption (local metadata, not on wire).
+    pub ratchet_id: Option<[u8; RATCHET_ID_LENGTH]>,
 }
 
 impl Packet {
@@ -328,6 +331,7 @@ impl Default for Packet {
             ifac: None,
             transport: None,
             context: crate::packet::PacketContext::None,
+            ratchet_id: None,
         }
     }
 }

@@ -179,6 +179,24 @@ impl RatchetState {
         self.ratchets.iter()
     }
 
+    /// Reload ratchets from the persistence file.
+    ///
+    /// Returns Ok(true) if ratchets were reloaded, Ok(false) if no path is configured.
+    /// This is used to retry decryption after ratchet drift between in-memory and
+    /// persisted state (Python: Destination.py:640-649).
+    pub fn reload(&mut self, identity: &PrivateIdentity) -> Result<bool, RnsError> {
+        if let Some(path) = self.ratchets_path.clone() {
+            if path.exists() {
+                self.load_from_file(&path, identity)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Persist ratchets to file.
     ///
     /// The file format is MessagePack with signature for integrity:

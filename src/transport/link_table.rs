@@ -36,6 +36,7 @@ fn send_backwards(packet: &Packet, entry: &LinkEntry) -> (Packet, AddressHash) {
         transport: Some(entry.next_hop),
         context: packet.context,
         data: packet.data,
+        ratchet_id: None,
     };
 
     (propagated, entry.received_from)
@@ -150,6 +151,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data,
+            ratchet_id: None,
         }
     }
 
@@ -170,6 +172,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new(),
+            ratchet_id: None,
         }
     }
 

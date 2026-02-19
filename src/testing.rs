@@ -411,6 +411,7 @@ mod tests {
             transport: None,
             data: PacketDataBuffer::new(),
             context: PacketContext::None,
+            ratchet_id: None,
         };
 
         capture.capture(packet.clone(), "test");

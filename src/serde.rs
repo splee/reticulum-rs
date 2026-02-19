@@ -89,6 +89,7 @@ impl Packet {
             transport,
             context,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
         buffer.read(packet.data.accuire_buf(buffer.bytes_left()))?;
@@ -133,6 +134,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
         packet.serialize(&mut buffer).expect("serialized packet");
@@ -161,6 +163,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
         packet.data.safe_write(b"Hello, world!");

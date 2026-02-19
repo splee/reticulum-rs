@@ -58,6 +58,7 @@ impl AnnounceEntry {
             transport: Some(*transport_id),
             context: PacketContext::None,
             data: self.packet.data,
+            ratchet_id: None,
         };
 
         Some((self.received_from, new_packet))
@@ -203,6 +204,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new(),
+            ratchet_id: None,
         }
     }
 

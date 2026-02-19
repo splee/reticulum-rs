@@ -274,6 +274,7 @@ impl PathTable {
                     transport: None, // No transport header for last hop
                     context: original_packet.context,
                     data: original_packet.data,
+                    ratchet_id: None,
                 },
                 Some(entry.iface),
             )
@@ -296,6 +297,7 @@ impl PathTable {
                     transport: Some(entry.received_from),
                     context: original_packet.context,
                     data: original_packet.data,
+                    ratchet_id: None,
                 },
                 Some(entry.iface),
             )
@@ -365,6 +367,7 @@ impl PathTable {
                     transport: Some(entry.received_from),
                     context: original_packet.context,
                     data: original_packet.data,
+                    ratchet_id: None,
                 },
                 Some(entry.iface),
             )

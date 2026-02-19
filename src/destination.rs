@@ -16,14 +16,18 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use core::{fmt, marker::PhantomData};
 
+use std::path::PathBuf;
+
 use crate::{
     destination::link::Link,
+    destination::ratchet::RatchetState,
     crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
     hash::{AddressHash, Hash},
     identity::{
-        DerivedKey, EmptyIdentity, HashIdentity, Identity,
-        PrivateIdentity, DERIVED_KEY_LENGTH, PUBLIC_KEY_LENGTH, RATCHET_KEY_SIZE,
+        DerivedKey, EmptyIdentity, HashIdentity, Identity, PrivateIdentity,
+        get_ratchet_id, ratchet_public_bytes,
+        DERIVED_KEY_LENGTH, PUBLIC_KEY_LENGTH, RATCHET_ID_LENGTH, RATCHET_KEY_SIZE,
     },
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
@@ -33,6 +37,17 @@ use crate::{
 };
 use sha2::Digest;
 use crate::destination::proof::ProofStrategy;
+
+/// Result of a successful single-destination decryption.
+///
+/// Contains the decrypted plaintext and optionally the ratchet ID
+/// if a ratchet key was used for decryption (rather than the identity key).
+pub struct DecryptResult {
+    /// The decrypted plaintext.
+    pub plaintext: Vec<u8>,
+    /// The ratchet ID if a ratchet key was used, or None if identity key was used.
+    pub ratchet_id: Option<[u8; RATCHET_ID_LENGTH]>,
+}
 
 // ============================================================================
 // SINGLE Destination Crypto Helpers (Python-compatible)
@@ -74,7 +89,8 @@ fn decrypt_single<R: CryptoRngCore + Copy>(
     identity: &PrivateIdentity,
     ciphertext: &[u8],
     ratchets: Option<&[Vec<u8>]>,
-) -> Result<Vec<u8>, RnsError> {
+    enforce_ratchets: bool,
+) -> Result<DecryptResult, RnsError> {
     if ciphertext.len() <= PUBLIC_KEY_LENGTH {
         return Err(RnsError::InvalidArgument);
     }
@@ -106,10 +122,21 @@ fn decrypt_single<R: CryptoRngCore + Copy>(
             let token = Token::from(token_bytes);
             if let Ok(verified) = fernet.verify(token) {
                 if let Ok(plain) = fernet.decrypt(verified, &mut out_buf) {
-                    return Ok(plain.as_slice().to_vec());
+                    // Compute ratchet ID from the public key of the matching ratchet
+                    let ratchet_id = get_ratchet_id(&ratchet_public_bytes(&rbytes));
+                    return Ok(DecryptResult {
+                        plaintext: plain.as_slice().to_vec(),
+                        ratchet_id: Some(ratchet_id),
+                    });
                 }
             }
         }
+    }
+
+    // If ratchets are enforced and we didn't find a matching ratchet, reject
+    // (Python: Identity.py:745-749)
+    if enforce_ratchets {
+        return Err(RnsError::CryptoError);
     }
 
     // Fallback to identity private key
@@ -123,7 +150,10 @@ fn decrypt_single<R: CryptoRngCore + Copy>(
     let token = Token::from(token_bytes);
     let verified = fernet.verify(token)?;
     let plain = fernet.decrypt(verified, &mut out_buf)?;
-    Ok(plain.as_slice().to_vec())
+    Ok(DecryptResult {
+        plaintext: plain.as_slice().to_vec(),
+        ratchet_id: None,
+    })
 }
 
 //***************************************************************************//
@@ -437,6 +467,10 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub callbacks: DestinationCallbacks,
     /// Proof strategy for responding to incoming packets
     pub proof_strategy: ProofStrategy,
+    /// Ratchet state for forward secrecy (disabled by default)
+    pub ratchet_state: RatchetState,
+    /// ID of the ratchet used in the last encrypt or decrypt operation
+    pub latest_ratchet_id: Option<[u8; RATCHET_ID_LENGTH]>,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -498,6 +532,8 @@ impl Destination<PrivateIdentity, Input, Single> {
             },
             callbacks: DestinationCallbacks::default(),
             proof_strategy: ProofStrategy::None,
+            ratchet_state: RatchetState::default(),
+            latest_ratchet_id: None,
         }
     }
 
@@ -569,6 +605,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -648,6 +685,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         })
     }
 
@@ -716,6 +754,16 @@ impl Destination<PrivateIdentity, Input, Single> {
         self.callbacks = DestinationCallbacks::default();
     }
 
+    /// Enable ratchets with persistence at the given path.
+    pub fn enable_ratchets(&mut self, path: PathBuf) -> Result<(), RnsError> {
+        self.ratchet_state.enable(path, &self.identity)
+    }
+
+    /// Enforce ratchet usage for decryption (reject non-ratchet packets).
+    pub fn set_enforce_ratchets(&mut self, enforce: bool) {
+        self.ratchet_state.set_enforce(enforce);
+    }
+
     pub fn sign_key(&self) -> &SigningKey {
         self.identity.sign_key()
     }
@@ -751,7 +799,7 @@ impl Destination<PrivateIdentity, Input, Single> {
     ///
     /// Encrypted ciphertext bytes.
     pub fn encrypt<R: CryptoRngCore + Copy>(
-        &self,
+        &mut self,
         rng: R,
         plaintext: &[u8],
         ratchet_manager: Option<&RatchetManager>,
@@ -761,6 +809,12 @@ impl Destination<PrivateIdentity, Input, Single> {
             .map_err(|_| RnsError::InvalidArgument)?;
         let selected_ratchet = ratchet_manager
             .and_then(|rm| rm.get(&dest_hash));
+
+        // Track ratchet ID (Python: Destination.py:608-609)
+        self.latest_ratchet_id = selected_ratchet.as_deref().and_then(|pub_bytes| {
+            let rbytes: [u8; RATCHET_KEY_SIZE] = pub_bytes.try_into().ok()?;
+            Some(get_ratchet_id(&rbytes))
+        });
 
         // Use identity's encrypt with optional ratchet
         self.encrypt_with_ratchet(rng, plaintext, selected_ratchet.as_deref())
@@ -813,16 +867,18 @@ impl Destination<PrivateIdentity, Input, Single> {
         rng: R,
         ciphertext: &[u8],
         ratchets: Option<&[Vec<u8>]>,
-    ) -> Result<Vec<u8>, RnsError> {
+        enforce_ratchets: bool,
+    ) -> Result<DecryptResult, RnsError> {
         let salt = self.desc.address_hash.as_slice();
-        decrypt_single(rng, salt, &self.identity, ciphertext, ratchets)
+        decrypt_single(rng, salt, &self.identity, ciphertext, ratchets, enforce_ratchets)
     }
 
     /// Receive and decrypt an incoming packet for this destination.
     ///
     /// Returns true if the packet was successfully decrypted and processed.
     /// Mirrors Python's `Destination.receive()` for SINGLE destinations.
-    pub fn receive(&self, packet: &Packet) -> bool {
+    /// Uses ratchet keys if enabled and tracks which ratchet was used.
+    pub fn receive(&mut self, packet: &Packet) -> bool {
         if packet.header.packet_type == PacketType::LinkRequest {
             // Link requests are handled by transport separately.
             return false;
@@ -832,13 +888,51 @@ impl Destination<PrivateIdentity, Input, Single> {
             return false;
         }
 
-        let plaintext = match self.decrypt(OsRng, packet.data.as_slice(), None) {
-            Ok(p) => p,
-            Err(_) => return false,
+        // Collect ratchet private keys to avoid borrow conflict with self
+        let ratchet_keys: Vec<Vec<u8>> = self.ratchet_state
+            .ratchet_keys()
+            .map(|k| k.to_vec())
+            .collect();
+        let ratchets_arg = if ratchet_keys.is_empty() { None } else { Some(ratchet_keys.as_slice()) };
+        let enforce = self.ratchet_state.enforce();
+
+        let result = match self.decrypt(OsRng, packet.data.as_slice(), ratchets_arg, enforce) {
+            Ok(r) => r,
+            Err(_) if self.ratchet_state.is_enabled() => {
+                // Retry after reloading ratchets from disk (Python: Destination.py:640-649)
+                log::debug!("Decryption with ratchets failed, reloading from storage and retrying");
+                if self.ratchet_state.reload(&self.identity).is_ok() {
+                    let ratchet_keys: Vec<Vec<u8>> = self.ratchet_state
+                        .ratchet_keys()
+                        .map(|k| k.to_vec())
+                        .collect();
+                    let ratchets_arg = if ratchet_keys.is_empty() { None } else { Some(ratchet_keys.as_slice()) };
+                    match self.decrypt(OsRng, packet.data.as_slice(), ratchets_arg, enforce) {
+                        Ok(r) => {
+                            log::info!("Decryption succeeded after ratchet reload");
+                            r
+                        }
+                        Err(_) => {
+                            self.latest_ratchet_id = None;
+                            return false;
+                        }
+                    }
+                } else {
+                    self.latest_ratchet_id = None;
+                    return false;
+                }
+            }
+            Err(_) => {
+                self.latest_ratchet_id = None;
+                return false;
+            }
         };
 
+        // Track which ratchet was used (Python: Destination.py:419)
+        self.latest_ratchet_id = result.ratchet_id;
+
         if let Some(ref callback) = self.callbacks.packet {
-            callback(plaintext.as_slice(), packet);
+            callback(result.plaintext.as_slice(), packet);
         }
 
         true
@@ -867,6 +961,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         }
     }
 }
@@ -885,6 +980,8 @@ impl Destination<Identity, Output, Single> {
             },
             callbacks: DestinationCallbacks::default(),
             proof_strategy: ProofStrategy::None,
+            ratchet_state: RatchetState::default(),
+            latest_ratchet_id: None,
         }
     }
 
@@ -906,7 +1003,7 @@ impl Destination<Identity, Output, Single> {
     ///
     /// Encrypted ciphertext bytes.
     pub fn encrypt<R: CryptoRngCore + Copy>(
-        &self,
+        &mut self,
         rng: R,
         plaintext: &[u8],
         ratchet_manager: Option<&RatchetManager>,
@@ -916,6 +1013,12 @@ impl Destination<Identity, Output, Single> {
             .map_err(|_| RnsError::InvalidArgument)?;
         let selected_ratchet = ratchet_manager
             .and_then(|rm| rm.get(&dest_hash));
+
+        // Track ratchet ID (Python: Destination.py:608-609)
+        self.latest_ratchet_id = selected_ratchet.as_deref().and_then(|pub_bytes| {
+            let rbytes: [u8; RATCHET_KEY_SIZE] = pub_bytes.try_into().ok()?;
+            Some(get_ratchet_id(&rbytes))
+        });
 
         let salt = self.desc.address_hash.as_slice();
         let target_pub = if let Some(ratchet) = selected_ratchet.as_deref() {
@@ -947,6 +1050,8 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             },
             callbacks: DestinationCallbacks::default(),
             proof_strategy: ProofStrategy::None,
+            ratchet_state: RatchetState::default(),
+            latest_ratchet_id: None,
         }
     }
 }
@@ -1190,6 +1295,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         };
 
         // The signature verification will fail first because the signed data
@@ -1262,6 +1368,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: packet_data,
+            ratchet_id: None,
         };
 
         // Validate with full ratchet support
@@ -1327,5 +1434,127 @@ mod tests {
 
         eprintln!("announce_with_ratchet roundtrip test passed!");
         eprintln!("  Ratchet ID: {}", hex::encode(&ratchet_id));
+    }
+
+    #[test]
+    fn test_decrypt_result_with_ratchet() {
+        // Encrypt with ratchet -> decrypt with matching ratchet -> ratchet_id is Some
+        use crate::identity::{generate_ratchet, ratchet_public_bytes, get_ratchet_id};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "ratchetcrypto");
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        // Generate ratchet key
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Encrypt using the ratchet public key
+        let plaintext = b"hello ratchet world";
+        let ciphertext = destination
+            .encrypt_with_ratchet(OsRng, plaintext, Some(&ratchet_pub))
+            .expect("encryption should succeed");
+
+        // Decrypt with the matching ratchet private key
+        let ratchet_keys = vec![ratchet_priv.to_vec()];
+        let result = destination
+            .decrypt(OsRng, &ciphertext, Some(&ratchet_keys[..]), false)
+            .expect("decryption should succeed");
+
+        assert_eq!(result.plaintext, plaintext);
+        assert!(result.ratchet_id.is_some(), "ratchet_id should be Some when ratchet was used");
+
+        let expected_id = get_ratchet_id(&ratchet_pub);
+        assert_eq!(result.ratchet_id.unwrap(), expected_id);
+    }
+
+    #[test]
+    fn test_decrypt_enforce_ratchets_rejects_identity_fallback() {
+        // Encrypt with ratchet -> decrypt with wrong ratchet + enforce_ratchets=true -> Err
+        use crate::identity::{generate_ratchet, ratchet_public_bytes};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "enforcetest");
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        // Generate ratchet and encrypt with it
+        let ratchet_priv = generate_ratchet(OsRng);
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+        let plaintext = b"secret data";
+        let ciphertext = destination
+            .encrypt_with_ratchet(OsRng, plaintext, Some(&ratchet_pub))
+            .expect("encryption should succeed");
+
+        // Generate a different (wrong) ratchet for decryption
+        let wrong_ratchet = generate_ratchet(OsRng);
+        let wrong_keys = vec![wrong_ratchet.to_vec()];
+
+        // With enforce_ratchets=true, decryption should fail (no identity fallback)
+        let result = destination.decrypt(OsRng, &ciphertext, Some(&wrong_keys[..]), true);
+        assert!(result.is_err(), "Should fail with enforce_ratchets and wrong ratchet");
+    }
+
+    #[test]
+    fn test_decrypt_identity_fallback_without_enforce() {
+        // Encrypt with identity key -> decrypt with wrong ratchet + enforce_ratchets=false
+        // -> falls back to identity key, ratchet_id is None
+        use crate::identity::generate_ratchet;
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "fallbacktest");
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        // Encrypt with identity key (no ratchet)
+        let plaintext = b"identity encrypted data";
+        let ciphertext = destination
+            .encrypt_with_ratchet(OsRng, plaintext, None)
+            .expect("encryption should succeed");
+
+        // Provide wrong ratchet keys but enforce=false -> should fall back to identity
+        let wrong_ratchet = generate_ratchet(OsRng);
+        let wrong_keys = vec![wrong_ratchet.to_vec()];
+
+        let result = destination
+            .decrypt(OsRng, &ciphertext, Some(&wrong_keys[..]), false)
+            .expect("decryption should fall back to identity key");
+
+        assert_eq!(result.plaintext, plaintext);
+        assert!(result.ratchet_id.is_none(), "ratchet_id should be None for identity key fallback");
+    }
+
+    #[test]
+    fn test_receive_with_identity_key_sets_latest_ratchet_id_none() {
+        // Verify that receive() sets latest_ratchet_id=None when identity key is used
+        use crate::packet::{Header, PacketDataBuffer, PacketType, DestinationType};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("test.app", "receivetest");
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        // Encrypt a data packet with the identity key (no ratchet)
+        let plaintext = b"hi";
+        let ciphertext = destination
+            .encrypt_with_ratchet(OsRng, plaintext, None)
+            .expect("encryption should succeed");
+
+        // Build a Packet with the encrypted data
+        let data = PacketDataBuffer::new_from_slice(&ciphertext);
+
+        let packet = crate::packet::Packet {
+            header: Header {
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination: destination.desc.address_hash,
+            data,
+            ..Default::default()
+        };
+
+        assert!(destination.latest_ratchet_id.is_none());
+        let received = destination.receive(&packet);
+        assert!(received, "receive should succeed via identity key");
+        assert!(destination.latest_ratchet_id.is_none(),
+            "latest_ratchet_id should be None when identity key was used");
     }
 }
