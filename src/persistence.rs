@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::hash::AddressHash;
 use crate::identity::{Identity, RATCHET_ID_LENGTH};
 
 /// Length of truncated hash in bytes (128 bits / 8)
@@ -220,6 +221,43 @@ impl KnownDestinations {
         self.recall(destination_hash).and_then(|kd| {
             if kd.public_key.len() >= FULL_PUBLIC_KEY_LENGTH {
                 Some(Identity::from_bytes(&kd.public_key).ok()?)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Recall a known destination by identity hash instead of destination hash.
+    ///
+    /// This iterates all known destinations, computes the identity hash
+    /// (truncated hash of the public key) for each, and returns the first match.
+    /// Mirrors Python's `Identity.recall(target_hash, from_identity_hash=True)`.
+    pub fn recall_by_identity_hash(
+        &self,
+        identity_hash: &[u8; TRUNCATED_HASH_LENGTH],
+    ) -> Option<KnownDestination> {
+        let cache = self.cache.read().ok()?;
+        for kd in cache.values() {
+            let kd_identity_hash = AddressHash::new_from_slice(&kd.public_key);
+            if kd_identity_hash.as_slice() == identity_hash {
+                return Some(kd.clone());
+            }
+        }
+        None
+    }
+
+    /// Recall an Identity by identity hash.
+    ///
+    /// Like `recall_identity`, but searches by identity hash instead of
+    /// destination hash. Mirrors Python's
+    /// `Identity.recall(target_hash, from_identity_hash=True)`.
+    pub fn recall_identity_by_identity_hash(
+        &self,
+        identity_hash: &[u8; TRUNCATED_HASH_LENGTH],
+    ) -> Option<Identity> {
+        self.recall_by_identity_hash(identity_hash).and_then(|kd| {
+            if kd.public_key.len() >= FULL_PUBLIC_KEY_LENGTH {
+                Identity::from_bytes(&kd.public_key).ok()
             } else {
                 None
             }
@@ -689,6 +727,87 @@ mod tests {
         // Should return None for non-existent ratchet
         let ratchet_id = rm.current_ratchet_id(&dest_hash);
         assert!(ratchet_id.is_none());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recall_by_identity_hash() {
+        use rand_core::OsRng;
+        use crate::identity::PrivateIdentity;
+        use crate::hash::AddressHash;
+
+        let temp = temp_dir().join("rns_test_recall_by_identity_hash");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        // Create a real identity and store it
+        let priv_id = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = priv_id.as_identity();
+        let public_key_bytes = pub_id.to_bytes();
+
+        let dest_hash = [0xCCu8; TRUNCATED_HASH_LENGTH];
+        let packet_hash = vec![0xDDu8; 32];
+
+        kd.remember(&dest_hash, &packet_hash, &public_key_bytes, None)
+            .unwrap();
+
+        // Compute the identity hash from the public key (same as AddressHash)
+        let identity_hash = AddressHash::new_from_slice(&public_key_bytes);
+        let identity_hash_bytes: [u8; TRUNCATED_HASH_LENGTH] =
+            identity_hash.as_slice().try_into().unwrap();
+
+        // Recall by identity hash should find it
+        let recalled = kd.recall_by_identity_hash(&identity_hash_bytes);
+        assert!(recalled.is_some());
+        let recalled = recalled.unwrap();
+        assert_eq!(recalled.public_key, public_key_bytes);
+        assert_eq!(recalled.packet_hash, packet_hash);
+
+        // A random identity hash should return None
+        let random_hash = [0xFFu8; TRUNCATED_HASH_LENGTH];
+        assert!(kd.recall_by_identity_hash(&random_hash).is_none());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recall_identity_by_identity_hash() {
+        use rand_core::OsRng;
+        use crate::identity::PrivateIdentity;
+        use crate::hash::AddressHash;
+
+        let temp = temp_dir().join("rns_test_recall_identity_by_identity_hash");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        // Create a real identity and store it
+        let priv_id = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = priv_id.as_identity();
+        let public_key_bytes = pub_id.to_bytes();
+
+        let dest_hash = [0xEEu8; TRUNCATED_HASH_LENGTH];
+        let packet_hash = vec![0x11u8; 32];
+
+        kd.remember(&dest_hash, &packet_hash, &public_key_bytes, None)
+            .unwrap();
+
+        // Compute the identity hash
+        let identity_hash = AddressHash::new_from_slice(&public_key_bytes);
+        let identity_hash_bytes: [u8; TRUNCATED_HASH_LENGTH] =
+            identity_hash.as_slice().try_into().unwrap();
+
+        // Recall identity by identity hash should return a valid Identity
+        let recalled = kd.recall_identity_by_identity_hash(&identity_hash_bytes);
+        assert!(recalled.is_some());
+
+        let recalled = recalled.unwrap();
+        assert_eq!(recalled.public_key.as_bytes(), pub_id.public_key.as_bytes());
+        assert_eq!(recalled.verifying_key.as_bytes(), pub_id.verifying_key.as_bytes());
+
+        // A random identity hash should return None
+        let random_hash = [0x00u8; TRUNCATED_HASH_LENGTH];
+        assert!(kd.recall_identity_by_identity_hash(&random_hash).is_none());
 
         let _ = fs::remove_dir_all(&temp);
     }
