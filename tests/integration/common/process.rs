@@ -5,6 +5,11 @@
 //!
 //! All spawned processes are registered in a global registry and will be
 //! killed when the test process exits (via atexit handler).
+//!
+//! Processes are spawned in their own process group via `setsid()` so that
+//! `killpg()` can reliably kill them and any children they may spawn.
+//! PID files in `$TMPDIR/reticulum-test-pids/` provide a safety net for
+//! cleaning up processes left behind by previous test runs.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -23,6 +28,78 @@ lazy_static! {
 /// One-time registration of the atexit cleanup handler.
 static CLEANUP_REGISTERED: Once = Once::new();
 
+/// Directory for PID files, used to detect stale processes from previous runs.
+fn pid_file_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("reticulum-test-pids")
+}
+
+/// Write a PID file for a spawned process.
+fn write_pid_file(pid: u32) {
+    let dir = pid_file_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(pid.to_string()), "");
+}
+
+/// Remove the PID file for a process that has been killed/exited.
+fn remove_pid_file(pid: u32) {
+    let _ = std::fs::remove_file(pid_file_dir().join(pid.to_string()));
+}
+
+/// Clean up stale processes from previous test runs.
+///
+/// Scans the PID file directory and kills processes whose PID files are older
+/// than a threshold (120 seconds). This avoids killing processes spawned by
+/// concurrent test subprocesses in the same nextest run, while still cleaning
+/// up genuinely stale processes from previous (possibly crashed) runs.
+///
+/// Called once at the start of each test process via `OnceLock`.
+pub fn cleanup_stale_processes() {
+    let dir = pid_file_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return, // No PID dir means nothing to clean up
+    };
+
+    // Only kill processes whose PID files are older than this threshold.
+    // Recent PID files likely belong to concurrent test subprocesses.
+    let stale_threshold = Duration::from_secs(120);
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        // Skip PID files that are too recent — they likely belong to
+        // concurrent tests in the same nextest run.
+        if let Ok(metadata) = entry.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    if age < stale_threshold {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Some(pid_str) = entry.file_name().to_str() {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                #[cfg(unix)]
+                unsafe {
+                    // Check if the process is still alive (signal 0 = existence check)
+                    if libc::kill(pid, 0) == 0 {
+                        eprintln!(
+                            "[integration-test] Cleaning up stale process (pid: {})",
+                            pid
+                        );
+                        // Kill the process group first, then the individual process
+                        libc::killpg(pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+                // Remove the stale PID file regardless
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Register a process PID for cleanup on exit.
 pub fn register_pid(pid: u32) {
     // Ensure cleanup handler is registered
@@ -31,6 +108,7 @@ pub fn register_pid(pid: u32) {
     if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
         registry.push(pid);
     }
+    write_pid_file(pid);
 }
 
 /// Unregister a PID (called when process exits normally or is killed).
@@ -38,6 +116,7 @@ pub fn unregister_pid(pid: u32) {
     if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
         registry.retain(|&p| p != pid);
     }
+    remove_pid_file(pid);
 }
 
 /// Kill all registered processes.
@@ -45,20 +124,27 @@ pub fn unregister_pid(pid: u32) {
 pub fn kill_all_registered() {
     if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
         for pid in registry.drain(..) {
-            #[cfg(unix)]
-            {
-                // Send SIGKILL to ensure process dies
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, we can't do much here without the Child handle
-                let _ = pid;
-            }
+            kill_pid(pid);
         }
     }
+}
+
+/// Kill a process by PID, using process group kill as primary and individual kill as fallback.
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let pid = pid as i32;
+    unsafe {
+        // Kill the process group (covers any children)
+        libc::killpg(pid, libc::SIGKILL);
+        // Also send directly to the PID as fallback (in case setsid failed)
+        libc::kill(pid, libc::SIGKILL);
+    }
+    remove_pid_file(pid as u32);
+}
+
+#[cfg(not(unix))]
+fn kill_pid(pid: u32) {
+    let _ = pid;
 }
 
 /// Ensure the atexit cleanup handler is registered.
@@ -72,8 +158,10 @@ pub fn ensure_cleanup_registered() {
                 // lazy_static may have been cleaned up. Do minimal cleanup.
                 if let Ok(registry) = PROCESS_REGISTRY.lock() {
                     for &pid in registry.iter() {
+                        let pid = pid as i32;
                         unsafe {
-                            libc::kill(pid as i32, libc::SIGKILL);
+                            libc::killpg(pid, libc::SIGKILL);
+                            libc::kill(pid, libc::SIGKILL);
                         }
                     }
                 }
@@ -84,6 +172,25 @@ pub fn ensure_cleanup_registered() {
         }
     });
 }
+
+/// Apply pre-exec hook to put the child process into its own process group.
+///
+/// This allows `killpg()` to kill the process and all its children reliably.
+#[cfg(unix)]
+fn apply_setsid(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid() is async-signal-safe and has no side effects in the
+    // parent process. The child calls it before exec to create a new session.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_setsid(_cmd: &mut Command) {}
 
 /// Error type for process operations.
 #[derive(Debug)]
@@ -103,6 +210,129 @@ impl From<std::io::Error> for ProcessError {
     }
 }
 
+/// RAII guard for a child process.
+///
+/// On drop, sends SIGTERM (via process group), waits a grace period,
+/// then escalates to SIGKILL. This ensures processes are cleaned up
+/// even if the test panics.
+pub struct ChildGuard {
+    child: Option<Child>,
+    pid: u32,
+    name: String,
+}
+
+impl ChildGuard {
+    /// Create a new ChildGuard wrapping a spawned child process.
+    fn new(child: Child, name: impl Into<String>) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+            name: name.into(),
+        }
+    }
+
+    /// Get a mutable reference to the underlying Child process.
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child process already consumed")
+    }
+
+    /// Get the process ID.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Explicitly kill the process (same logic as Drop).
+    pub fn kill(&mut self) {
+        self.kill_inner();
+    }
+
+    /// Take ownership of the underlying Child process.
+    ///
+    /// After calling this, the guard will still unregister the PID on drop
+    /// but will not attempt to kill the process (since it no longer owns it).
+    pub fn take_child(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+
+    /// Check if the process has exited without blocking.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if let Some(ref mut child) = self.child {
+            child.try_wait()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Core kill logic shared between `kill()` and `Drop`.
+    fn kill_inner(&mut self) {
+        let child = match self.child.as_mut() {
+            Some(c) => c,
+            None => {
+                // Child was taken (e.g. via take_child()), just unregister PID
+                unregister_pid(self.pid);
+                return;
+            }
+        };
+
+        // Check if already exited
+        if let Ok(Some(_)) = child.try_wait() {
+            unregister_pid(self.pid);
+            return;
+        }
+
+        // Unregister from global cleanup since we're handling it here
+        unregister_pid(self.pid);
+
+        // Send SIGTERM to the process group for graceful shutdown
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.pid as i32, libc::SIGTERM);
+            // Also signal the individual PID as fallback
+            libc::kill(self.pid as i32, libc::SIGTERM);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+        }
+
+        // Wait briefly for graceful shutdown
+        let start = Instant::now();
+        let grace_period = Duration::from_secs(2);
+
+        while start.elapsed() < grace_period {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(_) => return,
+            }
+        }
+
+        // Force kill if still running
+        eprintln!(
+            "[integration-test] Force killing process '{}' (pid: {})",
+            self.name, self.pid
+        );
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.pid as i32, libc::SIGKILL);
+            libc::kill(self.pid as i32, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_inner();
+    }
+}
+
 /// A managed background process with output capture.
 ///
 /// Output from stdout and stderr is captured in a buffer that can be
@@ -117,6 +347,8 @@ pub struct ManagedProcess {
     reader_handle: Option<JoinHandle<()>>,
     /// Name for logging.
     name: String,
+    /// PID of the child process (stored separately since child may be consumed).
+    pid: u32,
     /// Whether the process has been killed.
     killed: bool,
 }
@@ -127,15 +359,20 @@ impl ManagedProcess {
     /// The command's stdout and stderr will be merged and captured
     /// in a buffer for later inspection. The process is automatically
     /// registered in the global registry for cleanup on exit.
+    /// The child is spawned in its own process group via `setsid()`.
     pub fn spawn(name: &str, cmd: &mut Command) -> Result<Self, ProcessError> {
         // Configure command to capture output
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Put child in its own process group for reliable cleanup
+        apply_setsid(cmd);
+
         let mut child = cmd.spawn()?;
+        let pid = child.id();
 
         // Register PID for cleanup on exit
-        register_pid(child.id());
+        register_pid(pid);
 
         // Take ownership of stdout and stderr
         let stdout = child.stdout.take();
@@ -155,6 +392,7 @@ impl ManagedProcess {
             output_buffer,
             reader_handle: Some(reader_handle),
             name: name.to_string(),
+            pid,
             killed: false,
         })
     }
@@ -286,14 +524,15 @@ impl ManagedProcess {
 
         if let Some(ref mut child) = self.child {
             // Unregister from global cleanup since we're handling it here
-            unregister_pid(child.id());
+            unregister_pid(self.pid);
 
-            // Try graceful shutdown first
+            // Try graceful shutdown first — kill the process group
             #[cfg(unix)]
             {
-                // Send SIGTERM for graceful shutdown
                 unsafe {
-                    libc::kill(child.id() as i32, libc::SIGTERM);
+                    libc::killpg(self.pid as i32, libc::SIGTERM);
+                    // Also signal the individual PID as fallback
+                    libc::kill(self.pid as i32, libc::SIGTERM);
                 }
             }
 
@@ -323,10 +562,17 @@ impl ManagedProcess {
             if let Ok(None) = child.try_wait() {
                 eprintln!(
                     "[integration-test] Force killing process '{}' (pid: {})",
-                    self.name,
-                    child.id()
+                    self.name, self.pid
                 );
-                let _ = child.kill();
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(self.pid as i32, libc::SIGKILL);
+                    libc::kill(self.pid as i32, libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
             }
         }
@@ -408,6 +654,8 @@ pub fn run_command(cmd: &mut Command, _timeout: Duration) -> Result<String, Proc
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    apply_setsid(cmd);
+
     let child = cmd.spawn()?;
     let pid = child.id();
 
@@ -433,15 +681,14 @@ pub fn run_command(cmd: &mut Command, _timeout: Duration) -> Result<String, Proc
 
 /// Spawn a raw command and register it for cleanup.
 ///
-/// This is a lower-level function for cases where you need direct access
-/// to the Child process. The PID is registered for cleanup on exit.
-///
-/// Returns the spawned Child and its PID.
-pub fn spawn_tracked(cmd: &mut Command) -> Result<(Child, u32), ProcessError> {
+/// Returns a `ChildGuard` that will automatically kill the process on drop.
+/// The child is spawned in its own process group via `setsid()`.
+pub fn spawn_tracked(cmd: &mut Command) -> Result<ChildGuard, ProcessError> {
+    apply_setsid(cmd);
     let child = cmd.spawn()?;
     let pid = child.id();
     register_pid(pid);
-    Ok((child, pid))
+    Ok(ChildGuard::new(child, format!("tracked-pid-{}", pid)))
 }
 
 #[cfg(test)]
@@ -495,5 +742,26 @@ mod tests {
 
         // Dropping group should kill both processes
         drop(group);
+    }
+
+    #[test]
+    fn test_child_guard_cleanup_on_drop() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+
+        let guard = spawn_tracked(&mut cmd).unwrap();
+        let pid = guard.pid();
+
+        // Drop the guard — should kill the process
+        drop(guard);
+
+        // Verify the process is dead (signal 0 = existence check)
+        #[cfg(unix)]
+        {
+            // Give the OS a moment to reap the process
+            thread::sleep(Duration::from_millis(100));
+            let alive = unsafe { libc::kill(pid as i32, 0) };
+            assert_eq!(alive, -1, "process should be dead after ChildGuard drop");
+        }
     }
 }

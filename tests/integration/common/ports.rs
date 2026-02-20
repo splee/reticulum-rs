@@ -1,46 +1,77 @@
 //! Dynamic port allocation for integration tests.
 //!
-//! Provides thread-safe port allocation to ensure parallel tests don't conflict.
+//! Uses OS ephemeral port allocation (bind to port 0) to ensure parallel test
+//! processes don't collide on ports, even across separate nextest subprocesses.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::net::TcpListener;
 
-/// Starting port for test allocations.
-/// Using a high port range to avoid conflicts with common services.
-const BASE_PORT: u16 = 20000;
-
-/// Global atomic counter for port allocation.
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(BASE_PORT);
-
-/// Allocate a unique port for this test run.
+/// Allocate a unique port by binding to port 0 and reading back the OS-assigned port.
 ///
-/// Each call returns a new port number, ensuring parallel tests don't conflict.
+/// The listener is dropped immediately, freeing the port for the test process to use.
+/// There is a small TOCTOU window, but in practice this is reliable because the OS
+/// won't reassign the same ephemeral port immediately.
 pub fn allocate_port() -> u16 {
-    PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind to ephemeral port for test port allocation");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }
 
-/// Allocate multiple consecutive ports.
+/// Allocate multiple unique ports.
 ///
-/// Useful when a test needs several ports (e.g., TCP server, shared instance, control).
+/// Each port is independently allocated via the OS, so they are guaranteed
+/// to be distinct (the OS won't reuse a recently-freed ephemeral port).
 pub fn allocate_ports(count: u16) -> Vec<u16> {
-    (0..count).map(|_| allocate_port()).collect()
+    // Hold all listeners open until we've collected all ports, to prevent
+    // the OS from reassigning a just-freed port to the next allocation.
+    let listeners: Vec<TcpListener> = (0..count)
+        .map(|_| {
+            TcpListener::bind("127.0.0.1:0")
+                .expect("failed to bind to ephemeral port for test port allocation")
+        })
+        .collect();
+
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+
+    // All listeners drop here, freeing the ports for test use
+    drop(listeners);
+    ports
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
-    fn test_allocate_port_increments() {
-        let port1 = allocate_port();
-        let port2 = allocate_port();
-        assert!(port2 > port1);
+    fn test_allocate_port_returns_valid_port() {
+        let port = allocate_port();
+        assert!(port > 0, "port should be non-zero");
     }
 
     #[test]
-    fn test_allocate_ports_returns_consecutive() {
-        let ports = allocate_ports(3);
-        assert_eq!(ports.len(), 3);
-        assert_eq!(ports[1], ports[0] + 1);
-        assert_eq!(ports[2], ports[1] + 1);
+    fn test_allocate_port_returns_unique_ports() {
+        let mut ports = HashSet::new();
+        for _ in 0..10 {
+            let port = allocate_port();
+            assert!(ports.insert(port), "duplicate port allocated: {}", port);
+        }
+    }
+
+    #[test]
+    fn test_allocate_ports_returns_correct_count() {
+        let ports = allocate_ports(5);
+        assert_eq!(ports.len(), 5);
+    }
+
+    #[test]
+    fn test_allocate_ports_returns_distinct_ports() {
+        let ports = allocate_ports(5);
+        let unique: HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "allocate_ports returned duplicate ports");
     }
 }

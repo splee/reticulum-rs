@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
+use crate::common::{IntegrationTestContext, TestOutput};
 
 /// Test that Rust rnx identity is persisted between runs.
 #[test]
@@ -259,32 +259,26 @@ fn test_rnx_listen_tcp_server_mode() {
             .stderr(std::process::Stdio::piped()),
     );
 
-    if let Ok((mut child, child_pid)) = result {
+    if let Ok(mut guard) = result {
         // Wait briefly for startup
         std::thread::sleep(Duration::from_secs(3));
 
-        // Check if still running
-        if let Ok(None) = child.try_wait() {
-            eprintln!("Rust rnx started in TCP server mode on port {}", tcp_port);
-        }
-
-        // Clean up
-        let _ = child.kill();
-        unregister_pid(child_pid);
-        let output = child.wait_with_output();
-
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!("{}{}", stdout, stderr);
-
-            eprintln!("rnx output:\n{}", combined);
-
-            // Check for listening indicator
-            if combined.to_lowercase().contains("listen") {
+        // Check if still running — rnx --listen is a long-running server,
+        // so being alive after 3 seconds means it started successfully.
+        match guard.try_wait() {
+            Ok(None) => {
+                eprintln!("Rust rnx started in TCP server mode on port {}", tcp_port);
                 eprintln!("rnx TCP server mode test PASSED");
             }
+            Ok(Some(status)) => {
+                eprintln!("rnx exited early with status: {}", status);
+            }
+            Err(e) => {
+                eprintln!("Error checking rnx status: {}", e);
+            }
         }
+
+        // ChildGuard drop handles killing the long-running server process.
     } else {
         eprintln!("Note: Could not start rnx in TCP server mode");
     }

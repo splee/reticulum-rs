@@ -6,7 +6,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::common::{allocate_ports, unregister_pid, IntegrationTestContext, TestConfig};
+use crate::common::{allocate_ports, IntegrationTestContext, TestConfig};
 
 /// Test 12: TCP MTU compatibility.
 ///
@@ -20,7 +20,7 @@ fn test_tcp_mtu_compatibility() {
     let hub_config = TestConfig::python_hub().expect("Failed to create hub config");
     let hub_port = hub_config.tcp_port;
 
-    let (mut hub_child, hub_pid) = ctx
+    let mut hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -35,7 +35,7 @@ fn test_tcp_mtu_compatibility() {
     // Start Rust node connected to hub
     let node_config = TestConfig::rust_node(hub_port, None).expect("Failed to create node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -47,8 +47,8 @@ fn test_tcp_mtu_compatibility() {
     std::thread::sleep(Duration::from_secs(2));
 
     // Both processes should be running
-    let hub_status = hub_child.try_wait().expect("Failed to check hub status");
-    let node_status = node_child.try_wait().expect("Failed to check node status");
+    let hub_status = hub_guard.try_wait().expect("Failed to check hub status");
+    let node_status = node_guard.try_wait().expect("Failed to check node status");
 
     assert!(
         hub_status.is_none(),
@@ -63,12 +63,6 @@ fn test_tcp_mtu_compatibility() {
 
     // The connection itself establishes that MTU-sized HDLC frames work
     // since the initial handshake includes full announces
-
-    // Clean up
-    let _ = hub_child.kill();
-    let _ = node_child.kill();
-    unregister_pid(hub_pid);
-    unregister_pid(node_pid);
 
     eprintln!("test_tcp_mtu_compatibility passed");
 }
@@ -85,7 +79,7 @@ fn test_tcp_hdlc_interop() {
     let hub_config = TestConfig::python_hub().expect("Failed to create hub config");
     let hub_port = hub_config.tcp_port;
 
-    let (mut hub_child, hub_pid) = ctx
+    let mut hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -100,7 +94,7 @@ fn test_tcp_hdlc_interop() {
     // Start Rust node with HDLC (default)
     let node_config = TestConfig::rust_node(hub_port, None).expect("Failed to create node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -113,8 +107,8 @@ fn test_tcp_hdlc_interop() {
 
     // Both should establish connection with HDLC framing
     // Check that both processes are running (indicating successful connection)
-    let hub_status = hub_child.try_wait().expect("Failed to check hub status");
-    let node_status = node_child.try_wait().expect("Failed to check node status");
+    let hub_status = hub_guard.try_wait().expect("Failed to check hub status");
+    let node_status = node_guard.try_wait().expect("Failed to check node status");
 
     assert!(
         hub_status.is_none(),
@@ -124,12 +118,6 @@ fn test_tcp_hdlc_interop() {
         node_status.is_none(),
         "Node should be running for HDLC interop"
     );
-
-    // Clean up
-    let _ = hub_child.kill();
-    let _ = node_child.kill();
-    unregister_pid(hub_pid);
-    unregister_pid(node_pid);
 
     eprintln!("test_tcp_hdlc_interop passed");
 }
@@ -146,7 +134,7 @@ fn test_tcp_kiss_framing_interop() {
     let hub_config = TestConfig::python_hub_with_kiss().expect("Failed to create KISS hub config");
     let hub_port = hub_config.tcp_port;
 
-    let (mut hub_child, hub_pid) = ctx
+    let mut hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -161,7 +149,7 @@ fn test_tcp_kiss_framing_interop() {
     // Start Rust node with KISS framing
     let node_config = TestConfig::rust_node_with_kiss(hub_port).expect("Failed to create KISS node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -173,8 +161,8 @@ fn test_tcp_kiss_framing_interop() {
     std::thread::sleep(Duration::from_secs(3));
 
     // Check both processes are running
-    let hub_status = hub_child.try_wait().expect("Failed to check hub status");
-    let node_status = node_child.try_wait().expect("Failed to check node status");
+    let hub_status = hub_guard.try_wait().expect("Failed to check hub status");
+    let node_status = node_guard.try_wait().expect("Failed to check node status");
 
     assert!(
         hub_status.is_none(),
@@ -184,12 +172,6 @@ fn test_tcp_kiss_framing_interop() {
         node_status.is_none(),
         "KISS node should be running"
     );
-
-    // Clean up
-    let _ = hub_child.kill();
-    let _ = node_child.kill();
-    unregister_pid(hub_pid);
-    unregister_pid(node_pid);
 
     eprintln!("test_tcp_kiss_framing_interop passed");
 }
@@ -206,7 +188,7 @@ fn test_tcp_keepalive_behavior() {
     let hub_config = TestConfig::python_hub().expect("Failed to create hub config");
     let hub_port = hub_config.tcp_port;
 
-    let (mut hub_child, hub_pid) = ctx
+    let mut hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -221,7 +203,7 @@ fn test_tcp_keepalive_behavior() {
     // Start Rust node
     let node_config = TestConfig::rust_node(hub_port, None).expect("Failed to create node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -238,8 +220,8 @@ fn test_tcp_keepalive_behavior() {
     std::thread::sleep(Duration::from_secs(10));
 
     // Both should still be connected
-    let hub_status = hub_child.try_wait().expect("Failed to check hub status");
-    let node_status = node_child.try_wait().expect("Failed to check node status");
+    let hub_status = hub_guard.try_wait().expect("Failed to check hub status");
+    let node_status = node_guard.try_wait().expect("Failed to check node status");
 
     assert!(
         hub_status.is_none(),
@@ -249,12 +231,6 @@ fn test_tcp_keepalive_behavior() {
         node_status.is_none(),
         "Node should maintain connection after idle period"
     );
-
-    // Clean up
-    let _ = hub_child.kill();
-    let _ = node_child.kill();
-    unregister_pid(hub_pid);
-    unregister_pid(node_pid);
 
     eprintln!("test_tcp_keepalive_behavior passed");
 }
@@ -275,7 +251,7 @@ fn test_udp_interop() {
     // Start Python hub with UDP interface
     let hub_config = TestConfig::udp_hub(hub_port).expect("Failed to create UDP hub config");
 
-    let (mut hub_child, hub_pid) = ctx
+    let mut hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -290,7 +266,7 @@ fn test_udp_interop() {
     // Start Rust node with UDP interface forwarding to hub
     let node_config = TestConfig::udp_node(node_port, hub_port).expect("Failed to create UDP node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -302,17 +278,11 @@ fn test_udp_interop() {
     std::thread::sleep(Duration::from_secs(3));
 
     // Check both processes are running
-    let hub_status = hub_child.try_wait().expect("Failed to check hub status");
-    let node_status = node_child.try_wait().expect("Failed to check node status");
+    let hub_status = hub_guard.try_wait().expect("Failed to check hub status");
+    let node_status = node_guard.try_wait().expect("Failed to check node status");
 
     assert!(hub_status.is_none(), "UDP hub should be running");
     assert!(node_status.is_none(), "UDP node should be running");
-
-    // Clean up
-    let _ = hub_child.kill();
-    let _ = node_child.kill();
-    unregister_pid(hub_pid);
-    unregister_pid(node_pid);
 
     eprintln!("test_udp_interop passed");
 }

@@ -13,13 +13,44 @@ pub use config::TestConfig;
 pub use output::TestOutput;
 pub use ports::{allocate_port, allocate_ports};
 pub use process::{
-    register_pid, spawn_tracked, unregister_pid, ManagedProcess, ProcessError, ProcessGroup,
+    cleanup_stale_processes, register_pid, spawn_tracked, unregister_pid, ChildGuard,
+    ManagedProcess, ProcessError, ProcessGroup,
 };
 pub use venv::{PythonVenv, VenvError};
 
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Ensures stale process cleanup runs once per test process.
+static STALE_CLEANUP: OnceLock<()> = OnceLock::new();
+
+/// Poll until a TCP port on 127.0.0.1 accepts connections, or timeout.
+///
+/// Used to wait for a daemon's TCP listener to become ready instead of
+/// relying on blind `thread::sleep()` which is unreliable under CPU contention
+/// from parallel test execution.
+fn wait_for_tcp_port(port: u16, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let addr = format!("127.0.0.1:{}", port);
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(
+            &addr.parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(format!(
+        "port {} did not become ready within {:?}",
+        port, timeout
+    ))
+}
 
 /// Error type for integration test operations.
 #[derive(Debug)]
@@ -109,7 +140,14 @@ impl IntegrationTestContext {
     /// Create a new test context.
     ///
     /// This will initialize the Python venv if it doesn't exist.
+    /// On first call per process, cleans up any stale test processes from
+    /// previous runs.
     pub fn new() -> Result<Self, TestError> {
+        // Clean up stale processes from previous test runs (once per process)
+        STALE_CLEANUP.get_or_init(|| {
+            cleanup_stale_processes();
+        });
+
         let venv = PythonVenv::get_or_create()?;
 
         Ok(Self {
@@ -132,9 +170,10 @@ impl IntegrationTestContext {
 
         let process = ManagedProcess::spawn("python-hub", &mut cmd)?;
 
-        // Wait for the hub to start listening
-        // We check for the TCP interface to be ready by looking for log output
-        std::thread::sleep(Duration::from_secs(2));
+        // Wait for the hub's TCP port to accept connections.
+        // A blind sleep is unreliable under parallel execution / CPU contention.
+        wait_for_tcp_port(port, Duration::from_secs(15))
+            .map_err(|e| TestError(format!("Python hub failed to start: {}", e)))?;
 
         Ok(PythonHub {
             process,
@@ -153,7 +192,8 @@ impl IntegrationTestContext {
 
         let process = ManagedProcess::spawn("rust-node", &mut cmd)?;
 
-        // Wait for connection
+        // Wait for the node's TCP port to accept connections (if it has a server).
+        // Fall back to a sleep if there's no own TCP port to probe.
         std::thread::sleep(Duration::from_secs(2));
 
         Ok(RustNode {
@@ -280,14 +320,15 @@ impl IntegrationTestContext {
 
     /// Spawn a raw command and register it for cleanup.
     ///
-    /// Use this when you need direct access to the Child process.
-    /// The process is automatically registered in the global cleanup registry.
+    /// Returns a `ChildGuard` that will automatically kill the process and
+    /// unregister its PID on drop. This is panic-safe — the process will be
+    /// cleaned up even if the test panics.
     pub fn spawn_child(
         &self,
         cmd: &mut Command,
-    ) -> Result<(std::process::Child, u32), TestError> {
-        let (child, pid) = spawn_tracked(cmd)?;
-        Ok((child, pid))
+    ) -> Result<ChildGuard, TestError> {
+        let guard = spawn_tracked(cmd)?;
+        Ok(guard)
     }
 
     /// Run a command to completion and return its output.
@@ -298,9 +339,11 @@ impl IntegrationTestContext {
         // Configure pipes to capture output (required for wait_with_output)
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        let (child, pid) = spawn_tracked(cmd)?;
+        let mut guard = spawn_tracked(cmd)?;
+        // Take ownership of the child for wait_with_output (consumes Child).
+        // The guard's drop will still unregister the PID.
+        let child = guard.take_child().expect("child already consumed");
         let output = child.wait_with_output()?;
-        unregister_pid(pid);
         Ok(output)
     }
 }

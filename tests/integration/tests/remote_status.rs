@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
+use crate::common::{IntegrationTestContext, TestOutput};
 
 /// Test that rnstatus --help works.
 #[test]
@@ -223,7 +223,7 @@ enable_remote_management = true
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap(), "-v"])
@@ -236,8 +236,7 @@ enable_remote_management = true
     std::thread::sleep(Duration::from_secs(5));
 
     // Check if daemon is still running
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: rnsd exited early (remote management may not be implemented)");
         return;
     }
@@ -249,9 +248,8 @@ enable_remote_management = true
 
         // Read stderr to check for remote management output
         // Note: This is a best-effort check since we're reading piped stderr
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let output = rnsd.wait_with_output();
+        rnsd_guard.kill();
+        let output = rnsd_guard.take_child().unwrap().wait_with_output();
 
         if let Ok(output) = output {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -268,9 +266,7 @@ enable_remote_management = true
             }
         }
     } else {
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let _ = rnsd.wait();
+        rnsd_guard.kill();
         eprintln!("Note: Daemon identity not created at expected location");
     }
 

@@ -6,11 +6,11 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use crate::common::{unregister_pid, IntegrationTestContext};
+use crate::common::IntegrationTestContext;
 
 /// Helper to run the Rust crypto test binary and get output
 fn run_rust_crypto(ctx: &IntegrationTestContext, input: &str) -> Result<String, String> {
-    let (mut child, pid) = ctx
+    let mut guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("test_crypto_primitives"))
                 .stdin(Stdio::piped())
@@ -20,16 +20,17 @@ fn run_rust_crypto(ctx: &IntegrationTestContext, input: &str) -> Result<String, 
         .map_err(|e| format!("Failed to spawn Rust crypto: {}", e))?;
 
     {
-        let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
+        let stdin = guard.child_mut().stdin.as_mut().ok_or("Failed to get stdin")?;
         stdin
             .write_all(input.as_bytes())
             .map_err(|e| format!("Failed to write to stdin: {}", e))?;
     }
 
-    let output = child
+    let output = guard
+        .take_child()
+        .unwrap()
         .wait_with_output()
         .map_err(|e| format!("Failed to get output: {}", e))?;
-    unregister_pid(pid);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -43,7 +44,7 @@ fn run_rust_crypto(ctx: &IntegrationTestContext, input: &str) -> Result<String, 
 
 /// Helper to run the Python crypto test script and get output
 fn run_python_crypto(ctx: &IntegrationTestContext, input: &str) -> Result<String, String> {
-    let (mut child, pid) = ctx
+    let mut guard = ctx
         .spawn_child(
             ctx.venv()
                 .python_command()
@@ -55,16 +56,17 @@ fn run_python_crypto(ctx: &IntegrationTestContext, input: &str) -> Result<String
         .map_err(|e| format!("Failed to spawn Python crypto: {}", e))?;
 
     {
-        let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
+        let stdin = guard.child_mut().stdin.as_mut().ok_or("Failed to get stdin")?;
         stdin
             .write_all(input.as_bytes())
             .map_err(|e| format!("Failed to write to stdin: {}", e))?;
     }
 
-    let output = child
+    let output = guard
+        .take_child()
+        .unwrap()
         .wait_with_output()
         .map_err(|e| format!("Failed to get output: {}", e))?;
-    unregister_pid(pid);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext, TestOutput};
+use crate::common::{IntegrationTestContext, TestOutput};
 
 /// Test that Rust destination announces via shared instance are received by Python.
 ///
@@ -236,7 +236,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -249,8 +249,7 @@ shared_instance_port = {}
     std::thread::sleep(Duration::from_secs(5));
 
     // Check if daemon is still running
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -271,10 +270,8 @@ shared_instance_port = {}
 
     let socket_exists = socket_path.exists() || rpc_socket_path.exists();
 
-    // Clean up
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up (ChildGuard handles kill + unregister on drop)
+    rnsd_guard.kill();
 
     if socket_exists {
         eprintln!("Unix socket created successfully!");
@@ -336,7 +333,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start Rust rnsd with shared instance (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -349,8 +346,7 @@ shared_instance_port = {}
     std::thread::sleep(Duration::from_secs(5));
 
     // Check if rnsd is running
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -413,10 +409,8 @@ shared_instance_port = {}
         eprintln!("Note: test_destination with --shared flag may not be supported yet");
     }
 
-    // Clean up
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up (ChildGuard handles kill + unregister on drop)
+    rnsd_guard.kill();
 
     eprintln!("Shared instance announce forwarding test completed");
 }
@@ -462,7 +456,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start Rust rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -474,8 +468,7 @@ shared_instance_port = {}
     // Wait for rnsd to start
     std::thread::sleep(Duration::from_secs(5));
 
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -542,10 +535,8 @@ except Exception as e:
 
     let python_output = ctx.run_to_completion(&mut python_cmd);
 
-    // Clean up rnsd
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up rnsd (ChildGuard handles kill + unregister on drop)
+    rnsd_guard.kill();
 
     if let Ok(output) = python_output {
         let stdout = String::from_utf8_lossy(&output.stdout);

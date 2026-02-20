@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext};
+use crate::common::IntegrationTestContext;
 
 /// Test that Rust rnsd can start and create a daemon identity.
 #[test]
@@ -42,14 +42,12 @@ share_instance = false
             .stderr(std::process::Stdio::piped()),
     );
 
-    if let Ok((mut child, pid)) = rnsd {
+    if let Ok(mut guard) = rnsd {
         // Wait briefly for identity creation
         std::thread::sleep(Duration::from_secs(3));
 
-        // Kill the daemon
-        let _ = child.kill();
-        unregister_pid(pid);
-        let _ = child.wait();
+        // Kill the daemon (ChildGuard handles cleanup on drop)
+        let _ = guard.kill();
 
         // Check if identity was created
         let identity_file = identity_dir.join("daemon_identity");
@@ -115,7 +113,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -129,7 +127,7 @@ shared_instance_port = {}
 
     // Verify daemon is still running
     assert!(
-        rnsd.try_wait().unwrap().is_none(),
+        rnsd_guard.try_wait().unwrap().is_none(),
         "rnsd should still be running"
     );
 
@@ -151,10 +149,8 @@ shared_instance_port = {}
     let rpc_socket = socket_dir.join("default_rpc.sock");
 
     if !rpc_socket.exists() {
-        // Clean up and skip if socket not found
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let _ = rnsd.wait();
+        // Clean up and skip if socket not found (ChildGuard handles cleanup on drop)
+        let _ = rnsd_guard.kill();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
     }
@@ -180,10 +176,8 @@ shared_instance_port = {}
 
     eprintln!("Python RPC client output:\n{}", combined);
 
-    // Clean up daemon
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up daemon (ChildGuard handles cleanup on drop)
+    let _ = rnsd_guard.kill();
 
     // Assert successful connection and authentication
     assert!(
@@ -234,7 +228,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -248,7 +242,7 @@ shared_instance_port = {}
 
     // Verify daemon is still running
     assert!(
-        rnsd.try_wait().unwrap().is_none(),
+        rnsd_guard.try_wait().unwrap().is_none(),
         "rnsd should still be running"
     );
 
@@ -260,9 +254,8 @@ shared_instance_port = {}
     let rpc_socket = socket_dir.join("default_rpc.sock");
 
     if !rpc_socket.exists() {
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let _ = rnsd.wait();
+        // ChildGuard handles cleanup on drop
+        let _ = rnsd_guard.kill();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
     }
@@ -287,10 +280,8 @@ shared_instance_port = {}
 
     eprintln!("Python RPC client output:\n{}", combined);
 
-    // Clean up daemon
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up daemon (ChildGuard handles cleanup on drop)
+    let _ = rnsd_guard.kill();
 
     // Assert get_path_table test passed
     assert!(
@@ -334,7 +325,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -347,8 +338,8 @@ shared_instance_port = {}
     std::thread::sleep(Duration::from_secs(5));
 
     // Verify daemon is still running
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
+        // ChildGuard handles cleanup on drop
         eprintln!("Note: rnsd exited early, skipping test");
         return;
     }
@@ -357,9 +348,8 @@ shared_instance_port = {}
     let rpc_socket = socket_dir.join("default_rpc.sock");
 
     if !rpc_socket.exists() {
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let _ = rnsd.wait();
+        // ChildGuard handles cleanup on drop
+        let _ = rnsd_guard.kill();
         eprintln!("Note: RPC socket not found, skipping test");
         return;
     }
@@ -389,10 +379,8 @@ shared_instance_port = {}
 
     eprintln!("Python RPC client output with wrong key:\n{}", combined);
 
-    // Clean up daemon
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up daemon (ChildGuard handles cleanup on drop)
+    let _ = rnsd_guard.kill();
 
     // Should NOT contain "Connected and authenticated" - it should fail
     // The authentication should be rejected
@@ -443,7 +431,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -457,7 +445,7 @@ shared_instance_port = {}
 
     // Verify daemon is still running
     assert!(
-        rnsd.try_wait().unwrap().is_none(),
+        rnsd_guard.try_wait().unwrap().is_none(),
         "rnsd should still be running"
     );
 
@@ -474,9 +462,8 @@ shared_instance_port = {}
     let rpc_socket = socket_dir.join("default_rpc.sock");
 
     if !rpc_socket.exists() {
-        let _ = rnsd.kill();
-        unregister_pid(rnsd_pid);
-        let _ = rnsd.wait();
+        // ChildGuard handles cleanup on drop
+        let _ = rnsd_guard.kill();
         eprintln!("Note: RPC socket not found at {:?}", rpc_socket);
         // List what's in socket dir
         if let Ok(entries) = std::fs::read_dir(&socket_dir) {
@@ -510,10 +497,8 @@ shared_instance_port = {}
 
     eprintln!("Python RPC client output:\n{}", combined);
 
-    // Clean up daemon
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    // Clean up daemon (ChildGuard handles cleanup on drop)
+    let _ = rnsd_guard.kill();
 
     // Assert all tests passed
     assert!(

@@ -264,8 +264,15 @@ STATUS=RUNNING
 fn test_connection_refused_handled_gracefully() {
     let ctx = IntegrationTestContext::new().expect("Failed to create test context");
 
-    // Use a port that nothing is listening on (high port unlikely to be in use)
-    let nonexistent_port = 19999u16;
+    // Allocate a port from the OS, then immediately close the listener so
+    // nothing is listening — guarantees no collision with other tests.
+    let nonexistent_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    };
 
     // Start a Rust destination that tries to connect to non-existent server
     let rust_dest = ctx

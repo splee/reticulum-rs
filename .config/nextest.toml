@@ -1,11 +1,14 @@
 # nextest configuration
-# Integration tests must run serially because port allocation uses a
-# process-local atomic counter (starting at 20000). Since nextest spawns
-# each test as a separate process, parallel tests collide on the same ports.
+#
+# Integration tests use OS ephemeral port allocation (bind to port 0) and
+# ChildGuard RAII wrappers for panic-safe process cleanup, so they can
+# safely run in parallel across nextest subprocesses.
 
-[test-groups]
-serial-integration = { max-threads = 1 }
+# Integration tests that spawn Python/Rust processes are CPU-heavy.
+# Limit concurrency to avoid timeouts from resource contention.
+[test-groups.process-heavy]
+max-threads = 4
 
 [[profile.default.overrides]]
-filter = 'binary(integration)'
-test-group = 'serial-integration'
+filter = 'test(~tests::)'
+test-group = "process-heavy"

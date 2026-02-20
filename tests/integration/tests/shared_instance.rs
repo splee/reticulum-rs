@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext};
+use crate::common::IntegrationTestContext;
 
 /// Test that a second rnsd process does not destroy the first daemon's socket.
 ///
@@ -55,7 +55,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start first rnsd (tracked for cleanup)
-    let (mut rnsd1, rnsd1_pid) = ctx
+    let mut rnsd1_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -68,8 +68,7 @@ shared_instance_port = {}
     std::thread::sleep(Duration::from_secs(3));
 
     // Check if rnsd1 is still running
-    if rnsd1.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd1_pid);
+    if rnsd1_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: First rnsd exited early");
         return;
     }
@@ -92,14 +91,17 @@ shared_instance_port = {}
             .stderr(std::process::Stdio::piped()),
     );
 
-    if let Ok((mut rnsd2, rnsd2_pid)) = rnsd2_result {
+    if let Ok(mut rnsd2_guard) = rnsd2_result {
         // Give it time to attempt binding
         std::thread::sleep(Duration::from_secs(2));
 
         // Collect output
-        let _ = rnsd2.kill();
-        unregister_pid(rnsd2_pid);
-        let output = rnsd2.wait_with_output().expect("Failed to get rnsd2 output");
+        rnsd2_guard.kill();
+        let output = rnsd2_guard
+            .take_child()
+            .unwrap()
+            .wait_with_output()
+            .expect("Failed to get rnsd2 output");
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("Second rnsd stderr: {}", stderr);
 
@@ -126,14 +128,12 @@ shared_instance_port = {}
 
     // Verify first daemon is still running
     assert!(
-        rnsd1.try_wait().unwrap().is_none(),
+        rnsd1_guard.try_wait().unwrap().is_none(),
         "First rnsd should still be running"
     );
 
     // Clean up
-    let _ = rnsd1.kill();
-    unregister_pid(rnsd1_pid);
-    let _ = rnsd1.wait();
+    rnsd1_guard.kill();
 
     eprintln!("Test passed: Second process did not destroy first daemon's socket");
 }
@@ -182,7 +182,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Try to start rnsd - it should fail or at least not delete the socket (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -195,9 +195,12 @@ shared_instance_port = {}
     std::thread::sleep(Duration::from_secs(2));
 
     // Collect output
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let output = rnsd.wait_with_output().expect("Failed to get rnsd output");
+    rnsd_guard.kill();
+    let output = rnsd_guard
+        .take_child()
+        .unwrap()
+        .wait_with_output()
+        .expect("Failed to get rnsd output");
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("rnsd stderr: {}", stderr);
 
@@ -262,7 +265,7 @@ shared_instance_port = {}
     std::fs::write(&config_file, &config_content).expect("Failed to write config");
 
     // Start rnsd (tracked for cleanup)
-    let (mut rnsd, rnsd_pid) = ctx
+    let mut rnsd_guard = ctx
         .spawn_child(
             std::process::Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", config_dir.to_str().unwrap()])
@@ -274,8 +277,7 @@ shared_instance_port = {}
     // Wait for daemon to start
     std::thread::sleep(Duration::from_secs(3));
 
-    if rnsd.try_wait().unwrap().is_some() {
-        unregister_pid(rnsd_pid);
+    if rnsd_guard.try_wait().unwrap().is_some() {
         eprintln!("Note: rnsd exited early");
         return;
     }
@@ -310,14 +312,12 @@ shared_instance_port = {}
 
     // Verify daemon is still running
     assert!(
-        rnsd.try_wait().unwrap().is_none(),
+        rnsd_guard.try_wait().unwrap().is_none(),
         "rnsd should still be running after rnstatus"
     );
 
     // Clean up
-    let _ = rnsd.kill();
-    unregister_pid(rnsd_pid);
-    let _ = rnsd.wait();
+    rnsd_guard.kill();
 
     eprintln!("Test passed: rnstatus did not destroy daemon socket");
 }

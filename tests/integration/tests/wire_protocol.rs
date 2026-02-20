@@ -7,11 +7,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::common::{unregister_pid, IntegrationTestContext, TestConfig};
+use crate::common::{IntegrationTestContext, TestConfig};
 
 /// Helper to run the Rust packet codec and get output
 fn run_rust_codec(ctx: &IntegrationTestContext, input: &str) -> Result<String, String> {
-    let (mut child, pid) = ctx
+    let mut guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("test_packet_codec"))
                 .stdin(Stdio::piped())
@@ -21,16 +21,17 @@ fn run_rust_codec(ctx: &IntegrationTestContext, input: &str) -> Result<String, S
         .map_err(|e| format!("Failed to spawn Rust codec: {}", e))?;
 
     {
-        let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
+        let stdin = guard.child_mut().stdin.as_mut().ok_or("Failed to get stdin")?;
         stdin
             .write_all(input.as_bytes())
             .map_err(|e| format!("Failed to write to stdin: {}", e))?;
     }
 
-    let output = child
+    let output = guard
+        .take_child()
+        .unwrap()
         .wait_with_output()
         .map_err(|e| format!("Failed to get output: {}", e))?;
-    unregister_pid(pid);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -44,7 +45,7 @@ fn run_rust_codec(ctx: &IntegrationTestContext, input: &str) -> Result<String, S
 
 /// Helper to run the Python packet codec and get output
 fn run_python_codec(ctx: &IntegrationTestContext, input: &str) -> Result<String, String> {
-    let (mut child, pid) = ctx
+    let mut guard = ctx
         .spawn_child(
             ctx.venv()
                 .python_command()
@@ -56,16 +57,17 @@ fn run_python_codec(ctx: &IntegrationTestContext, input: &str) -> Result<String,
         .map_err(|e| format!("Failed to spawn Python codec: {}", e))?;
 
     {
-        let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
+        let stdin = guard.child_mut().stdin.as_mut().ok_or("Failed to get stdin")?;
         stdin
             .write_all(input.as_bytes())
             .map_err(|e| format!("Failed to write to stdin: {}", e))?;
     }
 
-    let output = child
+    let output = guard
+        .take_child()
+        .unwrap()
         .wait_with_output()
         .map_err(|e| format!("Failed to get output: {}", e))?;
-    unregister_pid(pid);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -327,7 +329,7 @@ fn test_stream_eof_handling() {
     let hub_config = TestConfig::python_hub().expect("Failed to create hub config");
     let hub_port = hub_config.tcp_port;
 
-    let (hub_child, hub_pid) = ctx
+    let hub_guard = ctx
         .spawn_child(
             ctx.venv()
                 .rnsd()
@@ -343,7 +345,7 @@ fn test_stream_eof_handling() {
     // Start a Rust node connected to the hub
     let node_config = TestConfig::rust_node(hub_port, None).expect("Failed to create node config");
 
-    let (mut node_child, node_pid) = ctx
+    let mut node_guard = ctx
         .spawn_child(
             Command::new(ctx.rust_binary("rnsd"))
                 .args(["--config", node_config.config_dir().to_str().unwrap()])
@@ -356,15 +358,14 @@ fn test_stream_eof_handling() {
     std::thread::sleep(Duration::from_secs(2));
 
     // Now kill the hub to trigger EOF
-    drop(hub_child); // Drops the child process handle, sending SIGKILL
-    unregister_pid(hub_pid);
+    drop(hub_guard); // Drops the ChildGuard, killing the process
 
     // Give the Rust node time to detect the disconnection
     std::thread::sleep(Duration::from_secs(3));
 
     // The Rust node should still be running (handling the disconnection gracefully)
     // and attempting reconnection
-    let status = node_child.try_wait().expect("Failed to check node status");
+    let status = node_guard.try_wait().expect("Failed to check node status");
 
     // If status is None, the process is still running (expected behavior)
     // If it exited with code 0, that's also acceptable (graceful shutdown)
@@ -376,9 +377,7 @@ fn test_stream_eof_handling() {
         }
     }
 
-    // Clean up
-    let _ = node_child.kill();
-    unregister_pid(node_pid);
+    // Clean up: node_guard's Drop impl will kill the process
 
     eprintln!("test_stream_eof_handling passed");
 }
