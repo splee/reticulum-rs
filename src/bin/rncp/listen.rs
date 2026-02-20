@@ -612,7 +612,7 @@ async fn handle_fetch_request(
     };
 
     let mut rng = OsRng;
-    let resource = match Resource::new(&mut rng, &file_data, resource_config, Some(&metadata)) {
+    let resource = match Resource::new(&mut rng, &file_data, resource_config, Some(&metadata), None) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to create resource: {:?}", e);
@@ -699,17 +699,19 @@ async fn handle_outgoing_resource_request(
     // Find a matching resource for this link
     let mut found_resource_hash: Option<[u8; 16]> = None;
     let mut parts_to_send: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut hashmap_update: Option<Vec<u8>> = None;
 
     for (hash, tracked) in resources.iter_mut() {
         if tracked.link_id == *link_id {
             match tracked.resource.handle_request(payload) {
-                Ok((_wants_more_hashmap, part_indices)) => {
+                Ok(result) => {
                     // Collect parts to send
-                    for &idx in &part_indices {
+                    for &idx in &result.parts_to_send {
                         if let Some(data) = tracked.resource.get_part_data(idx) {
                             parts_to_send.push((idx, data.to_vec()));
                         }
                     }
+                    hashmap_update = result.hashmap_update;
                     found_resource_hash = Some(*hash);
                     break;
                 }
@@ -721,6 +723,12 @@ async fn handle_outgoing_resource_request(
     }
 
     drop(resources);
+
+    // Send hashmap update if needed
+    if let Some(ref hmu_data) = hashmap_update {
+        log::info!("Sending hashmap update ({} bytes)", hmu_data.len());
+        transport.send_resource_hashmap_update(link_id, hmu_data).await;
+    }
 
     // Send the parts
     if let Some(link_mutex) = transport.find_in_link(link_id).await {

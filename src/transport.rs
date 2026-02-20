@@ -1035,6 +1035,31 @@ impl Transport {
         self.handler.lock().await.path_manager.hops_to(destination)
     }
 
+    /// Get the number of hops to a destination, or PATHFINDER_M (128) if unknown.
+    pub async fn hops_to_or_max(&self, destination: &AddressHash) -> u8 {
+        self.handler.lock().await.path_manager.hops_to_or_max(destination)
+    }
+
+    /// Mark a destination's path as unresponsive.
+    pub async fn mark_path_unresponsive(&self, dest: &AddressHash) -> bool {
+        self.handler.lock().await.path_manager.mark_path_unresponsive(dest)
+    }
+
+    /// Mark a destination's path as responsive.
+    pub async fn mark_path_responsive(&self, dest: &AddressHash) -> bool {
+        self.handler.lock().await.path_manager.mark_path_responsive(dest)
+    }
+
+    /// Mark a destination's path state as unknown.
+    pub async fn mark_path_unknown_state(&self, dest: &AddressHash) -> bool {
+        self.handler.lock().await.path_manager.mark_path_unknown_state(dest)
+    }
+
+    /// Check if a destination's path is in unresponsive state.
+    pub async fn path_is_unresponsive(&self, dest: &AddressHash) -> bool {
+        self.handler.lock().await.path_manager.path_is_unresponsive(dest)
+    }
+
     /// Get the next hop for a destination
     pub async fn get_next_hop(&self, destination: &AddressHash) -> Option<AddressHash> {
         self.handler.lock().await.path_manager.next_hop(destination)
@@ -1207,6 +1232,11 @@ impl Transport {
     /// If `on_interface` is Some, the request is sent only on that interface.
     /// Otherwise, it's broadcast on all interfaces.
     ///
+    /// If `tag` is Some, uses the provided request tag; otherwise generates a random one.
+    ///
+    /// Unlike some implementations, this always sends the request even if a path
+    /// already exists, allowing callers to discover fresher routes.
+    ///
     /// Returns true if the request was sent, false if rate-limited.
     pub async fn request_path(
         &self,
@@ -1214,11 +1244,6 @@ impl Transport {
         on_interface: Option<AddressHash>,
     ) -> bool {
         let handler = self.handler.lock().await;
-
-        // Check if we already have a path
-        if handler.path_manager.has_path(destination) {
-            return true;
-        }
 
         // Build the path request packet
         let transport_id = if handler.config.retransmit {
@@ -1228,7 +1253,7 @@ impl Transport {
         };
 
         let (packet, _tag) =
-            PathRequestManager::create_request_packet(destination, transport_id.as_ref());
+            PathRequestManager::create_request_packet(destination, transport_id.as_ref(), None);
 
         log::debug!(
             "tp({}): sending path request for {}",
@@ -1670,7 +1695,7 @@ async fn process_path_request<'a>(
         // Create a new path request packet to forward
         let transport_id = Some(*handler.config.identity.address_hash());
         let (forward_packet, _) =
-            PathRequestManager::create_request_packet(&destination_hash, transport_id.as_ref());
+            PathRequestManager::create_request_packet(&destination_hash, transport_id.as_ref(), None);
 
         // Send on all interfaces except the one that sent us the request
         handler
@@ -1927,6 +1952,9 @@ async fn handle_announce<'a>(
             if app_data.is_empty() { None } else { Some(app_data) },
         );
 
+        // Capture the announced identity before wrapping in Arc<Mutex<>>
+        let announced_identity = destination.identity;
+
         let destination = Arc::new(Mutex::new(destination));
 
         // Get hop count for logging
@@ -1968,12 +1996,44 @@ async fn handle_announce<'a>(
                 .map(|metadata| metadata.mode)
                 .unwrap_or(InterfaceMode::Full);
 
-            handler.path_manager.handle_announce(
+            let path_updated = handler.path_manager.handle_announce(
                 packet,
                 packet.transport,
                 iface,
                 interface_mode,
             );
+
+            // Notify announce handlers if the path was updated
+            if path_updated {
+                use crate::destination::NAME_HASH_LENGTH;
+                use crate::identity::PUBLIC_KEY_LENGTH;
+                use announce_handler::AnnounceData;
+
+                let announce_data = AnnounceData {
+                    destination_hash: packet.destination,
+                    announced_identity,
+                    app_data: if app_data.is_empty() {
+                        None
+                    } else {
+                        Some(PacketDataBuffer::new_from_slice(app_data))
+                    },
+                    announce_packet_hash: packet.hash(),
+                    is_path_response: packet.context == PacketContext::PathResponse,
+                };
+
+                // Extract name hash from packet data (10 bytes at offset 64)
+                let name_hash = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH {
+                    let mut nh = Hash::new_empty();
+                    nh.as_slice_mut()[..NAME_HASH_LENGTH].copy_from_slice(
+                        &packet.data.as_slice()[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH]
+                    );
+                    Some(nh)
+                } else {
+                    None
+                };
+
+                handler.announce_handler_registry.notify_spawned(announce_data, name_hash.as_ref());
+            }
         }
 
         log::debug!(
@@ -2173,11 +2233,18 @@ async fn handle_link_request<'a>(
 async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     let mut links_to_remove: Vec<AddressHash> = Vec::new();
 
-    // Clean up input links
+    // Clean up input links — collect dest hashes of timed-out links
+    let mut timed_out_input_destinations: Vec<AddressHash> = Vec::new();
+
+    let mut linkclose_packets: Vec<Packet> = Vec::new();
+
     for (addr, link_arc) in handler.link_manager.in_links() {
         let mut link = link_arc.lock().await;
         if link.elapsed() > INTERVAL_INPUT_LINK_CLEANUP {
-            link.close();
+            timed_out_input_destinations.push(link.destination().address_hash);
+            if let Some(packet) = link.close() {
+                linkclose_packets.push(packet);
+            }
             links_to_remove.push(*addr);
         }
     }
@@ -2186,18 +2253,50 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         handler.link_manager.remove_in_link(addr);
     }
 
+    // Mark paths as unresponsive for timed-out input link destinations
+    for dest_hash in &timed_out_input_destinations {
+        if handler.path_manager.mark_path_unresponsive(dest_hash) {
+            log::debug!(
+                "Marked path to {} as unresponsive due to timed-out input link",
+                dest_hash
+            );
+        }
+    }
+
     links_to_remove.clear();
+
+    // Collect destination hashes of closed output links to mark paths unresponsive
+    let mut closed_destinations: Vec<AddressHash> = Vec::new();
 
     for (addr, link_arc) in handler.link_manager.out_links() {
         let mut link = link_arc.lock().await;
         if link.status() == LinkStatus::Closed {
-            link.close();
+            closed_destinations.push(link.destination().address_hash);
+            if let Some(packet) = link.close() {
+                linkclose_packets.push(packet);
+            }
             links_to_remove.push(*addr);
         }
     }
 
     for addr in &links_to_remove {
         handler.link_manager.remove_out_link(addr);
+    }
+
+    // Mark paths as unresponsive for destinations whose links were closed/timed-out.
+    // This enables the multi-factor path update logic to accept alternative paths.
+    for dest_hash in &closed_destinations {
+        if handler.path_manager.mark_path_unresponsive(dest_hash) {
+            log::debug!(
+                "Marked path to {} as unresponsive due to closed link",
+                dest_hash
+            );
+        }
+    }
+
+    // Send LINKCLOSE packets collected during link cleanup
+    for packet in linkclose_packets {
+        handler.send_packet(packet).await;
     }
 
     for (_, link_arc) in handler.link_manager.out_links() {

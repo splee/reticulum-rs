@@ -17,6 +17,24 @@ pub const RETICULUM_MDU: usize = RETICULUM_MTU - HEADER_MAX_SIZE - IFAC_MIN_SIZE
 pub const AES_BLOCK_SIZE: usize = 16;
 pub const TOKEN_OVERHEAD: usize = 48; // 16-byte IV + 32-byte HMAC
 
+/// Identity key size in bits (Python Identity.KEYSIZE = 256*2 = 512).
+pub const IDENTITY_KEYSIZE: usize = 512;
+
+/// Plain MDU alias — maximum plaintext data for unencrypted single packets.
+pub const PLAIN_MDU: usize = RETICULUM_MDU;
+
+/// Maximum data unit for encrypted single packets (Python Packet.ENCRYPTED_MDU).
+///
+/// Formula from Packet.py:106:
+///   floor((MDU - TOKEN_OVERHEAD - KEYSIZE/16) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE - 1
+///   = floor((464 - 48 - 32) / 16) * 16 - 1 = 383
+pub const ENCRYPTED_MDU: usize =
+    ((RETICULUM_MDU - TOKEN_OVERHEAD - IDENTITY_KEYSIZE / 16) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE
+        - 1;
+
+// Compile-time assertion that ENCRYPTED_MDU matches the expected value.
+const _: () = assert!(ENCRYPTED_MDU == 383);
+
 // Packet payload buffer size (plain MDU)
 pub const PACKET_MDU: usize = RETICULUM_MDU;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
@@ -825,6 +843,32 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Tests for MDU constants.
+    mod mdu_constants {
+        use super::*;
+
+        #[test]
+        fn test_encrypted_mdu_value() {
+            // Python: floor((MDU - TOKEN_OVERHEAD - KEYSIZE/16) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE - 1
+            assert_eq!(ENCRYPTED_MDU, 383);
+        }
+
+        #[test]
+        fn test_plain_mdu_equals_reticulum_mdu() {
+            assert_eq!(PLAIN_MDU, RETICULUM_MDU);
+        }
+
+        #[test]
+        fn test_encrypted_mdu_less_than_plain() {
+            assert!(ENCRYPTED_MDU < PLAIN_MDU);
+        }
+
+        #[test]
+        fn test_identity_keysize() {
+            assert_eq!(IDENTITY_KEYSIZE, 512);
         }
     }
 }

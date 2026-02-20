@@ -225,6 +225,35 @@ impl AnnounceHandlerRegistry {
         }
     }
 
+    /// Notify all matching handlers of an announce, spawning each callback
+    /// in a separate tokio task to prevent slow handlers from blocking packet processing.
+    pub fn notify_spawned(&self, data: AnnounceData, name_hash: Option<&Hash>) {
+        for handler in &self.handlers {
+            // Skip path responses unless handler is configured to receive them
+            if data.is_path_response && !handler.config.receive_path_responses {
+                continue;
+            }
+
+            // Check aspect filter
+            if let Some(ref filter) = handler.config.aspect_filter {
+                if let Some(nh) = name_hash {
+                    if filter.as_name_hash_slice() != nh.as_slice() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            // Clone the data and callback for the spawned task
+            let data = data.clone();
+            let callback = handler.callback.clone();
+            tokio::spawn(async move {
+                callback.received_announce(data);
+            });
+        }
+    }
+
     /// Get the number of registered handlers.
     pub fn len(&self) -> usize {
         self.handlers.len()

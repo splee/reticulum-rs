@@ -20,6 +20,9 @@ use crate::packet::{
 /// Default path request timeout (matches Python's PATH_REQUEST_TIMEOUT = 15s)
 pub const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Minimum interval in seconds for automated path requests (matches Python's PATH_REQUEST_MI = 20)
+pub const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
+
 /// Default interval between path request retries
 pub const PATH_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -248,12 +251,14 @@ impl PathRequestManager {
     /// - With transport: destination_hash(16) + transport_id(16) + tag(16) = 48 bytes
     /// - Without transport: destination_hash(16) + tag(16) = 32 bytes
     ///
-    /// Returns the packet data buffer and the generated request tag.
+    /// If `tag` is provided, uses it; otherwise generates a random one.
+    /// Returns the packet data buffer and the request tag used.
     pub fn build_request_data(
         destination: &AddressHash,
         transport_identity: Option<&AddressHash>,
+        tag: Option<[u8; REQUEST_TAG_LENGTH]>,
     ) -> (PacketDataBuffer, [u8; REQUEST_TAG_LENGTH]) {
-        let request_tag = Self::generate_request_tag(OsRng);
+        let request_tag = tag.unwrap_or_else(|| Self::generate_request_tag(OsRng));
 
         let mut data = PacketDataBuffer::new();
         // Write destination hash (first 16 bytes of the 32-byte hash)
@@ -275,13 +280,15 @@ impl PathRequestManager {
     /// The packet is a broadcast DATA packet to the PLAIN destination
     /// "rnstransport.path.request".
     ///
-    /// Returns the packet and the generated request tag.
+    /// If `tag` is provided, uses it; otherwise generates a random one.
+    /// Returns the packet and the request tag used.
     pub fn create_request_packet(
         destination: &AddressHash,
         transport_identity: Option<&AddressHash>,
+        tag: Option<[u8; REQUEST_TAG_LENGTH]>,
     ) -> (Packet, [u8; REQUEST_TAG_LENGTH]) {
         let path_request_dest = Self::path_request_destination_hash();
-        let (data, tag) = Self::build_request_data(destination, transport_identity);
+        let (data, tag) = Self::build_request_data(destination, transport_identity, tag);
 
         let packet = Packet {
             header: Header {
@@ -644,7 +651,7 @@ mod tests {
     #[test]
     fn test_build_request_data_without_transport() {
         let dest = AddressHash::new_from_slice(&[0xAB; 32]);
-        let (data, tag) = PathRequestManager::build_request_data(&dest, None);
+        let (data, tag) = PathRequestManager::build_request_data(&dest, None, None);
 
         // Without transport: dest(16) + tag(16) = 32 bytes
         assert_eq!(data.len(), 32);
@@ -660,7 +667,7 @@ mod tests {
     fn test_build_request_data_with_transport() {
         let dest = AddressHash::new_from_slice(&[0xAB; 32]);
         let transport_id = AddressHash::new_from_slice(&[0xCD; 32]);
-        let (data, tag) = PathRequestManager::build_request_data(&dest, Some(&transport_id));
+        let (data, tag) = PathRequestManager::build_request_data(&dest, Some(&transport_id), None);
 
         // With transport: dest(16) + transport(16) + tag(16) = 48 bytes
         assert_eq!(data.len(), 48);
@@ -678,7 +685,7 @@ mod tests {
     #[test]
     fn test_create_request_packet() {
         let dest = AddressHash::new_from_slice(&[0xAB; 32]);
-        let (packet, _tag) = PathRequestManager::create_request_packet(&dest, None);
+        let (packet, _tag) = PathRequestManager::create_request_packet(&dest, None, None);
 
         // Verify packet properties
         assert_eq!(packet.header.packet_type, PacketType::Data);
@@ -756,7 +763,7 @@ mod tests {
         let dest = AddressHash::new_from_slice(&[0xAB; 32]);
         let transport_id = AddressHash::new_from_slice(&[0xCD; 32]);
 
-        let (data, original_tag) = PathRequestManager::build_request_data(&dest, Some(&transport_id));
+        let (data, original_tag) = PathRequestManager::build_request_data(&dest, Some(&transport_id), None);
         let result = PathRequestManager::parse_request_data(data.as_slice());
 
         assert!(result.is_some());

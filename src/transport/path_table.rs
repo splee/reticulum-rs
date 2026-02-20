@@ -3,10 +3,77 @@ use std::{collections::HashMap, time::{Duration, Instant}};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    destination::NAME_HASH_LENGTH,
     hash::{AddressHash, Hash},
+    identity::PUBLIC_KEY_LENGTH,
     iface::stats::InterfaceMode,
     packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, TransportType},
 };
+
+/// Max hops for pathfinding (matches Python's PATHFINDER_M = 128).
+pub const PATHFINDER_M: u8 = 128;
+
+/// Path state tracking for unresponsive path detection.
+///
+/// Mirrors Python's Transport.STATE_UNKNOWN/STATE_UNRESPONSIVE/STATE_RESPONSIVE.
+/// Used to allow higher-hop announces to replace paths that have become unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PathState {
+    #[default]
+    Unknown = 0x00,
+    Unresponsive = 0x01,
+    Responsive = 0x02,
+}
+
+/// A 10-byte random blob extracted from announce packets.
+///
+/// Bytes [0..5] are random data, bytes [5..10] encode the emission timestamp
+/// as a big-endian u40. Used to detect replayed announces and determine
+/// announce freshness.
+pub type RandomBlob = [u8; 10];
+
+/// Maximum number of random blobs per destination to keep in memory.
+pub const MAX_RANDOM_BLOBS: usize = 64;
+
+/// Maximum number of random blobs per destination to persist to disk.
+#[allow(dead_code)]
+pub const PERSIST_RANDOM_BLOBS: usize = 32;
+
+/// Offset into announce packet data where the random blob starts.
+/// This is PUBLIC_KEY_LENGTH * 2 (64 bytes for encryption + signing keys) +
+/// NAME_HASH_LENGTH (10 bytes for the name hash) = 74.
+const RANDOM_BLOB_OFFSET: usize = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH;
+
+/// Length of the random blob in bytes.
+const RANDOM_BLOB_LENGTH: usize = 10;
+
+/// Extract the emission timestamp (u40) from bytes [5..10] of a random blob.
+///
+/// The timestamp is stored as big-endian in the last 5 bytes of the blob.
+/// We pad it into a u64 by placing those 5 bytes at positions [3..8].
+pub fn emission_timestamp_from_blob(blob: &RandomBlob) -> u64 {
+    let mut buf = [0u8; 8];
+    buf[3..8].copy_from_slice(&blob[5..10]);
+    u64::from_be_bytes(buf)
+}
+
+/// Get the maximum emission timestamp across all random blobs.
+pub fn timebase_from_blobs(blobs: &[RandomBlob]) -> u64 {
+    blobs.iter().map(|b| emission_timestamp_from_blob(b)).max().unwrap_or(0)
+}
+
+/// Extract the 10-byte random blob from announce packet data at the standard offset.
+///
+/// Returns None if the packet data is too short.
+pub fn extract_random_blob(packet_data: &[u8]) -> Option<RandomBlob> {
+    if packet_data.len() < RANDOM_BLOB_OFFSET + RANDOM_BLOB_LENGTH {
+        return None;
+    }
+    let mut blob = [0u8; RANDOM_BLOB_LENGTH];
+    blob.copy_from_slice(&packet_data[RANDOM_BLOB_OFFSET..RANDOM_BLOB_OFFSET + RANDOM_BLOB_LENGTH]);
+    Some(blob)
+}
 
 /// Default path expiration time (1 week, matching Python's PATHFINDER_E).
 ///
@@ -45,6 +112,9 @@ pub struct PathEntry {
     pub packet_hash: Hash,
     /// Expiry duration based on the interface mode that received the announce
     pub expiry_duration: Duration,
+    /// Random blobs from announces for this destination, used for replay detection
+    /// and emission timestamp comparison.
+    pub random_blobs: Vec<RandomBlob>,
 }
 
 /// Path information for external display/queries
@@ -66,6 +136,8 @@ pub struct PathInfo {
 
 pub struct PathTable {
     map: HashMap<AddressHash, PathEntry>,
+    /// Per-destination path state tracking for unresponsive detection
+    path_states: HashMap<AddressHash, PathState>,
     /// Track when each entry was created for expiration
     #[allow(dead_code)]
     created_at: Instant,
@@ -75,6 +147,7 @@ impl PathTable {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            path_states: HashMap::new(),
             created_at: Instant::now(),
         }
     }
@@ -95,6 +168,49 @@ impl PathTable {
                 Some(entry.hops)
             }
         })
+    }
+
+    /// Get the number of hops to a destination, or PATHFINDER_M if unknown.
+    pub fn hops_to_or_max(&self, destination: &AddressHash) -> u8 {
+        self.hops_to(destination).unwrap_or(PATHFINDER_M)
+    }
+
+    /// Mark a destination's path state as Unknown.
+    /// Returns true if the path exists (and state was set).
+    pub fn mark_path_unknown_state(&mut self, dest: &AddressHash) -> bool {
+        if self.map.contains_key(dest) {
+            self.path_states.insert(*dest, PathState::Unknown);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a destination's path state as Unresponsive.
+    /// Returns true if the path exists (and state was set).
+    pub fn mark_path_unresponsive(&mut self, dest: &AddressHash) -> bool {
+        if self.map.contains_key(dest) {
+            self.path_states.insert(*dest, PathState::Unresponsive);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a destination's path state as Responsive.
+    /// Returns true if the path exists (and state was set).
+    pub fn mark_path_responsive(&mut self, dest: &AddressHash) -> bool {
+        if self.map.contains_key(dest) {
+            self.path_states.insert(*dest, PathState::Responsive);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a destination's path is in Unresponsive state.
+    pub fn path_is_unresponsive(&self, dest: &AddressHash) -> bool {
+        self.path_states.get(dest).copied() == Some(PathState::Unresponsive)
     }
 
     /// Get all paths, optionally filtered by maximum hop count
@@ -140,6 +256,7 @@ impl PathTable {
     /// Drop a specific path entry
     /// Returns true if path was found and removed
     pub fn drop_path(&mut self, destination: &AddressHash) -> bool {
+        self.path_states.remove(destination);
         self.map.remove(destination).is_some()
     }
 
@@ -155,7 +272,13 @@ impl PathTable {
     /// Returns the number of entries removed
     pub fn cleanup_expired(&mut self) -> usize {
         let before_count = self.map.len();
-        self.map.retain(|_, entry| entry.timestamp.elapsed() <= entry.expiry_duration);
+        self.map.retain(|dest, entry| {
+            let keep = entry.timestamp.elapsed() <= entry.expiry_duration;
+            if !keep {
+                self.path_states.remove(dest);
+            }
+            keep
+        });
         before_count - self.map.len()
     }
 
@@ -201,22 +324,126 @@ impl PathTable {
 
     /// Handle an announce packet and update the path table.
     ///
-    /// The `iface_mode` parameter determines the path expiry duration:
-    /// - AccessPoint: 1 day
-    /// - Roaming: 6 hours
-    /// - Full/others: 1 week
+    /// Implements the Python multi-factor path update decision tree:
+    /// 1. Extract random blob and compute emission timestamp
+    /// 2. If no existing path → accept
+    /// 3. If hops <= existing hops → accept if blob is new AND emitted > timebase
+    /// 4. If hops > existing hops:
+    ///    a. If path expired → accept if blob is new
+    ///    b. If emitted > existing max emission → accept if blob is new
+    ///    c. If emitted == existing max emission → accept if path is unresponsive
+    ///    d. Otherwise → reject
+    ///
+    /// Returns true if the path was updated, false if rejected.
     pub fn handle_announce(
         &mut self,
         announce: &Packet,
         transport_id: Option<AddressHash>,
         iface: AddressHash,
         iface_mode: InterfaceMode,
-    ) {
+    ) -> bool {
         let hops = announce.header.hops + 1;
+        let random_blob = extract_random_blob(announce.data.as_slice());
+        let announce_emitted = random_blob
+            .as_ref()
+            .map(|b| emission_timestamp_from_blob(b))
+            .unwrap_or(0);
 
-        if let Some(existing_entry) = self.map.get(&announce.destination) {
-            if hops >= existing_entry.hops {
-                return;
+        let should_add;
+
+        if let Some(existing) = self.map.get(&announce.destination) {
+            let existing_blobs = &existing.random_blobs;
+
+            if hops <= existing.hops {
+                // Equal or fewer hops: accept only if blob is new and emitted > timebase
+                let path_timebase = timebase_from_blobs(existing_blobs);
+                if random_blob.is_some()
+                    && !existing_blobs.contains(random_blob.as_ref().unwrap())
+                    && announce_emitted > path_timebase
+                {
+                    self.mark_path_unknown_state(&announce.destination);
+                    should_add = true;
+                } else {
+                    should_add = false;
+                }
+            } else {
+                // More hops than existing: only accept under specific conditions
+                let path_expired = existing.timestamp.elapsed() > existing.expiry_duration;
+
+                // Compute max emission from existing blobs, with early exit optimization
+                let mut path_announce_emitted: u64 = 0;
+                for blob in existing_blobs {
+                    path_announce_emitted = path_announce_emitted.max(emission_timestamp_from_blob(blob));
+                    if path_announce_emitted >= announce_emitted {
+                        break;
+                    }
+                }
+
+                let blob_is_new = random_blob.is_some()
+                    && !existing_blobs.contains(random_blob.as_ref().unwrap());
+
+                if path_expired {
+                    // Expired path: accept if blob is new
+                    if blob_is_new {
+                        log::debug!(
+                            "Replacing path for {} with new announce due to expired path",
+                            announce.destination
+                        );
+                        self.mark_path_unknown_state(&announce.destination);
+                        should_add = true;
+                    } else {
+                        should_add = false;
+                    }
+                } else if announce_emitted > path_announce_emitted {
+                    // More recently emitted: accept if blob is new
+                    if blob_is_new {
+                        log::debug!(
+                            "Replacing path for {} with new announce, since it was more recently emitted",
+                            announce.destination
+                        );
+                        self.mark_path_unknown_state(&announce.destination);
+                        should_add = true;
+                    } else {
+                        should_add = false;
+                    }
+                } else if announce_emitted == path_announce_emitted {
+                    // Same emission time: accept only if current path is unresponsive
+                    if self.path_is_unresponsive(&announce.destination) {
+                        log::debug!(
+                            "Replacing path for {} with new announce, since previously tried path was unresponsive",
+                            announce.destination
+                        );
+                        // Note: Python does NOT call mark_path_unknown_state here
+                        should_add = true;
+                    } else {
+                        should_add = false;
+                    }
+                } else {
+                    should_add = false;
+                }
+            }
+        } else {
+            // No existing path — always accept
+            should_add = true;
+        }
+
+        if !should_add {
+            return false;
+        }
+
+        // Collect the existing random_blobs before inserting the new entry
+        let mut random_blobs = self.map.get(&announce.destination)
+            .map(|e| e.random_blobs.clone())
+            .unwrap_or_default();
+
+        // Append new blob if not duplicate, truncate to MAX_RANDOM_BLOBS from end
+        if let Some(blob) = random_blob {
+            if !random_blobs.contains(&blob) {
+                random_blobs.push(blob);
+                if random_blobs.len() > MAX_RANDOM_BLOBS {
+                    let start = random_blobs.len() - MAX_RANDOM_BLOBS;
+                    random_blobs = random_blobs[start..].to_vec();
+                }
             }
         }
 
@@ -229,6 +456,7 @@ impl PathTable {
             iface,
             packet_hash: announce.hash(),
             expiry_duration,
+            random_blobs,
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -240,6 +468,8 @@ impl PathTable {
             received_from,
             expiry_duration,
         );
+
+        true
     }
 
     pub fn handle_inbound_packet(
@@ -405,6 +635,7 @@ mod tests {
             iface: zero_address_hash(),
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: Vec::new(),
         });
 
         assert!(table.has_path(&dest));
@@ -422,6 +653,7 @@ mod tests {
             iface: zero_address_hash(),
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: Vec::new(),
         });
 
         assert!(table.drop_path(&dest));
@@ -446,6 +678,7 @@ mod tests {
                 iface: zero_address_hash(),
                 packet_hash: Hash::new_empty(),
                 expiry_duration: PATH_EXPIRY_TIME,
+                random_blobs: Vec::new(),
             });
         }
 
@@ -475,5 +708,417 @@ mod tests {
         assert_eq!(PATH_EXPIRY_TIME.as_secs(), 60 * 60 * 24 * 7); // 1 week
         assert_eq!(PATH_EXPIRY_ACCESS_POINT.as_secs(), 60 * 60 * 24); // 1 day
         assert_eq!(PATH_EXPIRY_ROAMING.as_secs(), 60 * 60 * 6); // 6 hours
+    }
+
+    // =========================================================================
+    // RandomBlob and emission timestamp tests
+    // =========================================================================
+
+    #[test]
+    fn test_emission_timestamp_from_blob() {
+        // Bytes [5..10] = [0x00, 0x00, 0x01, 0x00, 0x00] = 65536
+        let mut blob: RandomBlob = [0u8; 10];
+        blob[7] = 0x01; // position [7] maps to big-endian byte
+        let ts = emission_timestamp_from_blob(&blob);
+        assert_eq!(ts, 65536);
+
+        // All zeros → 0
+        let zero_blob: RandomBlob = [0u8; 10];
+        assert_eq!(emission_timestamp_from_blob(&zero_blob), 0);
+
+        // All 0xFF in bytes [5..10] → max u40 = 2^40 - 1
+        let mut max_blob: RandomBlob = [0u8; 10];
+        max_blob[5..10].fill(0xFF);
+        assert_eq!(emission_timestamp_from_blob(&max_blob), (1u64 << 40) - 1);
+
+        // Known value: bytes [5..10] = [0, 0, 0, 0, 42] → 42
+        let mut blob42: RandomBlob = [0u8; 10];
+        blob42[9] = 42;
+        assert_eq!(emission_timestamp_from_blob(&blob42), 42);
+    }
+
+    #[test]
+    fn test_timebase_from_blobs() {
+        // Empty blobs → 0
+        assert_eq!(timebase_from_blobs(&[]), 0);
+
+        // Single blob
+        let mut b1: RandomBlob = [0u8; 10];
+        b1[9] = 10;
+        assert_eq!(timebase_from_blobs(&[b1]), 10);
+
+        // Multiple blobs — returns max
+        let mut b2: RandomBlob = [0u8; 10];
+        b2[9] = 20;
+        let mut b3: RandomBlob = [0u8; 10];
+        b3[9] = 5;
+        assert_eq!(timebase_from_blobs(&[b1, b2, b3]), 20);
+    }
+
+    #[test]
+    fn test_extract_random_blob() {
+        // Packet data too short
+        let short_data = [0u8; 80]; // needs >= 84 (74 + 10)
+        assert!(extract_random_blob(&short_data).is_none());
+
+        // Exact minimum length (74 + 10 = 84)
+        let mut data = [0u8; 84];
+        data[74..84].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let blob = extract_random_blob(&data).unwrap();
+        assert_eq!(blob, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        // Longer packet data also works
+        let mut long_data = [0u8; 200];
+        long_data[74..84].copy_from_slice(&[0xAA; 10]);
+        let blob = extract_random_blob(&long_data).unwrap();
+        assert_eq!(blob, [0xAA; 10]);
+    }
+
+    // =========================================================================
+    // PathState tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_state_default() {
+        assert_eq!(PathState::default(), PathState::Unknown);
+    }
+
+    #[test]
+    fn test_path_state_transitions() {
+        let mut table = PathTable::new();
+        let dest = zero_address_hash();
+
+        // No path exists — state changes should return false
+        assert!(!table.mark_path_unresponsive(&dest));
+        assert!(!table.mark_path_responsive(&dest));
+        assert!(!table.mark_path_unknown_state(&dest));
+        assert!(!table.path_is_unresponsive(&dest));
+
+        // Add a path
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 2,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+            expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: Vec::new(),
+        });
+
+        // Default state is not unresponsive
+        assert!(!table.path_is_unresponsive(&dest));
+
+        // Mark unresponsive
+        assert!(table.mark_path_unresponsive(&dest));
+        assert!(table.path_is_unresponsive(&dest));
+
+        // Mark responsive
+        assert!(table.mark_path_responsive(&dest));
+        assert!(!table.path_is_unresponsive(&dest));
+
+        // Mark unknown
+        assert!(table.mark_path_unknown_state(&dest));
+        assert!(!table.path_is_unresponsive(&dest));
+    }
+
+    #[test]
+    fn test_path_state_cleanup_on_drop() {
+        let mut table = PathTable::new();
+        let dest = zero_address_hash();
+
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 1,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+            expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: Vec::new(),
+        });
+
+        table.mark_path_unresponsive(&dest);
+        assert!(table.path_is_unresponsive(&dest));
+
+        // Drop the path — state should be cleaned up
+        table.drop_path(&dest);
+        assert!(!table.path_is_unresponsive(&dest));
+    }
+
+    // =========================================================================
+    // hops_to_or_max tests
+    // =========================================================================
+
+    #[test]
+    fn test_hops_to_or_max() {
+        let mut table = PathTable::new();
+        let dest = zero_address_hash();
+
+        // Unknown destination → PATHFINDER_M (128)
+        assert_eq!(table.hops_to_or_max(&dest), PATHFINDER_M);
+        assert_eq!(table.hops_to_or_max(&dest), 128);
+
+        // Known destination → actual hops
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 3,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+            expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: Vec::new(),
+        });
+
+        assert_eq!(table.hops_to_or_max(&dest), 3);
+    }
+
+    // =========================================================================
+    // Multi-factor handle_announce tests
+    // =========================================================================
+
+    /// Create a test announce packet with specific hops and random blob data.
+    fn make_announce_packet(dest: AddressHash, hops: u8, blob_bytes: &RandomBlob) -> Packet {
+        use crate::packet::{PacketDataBuffer, PacketContext};
+
+        // Build packet data: 64 bytes public keys + 10 bytes name hash + 10 bytes random blob
+        let mut data = PacketDataBuffer::new();
+        // 64 bytes of key data (PUBLIC_KEY_LENGTH * 2)
+        data.chain_safe_write(&[0u8; 64]);
+        // 10 bytes name hash
+        data.chain_safe_write(&[0u8; NAME_HASH_LENGTH]);
+        // 10 bytes random blob
+        data.chain_safe_write(blob_bytes);
+
+        Packet {
+            header: Header {
+                hops, // handle_announce will add 1
+                ..Default::default()
+            },
+            destination: dest,
+            data,
+            context: PacketContext::None,
+            ..Default::default()
+        }
+    }
+
+    /// Helper to make a random blob with a specific emission timestamp
+    fn blob_with_timestamp(ts: u64) -> RandomBlob {
+        let mut blob = [0u8; 10];
+        // Encode timestamp into bytes [5..10] as big-endian u40
+        let ts_bytes = ts.to_be_bytes(); // 8 bytes
+        // u40 occupies the last 5 bytes of the u64 big-endian representation
+        blob[5..10].copy_from_slice(&ts_bytes[3..8]);
+        blob
+    }
+
+    #[test]
+    fn test_handle_announce_new_destination_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+        let blob = blob_with_timestamp(100);
+        let packet = make_announce_packet(dest, 2, &blob);
+
+        let result = table.handle_announce(&packet, None, zero_address_hash(), InterfaceMode::Full);
+        assert!(result, "New destination should always be accepted");
+        assert!(table.has_path(&dest));
+        assert_eq!(table.hops_to(&dest), Some(3)); // hops + 1
+
+        // Random blob should be stored
+        let entry = table.map.get(&dest).unwrap();
+        assert_eq!(entry.random_blobs.len(), 1);
+        assert_eq!(entry.random_blobs[0], blob);
+    }
+
+    #[test]
+    fn test_handle_announce_fewer_hops_new_blob_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        // First announce: 3 hops (packet hops=2), timestamp=100
+        let blob1 = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 2, &blob1);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Second announce: 2 hops (packet hops=1), newer timestamp, new blob → accepted
+        let blob2 = blob_with_timestamp(200);
+        let p2 = make_announce_packet(dest, 1, &blob2);
+        assert!(table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+        assert_eq!(table.hops_to(&dest), Some(2));
+    }
+
+    #[test]
+    fn test_handle_announce_equal_hops_new_blob_newer_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob1 = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 2, &blob1);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Same hop count, new blob, newer timestamp → accepted
+        let blob2 = blob_with_timestamp(200);
+        let p2 = make_announce_packet(dest, 2, &blob2);
+        assert!(table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Should now have 2 random blobs
+        let entry = table.map.get(&dest).unwrap();
+        assert_eq!(entry.random_blobs.len(), 2);
+    }
+
+    #[test]
+    fn test_handle_announce_duplicate_blob_rejected() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 2, &blob);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Same blob, same hops → rejected (replay protection)
+        let p2 = make_announce_packet(dest, 2, &blob);
+        assert!(!table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+    }
+
+    #[test]
+    fn test_handle_announce_equal_hops_older_timestamp_rejected() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob1 = blob_with_timestamp(200);
+        let p1 = make_announce_packet(dest, 2, &blob1);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Same hops, new blob but OLDER timestamp → rejected
+        let blob2 = blob_with_timestamp(100);
+        let p2 = make_announce_packet(dest, 2, &blob2);
+        assert!(!table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+    }
+
+    #[test]
+    fn test_handle_announce_more_hops_newer_emission_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob1 = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 1, &blob1); // 2 hops
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // More hops but newer emission → accepted
+        let blob2 = blob_with_timestamp(200);
+        let p2 = make_announce_packet(dest, 3, &blob2); // 4 hops
+        assert!(table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+        assert_eq!(table.hops_to(&dest), Some(4));
+    }
+
+    #[test]
+    fn test_handle_announce_more_hops_same_emission_rejected() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob1 = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 1, &blob1);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // More hops, same emission time, path responsive → rejected
+        let blob2 = blob_with_timestamp(100);
+        // Different blob bytes but same timestamp
+        blob2[0]; // Just referencing; create a genuinely different blob
+        let mut blob2_diff: RandomBlob = [0x42; 10];
+        // Set timestamp to 100
+        let ts_bytes = 100u64.to_be_bytes();
+        blob2_diff[5..10].copy_from_slice(&ts_bytes[3..8]);
+
+        let p2 = make_announce_packet(dest, 3, &blob2_diff);
+        assert!(!table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+    }
+
+    #[test]
+    fn test_handle_announce_more_hops_unresponsive_path_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        let blob1 = blob_with_timestamp(100);
+        let p1 = make_announce_packet(dest, 1, &blob1);
+        assert!(table.handle_announce(&p1, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Mark path as unresponsive
+        table.mark_path_unresponsive(&dest);
+
+        // More hops, same emission, but path is unresponsive → accepted
+        let mut blob2: RandomBlob = [0x42; 10];
+        let ts_bytes = 100u64.to_be_bytes();
+        blob2[5..10].copy_from_slice(&ts_bytes[3..8]);
+        let p2 = make_announce_packet(dest, 3, &blob2);
+        assert!(table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+    }
+
+    #[test]
+    fn test_handle_announce_expired_path_new_blob_accepted() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        // Insert an expired path manually
+        let blob1 = blob_with_timestamp(100);
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now() - Duration::from_secs(60 * 60 * 24 * 8), // 8 days ago
+            received_from: zero_address_hash(),
+            hops: 2,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+            expiry_duration: PATH_EXPIRY_TIME, // 7 days
+            random_blobs: vec![blob1],
+        });
+
+        // More hops but new blob on expired path → accepted
+        let blob2 = blob_with_timestamp(50); // Even older timestamp is fine for expired path
+        let p2 = make_announce_packet(dest, 4, &blob2);
+        assert!(table.handle_announce(&p2, None, zero_address_hash(), InterfaceMode::Full));
+    }
+
+    #[test]
+    fn test_handle_announce_max_random_blobs_truncation() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+
+        // Fill up with MAX_RANDOM_BLOBS entries by inserting directly
+        let mut blobs = Vec::new();
+        for i in 0..MAX_RANDOM_BLOBS {
+            blobs.push(blob_with_timestamp(i as u64));
+        }
+        table.map.insert(dest, PathEntry {
+            timestamp: Instant::now(),
+            received_from: zero_address_hash(),
+            hops: 5,
+            iface: zero_address_hash(),
+            packet_hash: Hash::new_empty(),
+            expiry_duration: PATH_EXPIRY_TIME,
+            random_blobs: blobs,
+        });
+
+        // Add one more via announce (fewer hops, newer timestamp)
+        let new_blob = blob_with_timestamp((MAX_RANDOM_BLOBS + 1) as u64);
+        let packet = make_announce_packet(dest, 0, &new_blob); // 1 hop
+        assert!(table.handle_announce(&packet, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Should still be MAX_RANDOM_BLOBS (oldest was evicted)
+        let entry = table.map.get(&dest).unwrap();
+        assert_eq!(entry.random_blobs.len(), MAX_RANDOM_BLOBS);
+        // The newest blob should be the last one
+        assert_eq!(*entry.random_blobs.last().unwrap(), new_blob);
+        // The oldest (timestamp=0) should have been evicted
+        assert!(!entry.random_blobs.contains(&blob_with_timestamp(0)));
+    }
+
+    #[test]
+    fn test_handle_announce_returns_bool() {
+        let mut table = PathTable::new();
+        let dest = AddressHash::new_from_slice(&[1u8; 16]);
+        let blob = blob_with_timestamp(100);
+        let packet = make_announce_packet(dest, 2, &blob);
+
+        // First call accepts
+        assert!(table.handle_announce(&packet, None, zero_address_hash(), InterfaceMode::Full));
+
+        // Duplicate blob same hops rejects
+        assert!(!table.handle_announce(&packet, None, zero_address_hash(), InterfaceMode::Full));
     }
 }

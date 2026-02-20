@@ -48,6 +48,31 @@ impl PathManager {
         self.table.hops_to(destination)
     }
 
+    /// Get the number of hops to a destination, or PATHFINDER_M (128) if unknown.
+    pub fn hops_to_or_max(&self, destination: &AddressHash) -> u8 {
+        self.table.hops_to_or_max(destination)
+    }
+
+    /// Mark a destination's path state as Unknown.
+    pub fn mark_path_unknown_state(&mut self, dest: &AddressHash) -> bool {
+        self.table.mark_path_unknown_state(dest)
+    }
+
+    /// Mark a destination's path state as Unresponsive.
+    pub fn mark_path_unresponsive(&mut self, dest: &AddressHash) -> bool {
+        self.table.mark_path_unresponsive(dest)
+    }
+
+    /// Mark a destination's path state as Responsive.
+    pub fn mark_path_responsive(&mut self, dest: &AddressHash) -> bool {
+        self.table.mark_path_responsive(dest)
+    }
+
+    /// Check if a destination's path is in Unresponsive state.
+    pub fn path_is_unresponsive(&self, dest: &AddressHash) -> bool {
+        self.table.path_is_unresponsive(dest)
+    }
+
     /// Get the next hop address for a destination.
     pub fn next_hop(&self, destination: &AddressHash) -> Option<AddressHash> {
         self.table.next_hop(destination)
@@ -135,13 +160,15 @@ impl PathManager {
     /// - AccessPoint: 1 day
     /// - Roaming: 6 hours
     /// - Full/others: 1 week
+    ///
+    /// Returns true if the path was updated, false if the announce was rejected.
     pub fn handle_announce(
         &mut self,
         announce: &Packet,
         transport_id: Option<AddressHash>,
         iface: AddressHash,
         iface_mode: InterfaceMode,
-    ) {
+    ) -> bool {
         self.table.handle_announce(announce, transport_id, iface, iface_mode)
     }
 

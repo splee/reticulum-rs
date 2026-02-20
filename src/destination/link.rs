@@ -49,6 +49,26 @@ impl Default for LinkMode {
     }
 }
 
+/// Resource acceptance strategy for incoming resources on a link.
+///
+/// Matches Python's Link.ACCEPT_NONE / ACCEPT_APP / ACCEPT_ALL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResourceStrategy {
+    /// Reject all incoming resources
+    AcceptNone = 0x00,
+    /// Accept resources based on application callback
+    AcceptApp = 0x01,
+    /// Accept all incoming resources
+    AcceptAll = 0x02,
+}
+
+impl Default for ResourceStrategy {
+    fn default() -> Self {
+        ResourceStrategy::AcceptNone
+    }
+}
+
 /// MTU byte mask for extracting MTU from signalling bytes (21 bits).
 const MTU_BYTEMASK: u32 = 0x1FFFFF;
 
@@ -66,6 +86,18 @@ fn signalling_bytes(mtu: u32, mode: LinkMode) -> [u8; LINK_MTU_SIZE] {
     // Pack as big-endian 32-bit, take last 3 bytes (like Python's struct.pack(">I", ...)[1:])
     let packed = signalling_value.to_be_bytes();
     [packed[1], packed[2], packed[3]]
+}
+
+/// Reason a link was torn down (matching Python Link.py teardown reasons).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LinkTeardownReason {
+    /// Link timed out (keepalive failure)
+    Timeout = 0x01,
+    /// Link was closed by the initiator (client)
+    InitiatorClosed = 0x02,
+    /// Link was closed by the destination (server)
+    DestinationClosed = 0x03,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -282,6 +314,21 @@ pub struct Link {
     stale_time: Duration,
     /// Pending requests awaiting response
     pending_requests: HashMap<[u8; 16], SharedRequestReceipt>,
+    /// Resource acceptance strategy for incoming resources
+    resource_strategy: ResourceStrategy,
+    /// Application callback for AcceptApp strategy
+    resource_accept_callback: Option<Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>>,
+    /// Teardown reason when link is closed
+    teardown_reason: Option<LinkTeardownReason>,
+    // Physical layer stats
+    /// Received signal strength indicator (dBm)
+    rssi: Option<i16>,
+    /// Signal-to-noise ratio (dB)
+    snr: Option<f32>,
+    /// Link quality metric (0.0–1.0)
+    q: Option<f32>,
+    /// Whether to track physical layer statistics
+    track_phy_stats: bool,
 }
 
 impl Link {
@@ -316,6 +363,13 @@ impl Link {
             keepalive_interval: KEEPALIVE_MAX,
             stale_time: KEEPALIVE_MAX * STALE_FACTOR,
             pending_requests: HashMap::new(),
+            resource_strategy: ResourceStrategy::default(),
+            resource_accept_callback: None,
+            teardown_reason: None,
+            rssi: None,
+            snr: None,
+            q: None,
+            track_phy_stats: false,
         }
     }
 
@@ -393,6 +447,13 @@ impl Link {
             keepalive_interval: KEEPALIVE_MAX,
             stale_time: KEEPALIVE_MAX * STALE_FACTOR,
             pending_requests: HashMap::new(),
+            resource_strategy: ResourceStrategy::default(),
+            resource_accept_callback: None,
+            teardown_reason: None,
+            rssi: None,
+            snr: None,
+            q: None,
+            track_phy_stats: false,
         };
 
         link.handshake(peer_identity);
@@ -595,6 +656,8 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): response {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
+                    // Try to resolve a pending request receipt with the response
+                    self.handle_response(plain_text);
                     self.post_event(LinkEvent::Response(LinkPayload::new_from_slice(plain_text)));
                 } else {
                     log::error!("link({}): can't decrypt response", self.id);
@@ -648,6 +711,26 @@ impl Link {
                     }
                 } else {
                     log::error!("link({}): can't decrypt LinkIdentify packet", self.id);
+                }
+            }
+            PacketContext::LinkClose => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    // Verify decrypted content matches our link ID
+                    if plain_text == self.id.as_slice() {
+                        log::info!("link({}): received LINKCLOSE from remote", self.id);
+                        self.teardown_reason = Some(if self.initiator {
+                            LinkTeardownReason::DestinationClosed
+                        } else {
+                            LinkTeardownReason::InitiatorClosed
+                        });
+                        self.status = LinkStatus::Closed;
+                        self.post_event(LinkEvent::Closed);
+                    } else {
+                        log::warn!("link({}): LINKCLOSE link ID mismatch", self.id);
+                    }
+                } else {
+                    log::error!("link({}): can't decrypt LINKCLOSE packet", self.id);
                 }
             }
             _ => {
@@ -946,12 +1029,61 @@ impl Link {
             event,
         });
     }
-    pub fn close(&mut self) {
+    /// Close the link and optionally return a LINKCLOSE packet to send.
+    ///
+    /// If the link is active, creates a LINKCLOSE packet containing the
+    /// encrypted link ID so the remote side can verify the teardown.
+    /// Returns None if the link is already pending/closed (no packet needed).
+    pub fn close(&mut self) -> Option<Packet> {
+        // If already pending or closed, just set status
+        if self.status == LinkStatus::Pending || self.status == LinkStatus::Closed {
+            self.status = LinkStatus::Closed;
+            self.post_event(LinkEvent::Closed);
+            log::warn!("link: close {} (already {:?})", self.id, self.status);
+            return None;
+        }
+
+        // Set teardown reason based on who initiated
+        self.teardown_reason = Some(if self.initiator {
+            LinkTeardownReason::InitiatorClosed
+        } else {
+            LinkTeardownReason::DestinationClosed
+        });
+
+        // Build LINKCLOSE packet: encrypt(link_id)
+        let linkclose_packet = {
+            let mut packet_data = PacketDataBuffer::new();
+            let cipher_text_len = match self.encrypt(self.id.as_slice(), packet_data.accuire_buf_max()) {
+                Ok(ct) => ct.len(),
+                Err(e) => {
+                    log::error!("link({}): failed to encrypt LINKCLOSE: {}", self.id, e);
+                    self.status = LinkStatus::Closed;
+                    self.post_event(LinkEvent::Closed);
+                    return None;
+                }
+            };
+            packet_data.resize(cipher_text_len);
+
+            Packet {
+                header: Header {
+                    destination_type: DestinationType::Link,
+                    packet_type: PacketType::Data,
+                    ..Default::default()
+                },
+                ifac: None,
+                destination: self.id,
+                transport: None,
+                context: PacketContext::LinkClose,
+                data: packet_data,
+                ratchet_id: None,
+            }
+        };
+
         self.status = LinkStatus::Closed;
-
         self.post_event(LinkEvent::Closed);
-
         log::warn!("link: close {}", self.id);
+
+        Some(linkclose_packet)
     }
 
     pub fn restart(&mut self) {
@@ -1600,6 +1732,240 @@ impl Link {
     pub fn pending_requests(&self) -> &HashMap<[u8; 16], SharedRequestReceipt> {
         &self.pending_requests
     }
+
+    /// Send a request to the remote destination over this link.
+    ///
+    /// Mirrors Python's Link.request() (Link.py:478-527). Packs the request
+    /// as a msgpack array `[timestamp, path_hash, data]` and sends it as a
+    /// Request packet. Returns a SharedRequestReceipt for tracking the response.
+    ///
+    /// If the packed request exceeds the link MDU, returns
+    /// `Err(RnsError::ResourceRequired)` — the caller should use a Resource
+    /// transfer with a request_id instead.
+    pub fn send_request(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        timeout: Option<Duration>,
+    ) -> Result<(SharedRequestReceipt, Packet), RnsError> {
+        if self.status != LinkStatus::Active {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        // Compute path_hash: truncated SHA-256 of path string
+        let path_hash_full = Hash::new(
+            Hash::generator()
+                .chain_update(path.as_bytes())
+                .finalize()
+                .into(),
+        );
+        let path_hash = &path_hash_full.as_bytes()[..16];
+
+        // Get current timestamp as f64
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Pack as msgpack array: [timestamp, path_hash, data]
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 3).map_err(|_| RnsError::SerializationError)?;
+        rmp::encode::write_f64(&mut packed, timestamp).map_err(|_| RnsError::SerializationError)?;
+        rmp::encode::write_bin(&mut packed, path_hash).map_err(|_| RnsError::SerializationError)?;
+        match data {
+            Some(d) => rmp::encode::write_bin(&mut packed, d).map_err(|_| RnsError::SerializationError)?,
+            None => rmp::encode::write_nil(&mut packed).map_err(|_| RnsError::SerializationError)?,
+        }
+
+        // Check if packed data fits within link MDU
+        if packed.len() > self.mdu() {
+            log::warn!(
+                "link({}): request too large for link MDU ({} > {}), use Resource",
+                self.id,
+                packed.len(),
+                self.mdu()
+            );
+            return Err(RnsError::ResourceRequired);
+        }
+
+        // Generate request_id from truncated hash of packed data
+        let request_id_hash = Hash::new(
+            Hash::generator()
+                .chain_update(&packed)
+                .finalize()
+                .into(),
+        );
+        let mut request_id = [0u8; 16];
+        request_id.copy_from_slice(&request_id_hash.as_bytes()[..16]);
+
+        // Create the request packet
+        let packet = self.request_packet(&packed)?;
+
+        // Create receipt and register it
+        let request_timeout = timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        let receipt = crate::destination::request_receipt::new_shared_request_receipt(
+            request_id,
+            request_timeout,
+            Some(packed.len()),
+        );
+
+        self.pending_requests.insert(request_id, receipt.clone());
+
+        log::debug!(
+            "link({}): sent request to path '{}' (id: {})",
+            self.id,
+            path,
+            hex::encode(request_id)
+        );
+
+        Ok((receipt, packet))
+    }
+
+    /// Handle an incoming response packet by resolving the pending request.
+    ///
+    /// Parses the decrypted response data as msgpack `[request_id, response_data]`,
+    /// looks up the request in pending_requests, and marks it as Ready.
+    pub(crate) fn handle_response(&mut self, decrypted_data: &[u8]) {
+        // Parse msgpack: [request_id_bytes, response_data]
+        let value = match rmpv::decode::read_value(&mut &decrypted_data[..]) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("link({}): failed to parse response msgpack: {}", self.id, e);
+                return;
+            }
+        };
+
+        let arr = match value {
+            rmpv::Value::Array(a) if a.len() >= 2 => a,
+            _ => {
+                log::warn!("link({}): response is not a 2-element array", self.id);
+                return;
+            }
+        };
+
+        // Extract request_id
+        let request_id_bytes = match &arr[0] {
+            rmpv::Value::Binary(b) if b.len() == 16 => {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(b);
+                id
+            }
+            _ => {
+                log::warn!("link({}): response request_id not a 16-byte binary", self.id);
+                return;
+            }
+        };
+
+        // Extract response data
+        let response_data = match &arr[1] {
+            rmpv::Value::Binary(b) => b.clone(),
+            rmpv::Value::Nil => Vec::new(),
+            _ => {
+                log::warn!("link({}): response data not binary or nil", self.id);
+                return;
+            }
+        };
+
+        // Look up and resolve the pending request
+        if let Some(receipt) = self.pending_requests.remove(&request_id_bytes) {
+            let mut receipt = futures::executor::block_on(receipt.lock());
+            receipt.set_ready(response_data, None);
+            log::debug!(
+                "link({}): resolved request {}",
+                self.id,
+                hex::encode(request_id_bytes)
+            );
+        } else {
+            log::warn!(
+                "link({}): no pending request for id {}",
+                self.id,
+                hex::encode(request_id_bytes)
+            );
+        }
+    }
+
+    // ========== Resource Strategy Methods ==========
+
+    /// Set the resource acceptance strategy for this link.
+    pub fn set_resource_strategy(&mut self, strategy: ResourceStrategy) {
+        self.resource_strategy = strategy;
+    }
+
+    /// Get the current resource acceptance strategy.
+    pub fn resource_strategy(&self) -> ResourceStrategy {
+        self.resource_strategy
+    }
+
+    /// Set the application callback for AcceptApp resource strategy.
+    ///
+    /// The callback receives a ResourceAdvertisement and returns true to accept
+    /// or false to reject the incoming resource.
+    pub fn set_resource_accept_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&ResourceAdvertisement) -> bool + Send + Sync + 'static,
+    {
+        self.resource_accept_callback = Some(Arc::new(callback));
+    }
+
+    /// Check whether an incoming resource should be accepted based on the
+    /// current strategy and optional application callback.
+    pub fn should_accept_resource(&self, adv: &ResourceAdvertisement) -> bool {
+        match self.resource_strategy {
+            ResourceStrategy::AcceptNone => false,
+            ResourceStrategy::AcceptAll => true,
+            ResourceStrategy::AcceptApp => self
+                .resource_accept_callback
+                .as_ref()
+                .map(|cb| cb(adv))
+                .unwrap_or(false),
+        }
+    }
+
+    // ========== Teardown Methods ==========
+
+    /// Get the teardown reason, if the link has been closed.
+    pub fn teardown_reason(&self) -> Option<LinkTeardownReason> {
+        self.teardown_reason
+    }
+
+    // ========== Physical Layer Stats ==========
+
+    /// Enable or disable physical layer stats tracking.
+    pub fn set_track_phy_stats(&mut self, track: bool) {
+        self.track_phy_stats = track;
+    }
+
+    /// Whether physical layer stats tracking is enabled.
+    pub fn track_phy_stats(&self) -> bool {
+        self.track_phy_stats
+    }
+
+    /// Get the last known RSSI value (dBm).
+    pub fn get_rssi(&self) -> Option<i16> {
+        self.rssi
+    }
+
+    /// Get the last known signal-to-noise ratio (dB).
+    pub fn get_snr(&self) -> Option<f32> {
+        self.snr
+    }
+
+    /// Get the last known link quality metric.
+    pub fn get_q(&self) -> Option<f32> {
+        self.q
+    }
+
+    /// Update physical layer stats from a received packet.
+    ///
+    /// Called by the transport layer when phy stats are available from the
+    /// radio interface (e.g. LoRa RSSI/SNR). Only updates if tracking is enabled.
+    pub fn update_phy_stats(&mut self, rssi: Option<i16>, snr: Option<f32>, q: Option<f32>) {
+        if self.track_phy_stats {
+            self.rssi = rssi;
+            self.snr = snr;
+            self.q = q;
+        }
+    }
 }
 
 fn validate_proof_packet(
@@ -1962,14 +2328,16 @@ mod tests {
         }
 
         #[test]
-        fn test_link_close_sets_status() {
+        fn test_link_close_pending_returns_none() {
+            // Closing a pending link should not produce a LINKCLOSE packet
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
             let mut link = Link::new(dest, tx);
 
-            link.close();
+            let packet = link.close();
 
             assert_eq!(link.status(), LinkStatus::Closed);
+            assert!(packet.is_none(), "pending link should not produce LINKCLOSE");
         }
 
         #[test]

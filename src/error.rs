@@ -20,6 +20,8 @@ pub enum RnsError {
     IoError,
     /// Configuration or value parsing error
     ParseError,
+    /// Request data exceeds link MDU; must use a Resource transfer instead
+    ResourceRequired,
 }
 
 impl fmt::Display for RnsError {
@@ -37,6 +39,7 @@ impl fmt::Display for RnsError {
             RnsError::SerializationError => write!(f, "serialization error"),
             RnsError::IoError => write!(f, "I/O error"),
             RnsError::ParseError => write!(f, "parse error"),
+            RnsError::ResourceRequired => write!(f, "resource required for large data"),
         }
     }
 }

@@ -306,7 +306,7 @@ fn main() {
                 ..ResourceConfig::default()
             };
 
-            let resource = match Resource::new(&mut rng, &data, config, None) {
+            let resource = match Resource::new(&mut rng, &data, config, None, None) {
                 Ok(r) => r,
                 Err(e) => {
                     log::error!("Failed to create resource: {:?}", e);
@@ -392,30 +392,25 @@ fn main() {
                                     // Handle request
                                     let mut resource_guard = resource.lock().await;
                                     match resource_guard.handle_request(request_data) {
-                                        Ok((wants_more_hashmap, part_indices)) => {
-                                            if wants_more_hashmap {
-                                                // Send hashmap update
-                                                let hmu_segment = 1; // Next segment
-                                                let hmu_data = resource_guard.get_hashmap_update(hmu_segment);
+                                        Ok(result) => {
+                                            if let Some(ref hmu_data) = result.hashmap_update {
                                                 log::info!(
-                                                    "Sending hashmap update segment {} ({} bytes)",
-                                                    hmu_segment,
+                                                    "Sending hashmap update ({} bytes)",
                                                     hmu_data.len()
                                                 );
 
                                                 transport
-                                                    .send_resource_hashmap_update(&link_id, &hmu_data)
+                                                    .send_resource_hashmap_update(&link_id, hmu_data)
                                                     .await;
                                                 println!(
-                                                    "RESOURCE_HMU_SENT={}:{}",
+                                                    "RESOURCE_HMU_SENT={}",
                                                     resource_hash_hex,
-                                                    hmu_segment
                                                 );
                                             }
 
                                             // Send requested parts
                                             // Drop resource guard before getting link
-                                            let parts_to_send: Vec<_> = part_indices.iter()
+                                            let parts_to_send: Vec<_> = result.parts_to_send.iter()
                                                 .filter_map(|&idx| resource_guard.get_part_data(idx).map(|d| (idx, d.to_vec())))
                                                 .collect();
                                             drop(resource_guard);

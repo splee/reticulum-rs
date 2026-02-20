@@ -44,8 +44,9 @@ async fn handle_resource_request(
     let parts_to_send = {
         let mut resource_guard = resource.lock().await;
         match resource_guard.handle_request(payload) {
-            Ok((_wants_more_hashmap, part_indices)) => {
-                let parts: Vec<_> = part_indices
+            Ok(result) => {
+                // TODO: send hashmap_update if result.hashmap_update.is_some()
+                let parts: Vec<_> = result.parts_to_send
                     .iter()
                     .filter_map(|&idx| {
                         resource_guard
@@ -235,7 +236,7 @@ pub async fn run_send_mode(
     };
 
     let mut rng = OsRng;
-    let resource = match Resource::new(&mut rng, &file_data, config, Some(&metadata)) {
+    let resource = match Resource::new(&mut rng, &file_data, config, Some(&metadata), None) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to create resource: {:?}", e);

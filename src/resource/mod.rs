@@ -27,6 +27,7 @@ mod config;
 pub mod constants;
 mod parts;
 mod status;
+pub mod watchdog;
 
 // Re-export public types
 pub use advertising::ResourceAdvertisement;
@@ -44,6 +45,21 @@ pub type ProgressCallback = Arc<dyn Fn(&ResourceProgress) + Send + Sync>;
 
 /// Type alias for completion callback
 pub type CompletionCallback = Arc<dyn Fn(&Resource, bool) + Send + Sync>;
+
+/// Result from handling a resource request (for outgoing resources).
+///
+/// Contains the list of part indices to send, optional hashmap update data,
+/// and whether all parts have now been sent (triggering AwaitingProof status).
+#[derive(Debug)]
+pub struct HandleRequestResult {
+    /// Indices of parts that should be sent in response to the request.
+    pub parts_to_send: Vec<usize>,
+    /// Hashmap update data to send if the receiver needs more hashmap entries.
+    /// This should be sent as a ResourceHashUpdate packet.
+    pub hashmap_update: Option<Vec<u8>>,
+    /// True when all parts have been sent and resource should await proof.
+    pub all_parts_sent: bool,
+}
 
 /// A resource for transferring data over a link
 pub struct Resource {
@@ -126,19 +142,28 @@ pub struct Resource {
     req_data_rtt_rate: f64,
 
     /// Time of last activity
-    #[allow(dead_code)]
     last_activity: Instant,
     /// Time when transfer started
     #[allow(dead_code)]
     started_transferring: Option<Instant>,
+    /// Time when advertisement was sent
+    adv_sent: Option<Instant>,
     /// Time of last part sent
     last_part_sent: Option<Instant>,
 
     /// Retries remaining
     retries_left: u32,
 
+    /// Timeout for the resource transfer (typically link RTT * traffic_timeout_factor)
+    timeout: Duration,
+    /// Timeout factor for calculating wait times
+    timeout_factor: f64,
+    /// Part timeout factor for TRANSFERRING state
+    part_timeout_factor: f64,
+    /// Sender grace time
+    sender_grace_time: f64,
+
     /// Configuration
-    #[allow(dead_code)]
     config: ResourceConfig,
 
     /// Request ID for request/response pattern
@@ -170,12 +195,18 @@ pub struct Resource {
 }
 
 impl Resource {
-    /// Create a new outgoing resource from data
+    /// Create a new outgoing resource from data.
+    ///
+    /// The optional `encrypt_fn` encrypts the resource data stream before
+    /// splitting it into parts. This is typically `link.encrypt()` wrapped in
+    /// a closure. When provided, the resource is flagged as encrypted and
+    /// the receiver must decrypt with the corresponding `link.decrypt()`.
     pub fn new<R: CryptoRngCore>(
         rng: &mut R,
         data: &[u8],
         config: ResourceConfig,
         metadata: Option<&[u8]>,
+        encrypt_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>, RnsError>>,
     ) -> Result<Self, RnsError> {
         // Resource parts are sent as PacketContext::RESOURCE (link-level plaintext),
         // so SDU should match plain Reticulum MDU (MTU - header max - IFAC min).
@@ -227,86 +258,122 @@ impl Resource {
                 (full_data, false, data_for_hash)
             };
 
-        // Generate random hash
+        // Maximum retries for hash collision resolution (matching Python Resource.py)
+        const MAX_COLLISION_RETRIES: usize = 10;
+
         let mut random_hash = [0u8; RANDOM_HASH_SIZE];
-        rng.fill_bytes(&mut random_hash);
+        let mut final_data;
+        let mut encrypted;
+        let mut hash;
+        let mut truncated_hash;
+        let mut original_hash;
+        let mut expected_proof;
+        let mut size;
+        let mut total_parts;
+        let mut parts;
+        let mut hashmap;
 
-        // Prepend random hash and (in a real implementation) encrypt
-        let mut final_data = Vec::with_capacity(RANDOM_HASH_SIZE + processed_data.len());
-        final_data.extend_from_slice(&random_hash);
-        final_data.extend_from_slice(&processed_data);
+        // Retry loop: on hashmap collision, regenerate random_hash and rebuild.
+        // This matches Python's Resource.__init__ collision retry logic
+        // (Resource.py:432-471).
+        let mut retry = 0;
+        loop {
+            rng.fill_bytes(&mut random_hash);
 
-        // In production, this would be encrypted using link.encrypt().
-        // NOTE: Resource-level encryption is currently disabled in Rust and is
-        // not Python-compatible. This will be addressed in parity work.
-        // Full implementation requires passing link key to encrypt the data stream.
-        // Python encrypts the entire data stream with link.encrypt() before splitting into parts.
-        let encrypted = false;
+            // Prepend random hash to processed (possibly compressed) data
+            final_data = Vec::with_capacity(RANDOM_HASH_SIZE + processed_data.len());
+            final_data.extend_from_slice(&random_hash);
+            final_data.extend_from_slice(&processed_data);
 
-        let size = final_data.len();
+            // Encrypt the data stream if an encryption function is provided.
+            // Python encrypts the entire (random_hash + data) stream with
+            // link.encrypt() before splitting into parts.
+            encrypted = if let Some(enc_fn) = encrypt_fn {
+                final_data = enc_fn(&final_data)?;
+                true
+            } else {
+                false
+            };
 
-        // Calculate hashes
-        // NOTE: Python hashes the uncompressed (metadata + data) + random_hash
-        // The processed_data before random_hash prefix may be compressed,
-        // but for hash we use the uncompressed data
-        let hash = Hash::new(
-            Hash::generator()
-                .chain_update(&uncompressed_data) // Includes metadata, uncompressed
-                .chain_update(random_hash)
-                .finalize()
-                .into(),
-        );
+            size = final_data.len();
 
-        let truncated_hash = {
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(&hash.as_bytes()[..16]);
-            arr
-        };
+            // Calculate hashes
+            // NOTE: Python hashes the uncompressed (metadata + data) + random_hash
+            hash = Hash::new(
+                Hash::generator()
+                    .chain_update(&uncompressed_data)
+                    .chain_update(random_hash)
+                    .finalize()
+                    .into(),
+            );
 
-        let original_hash = *hash.as_bytes();
+            truncated_hash = {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&hash.as_bytes()[..16]);
+                arr
+            };
 
-        // Expected proof is Hash(uncompressed_data + hash)
-        let expected_proof = Hash::new(
-            Hash::generator()
-                .chain_update(&uncompressed_data) // Includes metadata, uncompressed
-                .chain_update(hash.as_bytes())
-                .finalize()
-                .into(),
-        );
+            original_hash = *hash.as_bytes();
 
-        // Calculate number of parts
-        let total_parts = size.div_ceil(sdu);
+            // Expected proof is Hash(uncompressed_data + hash)
+            expected_proof = Hash::new(
+                Hash::generator()
+                    .chain_update(&uncompressed_data)
+                    .chain_update(hash.as_bytes())
+                    .finalize()
+                    .into(),
+            );
 
-        // Build parts and hashmap
-        let mut parts = Vec::with_capacity(total_parts);
-        let mut hashmap = Vec::with_capacity(total_parts * MAPHASH_LEN);
-        let mut collision_guard = Vec::with_capacity(total_parts.min(256));
+            // Calculate number of parts
+            total_parts = size.div_ceil(sdu);
 
-        for i in 0..total_parts {
-            let start = i * sdu;
-            let end = ((i + 1) * sdu).min(size);
-            let part_data = final_data[start..end].to_vec();
+            // Build parts and hashmap
+            parts = Vec::with_capacity(total_parts);
+            hashmap = Vec::with_capacity(total_parts * MAPHASH_LEN);
+            let mut collision_guard = Vec::with_capacity(total_parts.min(256));
+            let mut collision = false;
 
-            // Calculate map hash for this part
-            let map_hash = calculate_map_hash(&part_data, &random_hash);
+            for i in 0..total_parts {
+                let start = i * sdu;
+                let end = ((i + 1) * sdu).min(size);
+                let part_data = final_data[start..end].to_vec();
 
-            // Check for collisions
-            if collision_guard.contains(&map_hash) {
-                // In production, we would regenerate with a new random hash
-                // For now, just return an error
+                let map_hash = calculate_map_hash(&part_data, &random_hash);
+
+                if collision_guard.contains(&map_hash) {
+                    collision = true;
+                    break;
+                }
+                collision_guard.push(map_hash);
+                if collision_guard.len() > 256 {
+                    collision_guard.remove(0);
+                }
+
+                hashmap.extend_from_slice(&map_hash);
+                parts.push(ResourcePart {
+                    data: part_data,
+                    map_hash,
+                    sent: false,
+                });
+            }
+
+            if !collision {
+                break;
+            }
+
+            retry += 1;
+            if retry >= MAX_COLLISION_RETRIES {
+                log::error!(
+                    "resource: hashmap collision not resolved after {} retries",
+                    MAX_COLLISION_RETRIES
+                );
                 return Err(RnsError::CryptoError);
             }
-            collision_guard.push(map_hash);
-            if collision_guard.len() > 256 {
-                collision_guard.remove(0);
-            }
-
-            hashmap.extend_from_slice(&map_hash);
-            parts.push(ResourcePart {
-                data: part_data,
-                map_hash,
-                sent: false,
-            });
+            log::debug!(
+                "resource: hashmap collision, regenerating (retry {}/{})",
+                retry,
+                MAX_COLLISION_RETRIES
+            );
         }
 
         // Determine if we need to split into segments
@@ -360,8 +427,13 @@ impl Resource {
             req_data_rtt_rate: 0.0,
             last_activity: Instant::now(),
             started_transferring: None,
+            adv_sent: None,
             last_part_sent: None,
             retries_left: config.max_retries,
+            timeout: config.timeout.unwrap_or(Duration::from_secs(15)),
+            timeout_factor: PART_TIMEOUT_FACTOR,
+            part_timeout_factor: PART_TIMEOUT_FACTOR,
+            sender_grace_time: SENDER_GRACE_TIME,
             config,
             request_id: None,
             metadata: metadata_bytes,
@@ -424,8 +496,13 @@ impl Resource {
             req_data_rtt_rate: 0.0,
             last_activity: Instant::now(),
             started_transferring: Some(Instant::now()),
+            adv_sent: None,
             last_part_sent: None,
             retries_left: MAX_RETRIES,
+            timeout: Duration::from_secs(15),
+            timeout_factor: PART_TIMEOUT_FACTOR,
+            part_timeout_factor: PART_TIMEOUT_FACTOR,
+            sender_grace_time: SENDER_GRACE_TIME,
             config: ResourceConfig::default(),
             request_id: adv.request_id,
             metadata: None,
@@ -535,6 +612,131 @@ impl Resource {
     /// Set completion callback
     pub fn set_completion_callback(&mut self, callback: CompletionCallback) {
         self.completion_callback = Some(callback);
+    }
+
+    // --- Watchdog-accessible state ---
+
+    /// Get time of last activity
+    pub fn last_activity(&self) -> Instant {
+        self.last_activity
+    }
+
+    /// Update last activity to now
+    pub fn touch_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Get time when advertisement was sent
+    pub fn adv_sent(&self) -> Option<Instant> {
+        self.adv_sent
+    }
+
+    /// Record that advertisement was sent now
+    pub fn mark_adv_sent(&mut self) {
+        let now = Instant::now();
+        self.adv_sent = Some(now);
+        self.last_activity = now;
+    }
+
+    /// Get time of last part sent
+    pub fn last_part_sent(&self) -> Option<Instant> {
+        self.last_part_sent
+    }
+
+    /// Reset last_part_sent timestamp to now (used by watchdog for proof query retries)
+    pub fn reset_last_part_sent(&mut self) {
+        self.last_part_sent = Some(Instant::now());
+    }
+
+    /// Get the resource timeout
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Set the resource timeout (e.g. from link RTT * traffic_timeout_factor)
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    /// Get remaining retries
+    pub fn retries_left(&self) -> u32 {
+        self.retries_left
+    }
+
+    /// Decrement retries remaining; returns new count
+    pub fn decrement_retries(&mut self) -> u32 {
+        self.retries_left = self.retries_left.saturating_sub(1);
+        self.retries_left
+    }
+
+    /// Get RTT estimate
+    pub fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
+    /// Get outstanding parts count
+    pub fn outstanding_parts(&self) -> usize {
+        self.outstanding_parts
+    }
+
+    /// Get SDU (part size)
+    pub fn sdu(&self) -> usize {
+        self.sdu
+    }
+
+    /// Get expected in-flight rate (bits per second)
+    pub fn eifr(&self) -> Option<f64> {
+        self.eifr
+    }
+
+    /// Get request-response RTT rate
+    pub fn req_resp_rtt_rate(&self) -> f64 {
+        self.req_resp_rtt_rate
+    }
+
+    /// Get part timeout factor
+    pub fn part_timeout_factor(&self) -> f64 {
+        self.part_timeout_factor
+    }
+
+    /// Set part timeout factor
+    pub fn set_part_timeout_factor(&mut self, factor: f64) {
+        self.part_timeout_factor = factor;
+    }
+
+    /// Get timeout factor
+    pub fn timeout_factor(&self) -> f64 {
+        self.timeout_factor
+    }
+
+    /// Set timeout factor
+    pub fn set_timeout_factor(&mut self, factor: f64) {
+        self.timeout_factor = factor;
+    }
+
+    /// Get sender grace time
+    pub fn sender_grace_time(&self) -> f64 {
+        self.sender_grace_time
+    }
+
+    /// Get whether waiting for hashmap update
+    pub fn waiting_for_hmu(&self) -> bool {
+        self.waiting_for_hmu
+    }
+
+    /// Clear the waiting-for-HMU flag
+    pub fn clear_waiting_for_hmu(&mut self) {
+        self.waiting_for_hmu = false;
+    }
+
+    /// Get the expected proof hash
+    pub fn expected_proof(&self) -> &[u8; 32] {
+        &self.expected_proof
+    }
+
+    /// Get max retries from config
+    pub fn max_retries(&self) -> u32 {
+        self.config.max_retries
     }
 
     /// Create a resource advertisement
@@ -994,8 +1196,12 @@ impl Resource {
     }
 
     /// Handle an incoming resource request (for outgoing resources).
-    /// Returns a list of part indices that should be sent.
-    pub fn handle_request(&mut self, request_data: &[u8]) -> Result<(bool, Vec<usize>), RnsError> {
+    ///
+    /// Returns a `HandleRequestResult` containing:
+    /// - The part indices to send
+    /// - Optional hashmap update data if the receiver needs more entries
+    /// - Whether all parts have been sent (caller should transition to AwaitingProof)
+    pub fn handle_request(&mut self, request_data: &[u8]) -> Result<HandleRequestResult, RnsError> {
         if request_data.is_empty() {
             return Err(RnsError::InvalidArgument);
         }
@@ -1021,6 +1227,28 @@ impl Resource {
             pad,
             requested_hashes.len()
         );
+
+        // Determine the hashmap update segment if the receiver needs more entries
+        let hashmap_update = if wants_more_hashmap {
+            // Find the segment based on the last hash the receiver has.
+            // The receiver sends their last map_hash in bytes 1..(1+MAPHASH_LEN).
+            let last_hash = &request_data[1..1 + MAPHASH_LEN];
+
+            // Find which segment contains this hash
+            let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
+            let mut segment = 0;
+            for i in 0..self.total_parts {
+                let h_start = i * MAPHASH_LEN;
+                let h_end = h_start + MAPHASH_LEN;
+                if h_end <= self.hashmap.len() && &self.hashmap[h_start..h_end] == last_hash {
+                    segment = (i / seg_len) + 1; // Next segment after the one containing this hash
+                    break;
+                }
+            }
+            Some(self.get_hashmap_update(segment))
+        } else {
+            None
+        };
 
         // Define search scope based on receiver's state
         let search_start = self.receiver_min_consecutive_height;
@@ -1070,7 +1298,14 @@ impl Resource {
         }
         self.retries_left = MAX_RETRIES;
 
-        Ok((wants_more_hashmap, parts_to_send))
+        // Check if all parts will have been sent after this batch
+        let all_parts_sent = self.all_parts_sent();
+
+        Ok(HandleRequestResult {
+            parts_to_send,
+            hashmap_update,
+            all_parts_sent,
+        })
     }
 
     /// Get hashmap data for a hashmap update packet.
@@ -1173,6 +1408,11 @@ impl Resource {
         true
     }
 
+    /// Check if all parts have been sent (for outgoing resources).
+    pub fn all_parts_sent(&self) -> bool {
+        self.sent_parts >= self.total_parts
+    }
+
     /// Get part data for sending (for outgoing resources).
     pub fn get_part_data(&self, index: usize) -> Option<&[u8]> {
         self.parts.get(index).map(|p| p.data.as_slice())
@@ -1209,7 +1449,7 @@ mod tests {
         let data = b"Hello, Resource Transfer!";
 
         let resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create resource");
+            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Total size is the uncompressed data length (not including random hash)
         assert_eq!(resource.total_size(), data.len());
@@ -1223,7 +1463,7 @@ mod tests {
         let data = b"Data with metadata";
         let metadata = b"filename.txt";
 
-        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), Some(metadata))
+        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), Some(metadata), None)
             .expect("create resource");
 
         assert!(resource.flags.has_metadata);
@@ -1235,7 +1475,7 @@ mod tests {
         let data = vec![0x41u8; 1000]; // 1KB of 'A'
 
         let resource =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Verify parts were created
         assert!(resource.total_parts() > 0);
@@ -1260,7 +1500,7 @@ mod tests {
 
         // Create outgoing resource to get parts
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         // Create incoming resource from advertisement
         let adv = outgoing.create_advertisement();
@@ -1288,7 +1528,7 @@ mod tests {
         let data = vec![0x43u8; 2000]; // Large enough for multiple parts
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1312,7 +1552,7 @@ mod tests {
         let data = vec![0x44u8; 1000];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1333,7 +1573,7 @@ mod tests {
         let data = vec![0x45u8; 500];
 
         let mut resource =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Create a mock request with the first part hash
         let mut request_data = Vec::new();
@@ -1344,10 +1584,10 @@ mod tests {
         let result = resource.handle_request(&request_data);
         assert!(result.is_ok());
 
-        let (wants_more, parts) = result.unwrap();
-        assert!(!wants_more);
-        assert!(!parts.is_empty());
-        assert_eq!(parts[0], 0); // Should request first part
+        let result = result.unwrap();
+        assert!(result.hashmap_update.is_none());
+        assert!(!result.parts_to_send.is_empty());
+        assert_eq!(result.parts_to_send[0], 0); // Should request first part
     }
 
     #[test]
@@ -1356,7 +1596,7 @@ mod tests {
         let data = b"Data for proof testing";
 
         let resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create resource");
+            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Generate proof
         let proof = resource.generate_proof();
@@ -1379,7 +1619,7 @@ mod tests {
         let data = vec![0x46u8; 500];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1398,7 +1638,7 @@ mod tests {
         let data = vec![0x47u8; 500];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1431,7 +1671,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, data, config, None).expect("create resource");
+        let resource = Resource::new(&mut rng, data, config, None, None).expect("create resource");
 
         // Small data might not compress well, could be either compressed or not
         // Just verify resource was created successfully
@@ -1449,7 +1689,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, &data, config, None).expect("create resource");
+        let resource = Resource::new(&mut rng, &data, config, None, None).expect("create resource");
 
         // Verify it's marked as compressed
         assert!(resource.is_compressed());
@@ -1470,7 +1710,7 @@ mod tests {
         };
 
         let outgoing =
-            Resource::new(&mut rng, original_data, config, None).expect("create outgoing resource");
+            Resource::new(&mut rng, original_data, config, None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1503,7 +1743,7 @@ mod tests {
         };
 
         let outgoing =
-            Resource::new(&mut rng, data, config, None).expect("create outgoing resource");
+            Resource::new(&mut rng, data, config, None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
@@ -1529,7 +1769,7 @@ mod tests {
         let data = b"Data to cancel";
 
         let mut resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create resource");
+            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         assert_ne!(resource.status(), ResourceStatus::Failed);
 
@@ -1544,7 +1784,7 @@ mod tests {
         let data = b"RTT test";
 
         let outgoing =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None).expect("create outgoing resource");
+            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
