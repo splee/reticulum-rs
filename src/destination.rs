@@ -840,7 +840,9 @@ impl Destination<PrivateIdentity, Input, Single> {
         plaintext: &[u8],
         ratchet: Option<&[u8]>,
     ) -> Result<Vec<u8>, RnsError> {
-        let salt = self.desc.address_hash.as_slice();
+        // Python uses Identity.get_salt() which returns self.hash (the identity hash),
+        // not the destination address hash.
+        let salt = self.desc.identity.address_hash.as_slice();
         let target_pub = if let Some(ratchet) = ratchet {
             if ratchet.len() != RATCHET_KEY_SIZE {
                 return Err(RnsError::InvalidArgument);
@@ -876,7 +878,9 @@ impl Destination<PrivateIdentity, Input, Single> {
         ratchets: Option<&[Vec<u8>]>,
         enforce_ratchets: bool,
     ) -> Result<DecryptResult, RnsError> {
-        let salt = self.desc.address_hash.as_slice();
+        // Python uses Identity.get_salt() which returns self.hash (the identity hash),
+        // not the destination address hash.
+        let salt = self.desc.identity.address_hash.as_slice();
         decrypt_single(rng, salt, &self.identity, ciphertext, ratchets, enforce_ratchets)
     }
 
@@ -1010,7 +1014,9 @@ impl Destination<Identity, Output, Single> {
             Some(get_ratchet_id(&rbytes))
         });
 
-        let salt = self.desc.address_hash.as_slice();
+        // Python uses Identity.get_salt() which returns self.hash (the identity hash),
+        // not the destination address hash.
+        let salt = self.desc.identity.address_hash.as_slice();
         let target_pub = if let Some(ratchet) = selected_ratchet.as_deref() {
             if ratchet.len() != RATCHET_KEY_SIZE {
                 return Err(RnsError::InvalidArgument);

@@ -1003,9 +1003,10 @@ fn encrypt_for_identity<'a>(
     // Derive shared secret using ephemeral key and recipient's public key
     let shared_secret = ephemeral_secret.diffie_hellman(&identity.public_key);
 
-    // Derive encryption key using Python-compatible HKDF
+    // Derive encryption key using Python-compatible HKDF.
+    // Python uses Identity.get_salt() (the identity hash) as the HKDF salt.
     let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    hkdf_into(shared_secret.as_bytes(), None, None, &mut derived_key);
+    hkdf_into(shared_secret.as_bytes(), Some(identity.address_hash.as_slice()), None, &mut derived_key);
 
     // Write ephemeral public key to output
     let mut offset = 0;
@@ -1052,9 +1053,10 @@ fn decrypt_with_identity<'a>(
     // Derive shared secret
     let shared_secret = static_secret.diffie_hellman(&ephemeral_public);
 
-    // Derive decryption key using Python-compatible HKDF
+    // Derive decryption key using Python-compatible HKDF.
+    // Python uses Identity.get_salt() (the identity hash) as the HKDF salt.
     let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    hkdf_into(shared_secret.as_bytes(), None, None, &mut derived_key);
+    hkdf_into(shared_secret.as_bytes(), Some(identity.as_identity().address_hash.as_slice()), None, &mut derived_key);
 
     // Decrypt with Fernet
     let fernet = Fernet::new_from_slices(
