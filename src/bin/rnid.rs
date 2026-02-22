@@ -13,15 +13,11 @@ use clap::Parser;
 use data_encoding::{BASE32, BASE64};
 use ed25519_dalek::Signature;
 use rand_core::OsRng;
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
-
 use reticulum::cli::format::{format_hash, spinner_char};
 use reticulum::config::{LogLevel, ReticulumConfig};
-use reticulum::crypt::fernet::{Fernet, PlainText, Token};
-use reticulum::crypt::hkdf::hkdf_into;
 use reticulum::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
 use reticulum::hash::AddressHash;
-use reticulum::identity::{Identity, PrivateIdentity, DERIVED_KEY_LENGTH};
+use reticulum::identity::{Identity, PrivateIdentity};
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::logging;
@@ -35,12 +31,6 @@ const ENCRYPT_EXT: &str = "rfe";
 
 /// Chunk size for file encryption/decryption (16 MB, matching Python)
 const CHUNK_SIZE: usize = 16 * 1024 * 1024;
-
-/// Fernet overhead: 16 bytes IV + 32 bytes HMAC + padding
-const FERNET_OVERHEAD: usize = 48 + 16;
-
-/// Ephemeral public key size prepended to encrypted data
-const EPHEMERAL_KEY_SIZE: usize = 32;
 
 // Exit codes matching Python implementation
 const EXIT_OK: i32 = 0;
@@ -758,7 +748,6 @@ fn handle_encrypt(args: &Args, identity: &Identity, encrypt_file: &PathBuf) -> i
 
     // Process in chunks
     let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut out_buffer = vec![0u8; CHUNK_SIZE + EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD];
 
     loop {
         let bytes_read = match input_file.read(&mut buffer) {
@@ -770,20 +759,20 @@ fn handle_encrypt(args: &Args, identity: &Identity, encrypt_file: &PathBuf) -> i
             }
         };
 
-        // Encrypt chunk
-        match encrypt_for_identity(identity, &buffer[..bytes_read], &mut out_buffer) {
+        // Encrypt chunk using Identity::encrypt_for()
+        match identity.encrypt_for(OsRng, &buffer[..bytes_read]) {
             Ok(encrypted) => {
                 // Write length prefix (4 bytes big-endian) + encrypted data
                 let len_bytes = (encrypted.len() as u32).to_be_bytes();
                 if output_file.write_all(&len_bytes).is_err()
-                    || output_file.write_all(encrypted).is_err()
+                    || output_file.write_all(&encrypted).is_err()
                 {
                     eprintln!("Error writing output");
                     return EXIT_ENCRYPT_WRITE_ERROR;
                 }
             }
             Err(e) => {
-                eprintln!("Error encrypting data: {}", e);
+                eprintln!("Error encrypting data: {:?}", e);
                 return EXIT_ENCRYPT_WRITE_ERROR;
             }
         }
@@ -846,7 +835,6 @@ fn handle_decrypt(args: &Args, identity: &PrivateIdentity, decrypt_file: &PathBu
 
     // Process chunks
     let mut len_buffer = [0u8; 4];
-    let mut out_buffer = vec![0u8; CHUNK_SIZE];
 
     loop {
         // Read length prefix
@@ -870,16 +858,16 @@ fn handle_decrypt(args: &Args, identity: &PrivateIdentity, decrypt_file: &PathBu
             }
         }
 
-        // Decrypt chunk
-        match decrypt_with_identity(identity, &chunk, &mut out_buffer) {
+        // Decrypt chunk using PrivateIdentity::decrypt_for()
+        match identity.decrypt_for(OsRng, &chunk) {
             Ok(decrypted) => {
-                if output_file.write_all(decrypted).is_err() {
+                if output_file.write_all(&decrypted).is_err() {
                     eprintln!("Error writing output");
                     return EXIT_DECRYPT_WRITE_ERROR;
                 }
             }
             Err(e) => {
-                eprintln!("Error decrypting data: {}", e);
+                eprintln!("Error decrypting data: {:?}", e);
                 return EXIT_DECRYPT_FAILED;
             }
         }
@@ -920,7 +908,7 @@ async fn handle_announce(args: &Args, identity: &PrivateIdentity, aspects: &str)
             return EXIT_GENERAL_ERROR;
         }
     };
-    let destination = SingleInputDestination::new(identity.clone(), name);
+    let mut destination = SingleInputDestination::new(identity.clone(), name);
 
     log::info!(
         "Created destination {}",
@@ -988,93 +976,6 @@ async fn create_transport(args: &Args, _config: &ReticulumConfig) -> Transport {
     // if socket_dir.exists() { ... }
 
     transport
-}
-
-/// Encrypt data for a public identity
-fn encrypt_for_identity<'a>(
-    identity: &Identity,
-    plaintext: &[u8],
-    out_buf: &'a mut [u8],
-) -> Result<&'a [u8], String> {
-    // Generate ephemeral key for key exchange
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_public = PublicKey::from(&ephemeral_secret);
-
-    // Derive shared secret using ephemeral key and recipient's public key
-    let shared_secret = ephemeral_secret.diffie_hellman(&identity.public_key);
-
-    // Derive encryption key using Python-compatible HKDF.
-    // Python uses Identity.get_salt() (the identity hash) as the HKDF salt.
-    let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    hkdf_into(shared_secret.as_bytes(), Some(identity.address_hash.as_slice()), None, &mut derived_key);
-
-    // Write ephemeral public key to output
-    let mut offset = 0;
-    out_buf[..EPHEMERAL_KEY_SIZE].copy_from_slice(ephemeral_public.as_bytes());
-    offset += EPHEMERAL_KEY_SIZE;
-
-    // Encrypt with Fernet
-    let fernet = Fernet::new_from_slices(
-        &derived_key[..DERIVED_KEY_LENGTH / 2],
-        &derived_key[DERIVED_KEY_LENGTH / 2..],
-        OsRng,
-    );
-
-    let token = fernet
-        .encrypt(PlainText::from(plaintext), &mut out_buf[offset..])
-        .map_err(|e| format!("Encryption failed: {:?}", e))?;
-
-    offset += token.as_bytes().len();
-
-    Ok(&out_buf[..offset])
-}
-
-/// Decrypt data with a private identity
-fn decrypt_with_identity<'a>(
-    identity: &PrivateIdentity,
-    ciphertext: &[u8],
-    out_buf: &'a mut [u8],
-) -> Result<&'a [u8], String> {
-    if ciphertext.len() <= EPHEMERAL_KEY_SIZE {
-        return Err("Ciphertext too short".to_string());
-    }
-
-    // Extract ephemeral public key
-    let mut ephemeral_bytes = [0u8; 32];
-    ephemeral_bytes.copy_from_slice(&ciphertext[..EPHEMERAL_KEY_SIZE]);
-    let ephemeral_public = PublicKey::from(ephemeral_bytes);
-
-    // Get our private key bytes and create StaticSecret for DH
-    let private_bytes = identity.to_bytes();
-    let mut prv_key_bytes = [0u8; 32];
-    prv_key_bytes.copy_from_slice(&private_bytes[..32]);
-    let static_secret = StaticSecret::from(prv_key_bytes);
-
-    // Derive shared secret
-    let shared_secret = static_secret.diffie_hellman(&ephemeral_public);
-
-    // Derive decryption key using Python-compatible HKDF.
-    // Python uses Identity.get_salt() (the identity hash) as the HKDF salt.
-    let mut derived_key = [0u8; DERIVED_KEY_LENGTH];
-    hkdf_into(shared_secret.as_bytes(), Some(identity.as_identity().address_hash.as_slice()), None, &mut derived_key);
-
-    // Decrypt with Fernet
-    let fernet = Fernet::new_from_slices(
-        &derived_key[..DERIVED_KEY_LENGTH / 2],
-        &derived_key[DERIVED_KEY_LENGTH / 2..],
-        OsRng,
-    );
-
-    let token = Token::from(&ciphertext[EPHEMERAL_KEY_SIZE..]);
-    let verified_token = fernet
-        .verify(token)
-        .map_err(|_| "Token verification failed")?;
-
-    let plaintext = fernet
-        .decrypt(verified_token, out_buf)
-        .map_err(|e| format!("Decryption failed: {:?}", e))?;
-
-    Ok(plaintext.as_slice())
 }
 
 /// Print identity information
@@ -1292,17 +1193,13 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let plaintext = b"Secret message for Reticulum testing!";
 
-        let mut encrypted_buf = vec![0u8; plaintext.len() + EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD];
-        let mut decrypted_buf = vec![0u8; plaintext.len() + 16]; // Allow for padding
-
         // Encrypt using public identity
-        let encrypted =
-            encrypt_for_identity(identity.as_identity(), plaintext, &mut encrypted_buf).unwrap();
+        let encrypted = identity.as_identity().encrypt_for(OsRng, plaintext).unwrap();
 
         // Decrypt using private identity
-        let decrypted = decrypt_with_identity(&identity, encrypted, &mut decrypted_buf).unwrap();
+        let decrypted = identity.decrypt_for(OsRng, &encrypted).unwrap();
 
-        assert_eq!(plaintext.as_slice(), decrypted);
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
     #[test]
@@ -1310,14 +1207,10 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let plaintext = b"";
 
-        let mut encrypted_buf = vec![0u8; EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD + 16];
-        let mut decrypted_buf = vec![0u8; 64];
+        let encrypted = identity.as_identity().encrypt_for(OsRng, plaintext).unwrap();
+        let decrypted = identity.decrypt_for(OsRng, &encrypted).unwrap();
 
-        let encrypted =
-            encrypt_for_identity(identity.as_identity(), plaintext, &mut encrypted_buf).unwrap();
-        let decrypted = decrypt_with_identity(&identity, encrypted, &mut decrypted_buf).unwrap();
-
-        assert_eq!(plaintext.as_slice(), decrypted);
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
     #[test]
@@ -1326,14 +1219,10 @@ mod tests {
         // Test with 1KB of data
         let plaintext: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
 
-        let mut encrypted_buf = vec![0u8; plaintext.len() + EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD];
-        let mut decrypted_buf = vec![0u8; plaintext.len() + 16];
+        let encrypted = identity.as_identity().encrypt_for(OsRng, &plaintext).unwrap();
+        let decrypted = identity.decrypt_for(OsRng, &encrypted).unwrap();
 
-        let encrypted =
-            encrypt_for_identity(identity.as_identity(), &plaintext, &mut encrypted_buf).unwrap();
-        let decrypted = decrypt_with_identity(&identity, encrypted, &mut decrypted_buf).unwrap();
-
-        assert_eq!(plaintext.as_slice(), decrypted);
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
     #[test]
@@ -1342,15 +1231,11 @@ mod tests {
         let identity2 = PrivateIdentity::new_from_rand(OsRng);
         let plaintext = b"Secret message";
 
-        let mut encrypted_buf = vec![0u8; plaintext.len() + EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD];
-        let mut decrypted_buf = vec![0u8; plaintext.len() + 16];
-
         // Encrypt for identity1
-        let encrypted =
-            encrypt_for_identity(identity1.as_identity(), plaintext, &mut encrypted_buf).unwrap();
+        let encrypted = identity1.as_identity().encrypt_for(OsRng, plaintext).unwrap();
 
         // Try to decrypt with identity2 - should fail
-        let result = decrypt_with_identity(&identity2, encrypted, &mut decrypted_buf);
+        let result = identity2.decrypt_for(OsRng, &encrypted);
         assert!(result.is_err());
     }
 
@@ -1359,32 +1244,26 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let plaintext = b"Secret message";
 
-        let mut encrypted_buf = vec![0u8; plaintext.len() + EPHEMERAL_KEY_SIZE + FERNET_OVERHEAD];
-        let mut decrypted_buf = vec![0u8; plaintext.len() + 16];
-
-        let encrypted =
-            encrypt_for_identity(identity.as_identity(), plaintext, &mut encrypted_buf).unwrap();
+        let encrypted = identity.as_identity().encrypt_for(OsRng, plaintext).unwrap();
 
         // Corrupt the encrypted data
-        let mut corrupted = encrypted.to_vec();
+        let mut corrupted = encrypted.clone();
         if corrupted.len() > 40 {
             corrupted[40] ^= 0xFF; // Flip bits in the ciphertext
         }
 
-        let result = decrypt_with_identity(&identity, &corrupted, &mut decrypted_buf);
+        let result = identity.decrypt_for(OsRng, &corrupted);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_decrypt_too_short_fails() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let mut decrypted_buf = vec![0u8; 64];
 
         // Data shorter than ephemeral key size
         let short_data = vec![0u8; 16];
-        let result = decrypt_with_identity(&identity, &short_data, &mut decrypted_buf);
+        let result = identity.decrypt_for(OsRng, &short_data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too short"));
     }
 
     // ==========================================================================

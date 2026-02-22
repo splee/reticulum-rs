@@ -204,6 +204,36 @@ impl Identity {
         DerivedKey::new_from_ephemeral_key(rng, &self.public_key, salt)
     }
 
+    /// Get the full 32-byte SHA-256 hash of this identity's public key material.
+    ///
+    /// This is the full hash before truncation to the 16-byte address_hash.
+    /// Equivalent to Python's `Identity.get_public_key()` hashed via
+    /// `Identity.full_hash()`.
+    pub fn full_hash(&self) -> [u8; crate::hash::HASH_SIZE] {
+        Hash::new(
+            Hash::generator()
+                .chain_update(self.public_key.as_bytes())
+                .chain_update(self.verifying_key.as_bytes())
+                .finalize()
+                .into(),
+        )
+        .to_bytes()
+    }
+
+    /// Encrypt plaintext for this identity, matching Python's `Identity.encrypt()`.
+    ///
+    /// Wire format: `[ephemeral_public_key(32) || Fernet_token]`
+    ///
+    /// The HKDF salt is the identity's `address_hash`, matching Python's
+    /// `Identity.get_salt()` which returns `Identity.hash`.
+    pub fn encrypt_for<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, crate::error::RnsError> {
+        crate::destination::encrypt_single(rng, &self.public_key, self.address_hash.as_slice(), plaintext)
+    }
+
     /// Create a public Identity from 64-byte raw data.
     ///
     /// Format: [32 bytes X25519 public key][32 bytes Ed25519 verifying key]
@@ -272,33 +302,17 @@ impl EncryptIdentity for Identity {
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
-        let mut out_offset = 0;
-        let ephemeral_key = EphemeralSecret::random_from_rng(rng);
-        {
-            let ephemeral_public = PublicKey::from(&ephemeral_key);
-            let ephemeral_public_bytes = ephemeral_public.as_bytes();
-
-            if out_buf.len() >= ephemeral_public_bytes.len() {
-                out_buf[..ephemeral_public_bytes.len()].copy_from_slice(ephemeral_public_bytes);
-                out_offset += ephemeral_public_bytes.len();
-            } else {
-                return Err(RnsError::InvalidArgument);
-            }
-        }
-
-        // Split derived key into signing and encryption keys (matching Python's Fernet key handling).
-        // For AES-256 (default): 64-byte key split into 32-byte signing + 32-byte encryption.
-        // For AES-128 (feature): 32-byte key split into 16-byte signing + 16-byte encryption.
+        // Use derived_key directly for Fernet (symmetric encryption).
+        // For asymmetric encryption targeting this identity, use Identity::encrypt_for() instead.
         let token = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
         )
-        .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
+        .encrypt(PlainText::from(text), out_buf)?;
 
-        out_offset += token.as_bytes().len();
-
-        Ok(&out_buf[..out_offset])
+        let len = token.len();
+        Ok(&out_buf[..len])
     }
 }
 
@@ -490,6 +504,27 @@ impl PrivateIdentity {
 
     pub fn exchange(&self, public_key: &PublicKey) -> SharedSecret {
         self.private_key.diffie_hellman(public_key)
+    }
+
+    /// Decrypt ciphertext encrypted for this identity, matching Python's `Identity.decrypt()`.
+    ///
+    /// Extracts the ephemeral public key from the first 32 bytes, performs ECDH,
+    /// derives the Fernet key via HKDF, and decrypts. No ratchet support — use
+    /// `SingleInputDestination::decrypt()` for ratchet-aware decryption.
+    pub fn decrypt_for<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, crate::error::RnsError> {
+        let result = crate::destination::decrypt_single(
+            rng,
+            self.as_identity().address_hash.as_slice(),
+            self,
+            ciphertext,
+            None,
+            false,
+        )?;
+        Ok(result.plaintext)
     }
 
     pub fn derive_key(&self, public_key: &PublicKey, salt: Option<&[u8]>) -> DerivedKey {
@@ -913,5 +948,110 @@ mod tests {
         let sig_bytes = &explicit_proof.data.as_slice()[32..]; // skip hash
         let sig = ed25519_dalek::Signature::from_slice(sig_bytes).expect("valid signature bytes");
         identity.verify(hash.as_slice(), &sig).expect("explicit proof signature should validate");
+    }
+
+    // =========================================================================
+    // encrypt_for / decrypt_for Tests
+    // =========================================================================
+
+    #[test]
+    fn test_encrypt_for_decrypt_for_roundtrip() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+        let plaintext = b"Hello from encrypt_for!";
+
+        let ciphertext = public_id.encrypt_for(OsRng, plaintext).unwrap();
+        let decrypted = private_id.decrypt_for(OsRng, &ciphertext).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_encrypt_for_decrypt_for_empty() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+
+        let ciphertext = public_id.encrypt_for(OsRng, b"").unwrap();
+        let decrypted = private_id.decrypt_for(OsRng, &ciphertext).unwrap();
+
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_encrypt_for_wrong_identity_fails() {
+        let id1 = PrivateIdentity::new_from_rand(OsRng);
+        let id2 = PrivateIdentity::new_from_rand(OsRng);
+
+        let ciphertext = id1.as_identity().encrypt_for(OsRng, b"secret").unwrap();
+        let result = id2.decrypt_for(OsRng, &ciphertext);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypt_for_too_short_ciphertext_fails() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let result = private_id.decrypt_for(OsRng, &[0u8; 16]);
+
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // full_hash Tests
+    // =========================================================================
+
+    #[test]
+    fn test_full_hash_length() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let full = private_id.as_identity().full_hash();
+        assert_eq!(full.len(), crate::hash::HASH_SIZE);
+    }
+
+    #[test]
+    fn test_full_hash_prefix_matches_address_hash() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+
+        let full = public_id.full_hash();
+        let addr = public_id.address_hash.as_slice();
+
+        // address_hash is the first 16 bytes of the full 32-byte hash
+        assert_eq!(&full[..addr.len()], addr);
+    }
+
+    #[test]
+    fn test_full_hash_deterministic() {
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = private_id.as_identity();
+
+        let h1 = public_id.full_hash();
+        let h2 = public_id.full_hash();
+
+        assert_eq!(h1, h2);
+    }
+
+    // =========================================================================
+    // EncryptIdentity / DecryptIdentity symmetric round-trip
+    // =========================================================================
+
+    #[test]
+    fn test_encrypt_identity_symmetric_roundtrip() {
+        // Verify that EncryptIdentity for Identity and DecryptIdentity for PrivateIdentity
+        // work together with a shared derived key (symmetric/link-level encryption).
+        let private_id = PrivateIdentity::new_from_rand(OsRng);
+        let public_id = *private_id.as_identity();
+
+        // Create a shared derived key (simulating link key exchange)
+        let peer = PrivateIdentity::new_from_rand(OsRng);
+        let derived_key = private_id.derive_key(&peer.as_identity().public_key, None);
+
+        let plaintext = b"symmetric encryption test";
+        let mut enc_buf = vec![0u8; plaintext.len() + 128];
+        let mut dec_buf = vec![0u8; plaintext.len() + 128];
+
+        let encrypted = public_id.encrypt(OsRng, plaintext, &derived_key, &mut enc_buf).unwrap();
+        let decrypted = private_id.decrypt(OsRng, encrypted, &derived_key, &mut dec_buf).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted);
     }
 }

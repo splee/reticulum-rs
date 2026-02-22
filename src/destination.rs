@@ -53,7 +53,7 @@ pub struct DecryptResult {
 // SINGLE Destination Crypto Helpers (Python-compatible)
 // ============================================================================
 
-fn encrypt_single<R: CryptoRngCore + Copy>(
+pub(crate) fn encrypt_single<R: CryptoRngCore + Copy>(
     rng: R,
     target_pub: &PublicKey,
     salt: &[u8],
@@ -83,7 +83,7 @@ fn encrypt_single<R: CryptoRngCore + Copy>(
     Ok(out)
 }
 
-fn decrypt_single<R: CryptoRngCore + Copy>(
+pub(crate) fn decrypt_single<R: CryptoRngCore + Copy>(
     rng: R,
     salt: &[u8],
     identity: &PrivateIdentity,
@@ -545,10 +545,23 @@ impl Destination<PrivateIdentity, Input, Single> {
     }
 
     pub fn announce<R: CryptoRngCore + Copy>(
-        &self,
+        &mut self,
         rng: R,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
+        // Auto-rotate ratchet if enabled. When a ratchet is available,
+        // delegate to announce_with_ratchet() so the ratchet public key
+        // is included in the announce and context_flag is set.
+        if self.ratchet_state.is_enabled() {
+            if let Ok(Some(ratchet_pub)) = self.ratchet_state.rotate_if_needed(&self.identity) {
+                // Note: Callers that need to remember this ratchet for remote
+                // destinations should call RatchetManager::remember() separately.
+                // RatchetManager stores OTHER destinations' ratchets; the local
+                // destination's own ratchets are managed by RatchetState.
+                return self.announce_with_ratchet(rng, &ratchet_pub, app_data);
+            }
+        }
+
         let mut packet_data = PacketDataBuffer::new();
 
         // Generate rand_hash matching Python format (Destination.py line 282):
@@ -1084,7 +1097,7 @@ mod tests {
     fn create_announce() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
 
-        let single_in_destination =
+        let mut single_in_destination =
             SingleInputDestination::new(identity, DestinationName::new("test", "in").unwrap());
 
         let announce_packet = single_in_destination
@@ -1123,7 +1136,7 @@ mod tests {
 
         println!("identity hash {}", priv_identity.as_identity().address_hash);
 
-        let destination = SingleInputDestination::new(
+        let mut destination = SingleInputDestination::new(
             priv_identity,
             DestinationName::new("example_utilities", "announcesample.fruits").unwrap(),
         );
@@ -1147,7 +1160,7 @@ mod tests {
     fn check_announce() {
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
 
-        let destination = SingleInputDestination::new(
+        let mut destination = SingleInputDestination::new(
             priv_identity,
             DestinationName::new("example_utilities", "announcesample.fruits").unwrap(),
         );
@@ -1193,7 +1206,7 @@ mod tests {
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
         let original_name = DestinationName::new("testapp", "service").unwrap();
 
-        let destination = SingleInputDestination::new(priv_identity, original_name);
+        let mut destination = SingleInputDestination::new(priv_identity, original_name);
 
         // Create and validate an announce packet
         let announce = destination.announce(OsRng, None).expect("valid announce");
@@ -1214,7 +1227,7 @@ mod tests {
         let priv_identity = PrivateIdentity::new_from_rand(OsRng);
         let original_name = DestinationName::new("testapp", "service").unwrap();
 
-        let destination = SingleInputDestination::new(priv_identity, original_name);
+        let mut destination = SingleInputDestination::new(priv_identity, original_name);
 
         let announce = destination.announce(OsRng, None).expect("valid announce");
 
