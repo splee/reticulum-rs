@@ -66,6 +66,18 @@ impl ResourceProgress {
         (effective_processed / effective_total as f64).min(1.0)
     }
 
+    /// Get segment-local progress (ignoring other segments).
+    /// Returns value between 0.0 and 1.0 for current segment only.
+    pub fn get_segment_progress(&self) -> f64 {
+        if self.status == ResourceStatus::Complete && self.segment_index == self.total_segments {
+            return 1.0;
+        }
+        if self.total_parts == 0 {
+            return 0.0;
+        }
+        (self.processed_parts as f64 / self.total_parts as f64).min(1.0)
+    }
+
     /// Check if resource is split into multiple segments
     pub fn is_split(&self) -> bool {
         self.total_segments > 1

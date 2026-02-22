@@ -50,11 +50,29 @@ pub struct WatchdogConfig {
     pub establishment_timeout: Duration,
 }
 
+/// Timeout per hop for link establishment (matching Python Link.py)
+pub const ESTABLISHMENT_TIMEOUT_PER_HOP: f64 = 6.0;
+
+/// Default keepalive duration used in establishment timeout calculation
+pub const DEFAULT_KEEPALIVE_SECS: f64 = 360.0;
+
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             check_interval: Duration::from_secs(1),
             establishment_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+impl WatchdogConfig {
+    /// Create config for incoming link with hop-aware establishment timeout.
+    pub fn for_incoming_link(hops: u8) -> Self {
+        let effective_hops = (hops as f64).max(1.0);
+        let timeout = ESTABLISHMENT_TIMEOUT_PER_HOP * effective_hops + DEFAULT_KEEPALIVE_SECS;
+        Self {
+            check_interval: Duration::from_secs(1),
+            establishment_timeout: Duration::from_secs_f64(timeout),
         }
     }
 }

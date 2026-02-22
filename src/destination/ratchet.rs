@@ -95,6 +95,17 @@ impl RatchetState {
         Ok(())
     }
 
+    /// Disable ratchets, clearing all keys and persistence.
+    ///
+    /// After calling this, `is_enabled()` returns false and no ratchet keys
+    /// will be used for encryption or decryption.
+    pub fn disable(&mut self) {
+        self.ratchets.clear();
+        self.ratchets_path = None;
+        self.latest_ratchet_id = None;
+        self.latest_ratchet_time = None;
+    }
+
     /// Set whether to enforce ratchet usage for decryption.
     pub fn set_enforce(&mut self, enforce: bool) {
         self.enforce_ratchets = enforce;
@@ -111,8 +122,20 @@ impl RatchetState {
     }
 
     /// Set the number of retained ratchets.
-    pub fn set_retained_count(&mut self, count: usize) {
+    ///
+    /// Immediately prunes excess ratchets and persists if a path is configured.
+    pub fn set_retained_count(&mut self, count: usize, identity: Option<&PrivateIdentity>) {
         self.retained_ratchets = count;
+        // Immediately prune excess ratchets
+        while self.ratchets.len() > self.retained_ratchets {
+            self.ratchets.pop_back();
+        }
+        // Persist if we have a path and identity
+        if self.ratchets_path.is_some() {
+            if let Some(id) = identity {
+                let _ = self.persist(id);
+            }
+        }
     }
 
     /// Get the latest ratchet ID if available.

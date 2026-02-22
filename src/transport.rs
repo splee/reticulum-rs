@@ -1631,7 +1631,7 @@ async fn process_path_request<'a>(
         );
 
         // Create announce with PathResponse context
-        let dest = destination.lock().await;
+        let mut dest = destination.lock().await;
         if let Ok(mut announce_packet) = dest.announce(OsRng, None) {
             announce_packet.context = PacketContext::PathResponse;
             drop(dest);
@@ -2828,7 +2828,7 @@ mod tests {
 
         // Create an identity and build a valid announce packet
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let destination =
+        let mut destination =
             SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app").unwrap());
         let announce = destination
             .announce(OsRng, None)
@@ -2868,7 +2868,7 @@ mod tests {
         let identity_b = PrivateIdentity::new_from_rand(OsRng);
 
         // Create a valid announce from identity A
-        let dest_a =
+        let mut dest_a =
             SingleInputDestination::new(identity_a.clone(), DestinationName::new("test", "app").unwrap());
         let announce_a = dest_a
             .announce(OsRng, None)
@@ -2930,7 +2930,7 @@ mod tests {
         let handler = transport.get_handler();
 
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let destination =
+        let mut destination =
             SingleInputDestination::new(identity.clone(), DestinationName::new("test", "app").unwrap());
         let announce = destination
             .announce(OsRng, None)

@@ -25,6 +25,12 @@ pub const IMPLICIT_PROOF_LENGTH: usize = SIGNATURE_LENGTH;
 /// Default timeout per hop in seconds
 pub const TIMEOUT_PER_HOP: f64 = 6.0;
 
+/// Traffic timeout factor matching Python's Packet.py
+pub const TRAFFIC_TIMEOUT_FACTOR: f64 = 6.0;
+
+/// Minimum traffic timeout (5 milliseconds)
+pub const TRAFFIC_TIMEOUT_MIN_SECS: f64 = 0.005;
+
 /// Receipt status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -126,9 +132,10 @@ impl PacketReceipt {
 
         // Calculate timeout based on hops and link status
         let timeout = if is_link {
-            // For links, use RTT-based timeout
+            // For links, use RTT-based timeout with minimum floor
             let base_timeout = rtt.unwrap_or(TIMEOUT_PER_HOP);
-            Duration::from_secs_f64(base_timeout * 4.0) // traffic_timeout_factor
+            let computed = base_timeout * TRAFFIC_TIMEOUT_FACTOR;
+            Duration::from_secs_f64(computed.max(TRAFFIC_TIMEOUT_MIN_SECS))
         } else {
             // For regular packets, use hop-based timeout
             let base = TIMEOUT_PER_HOP;

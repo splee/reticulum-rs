@@ -32,6 +32,7 @@ use crate::APP_NAME;
 async fn handle_resource_request(
     transport: &Transport,
     link: &Arc<tokio::sync::Mutex<Link>>,
+    link_id: &AddressHash,
     resource: &Arc<tokio::sync::Mutex<Resource>>,
     payload: &[u8],
     progress: &mut TransferProgress,
@@ -41,11 +42,10 @@ async fn handle_resource_request(
     log::info!("Received resource request ({} bytes)", payload.len());
 
     // Handle request and collect parts to send
-    let parts_to_send = {
+    let (parts_to_send, hashmap_update) = {
         let mut resource_guard = resource.lock().await;
         match resource_guard.handle_request(payload) {
             Ok(result) => {
-                // TODO: send hashmap_update if result.hashmap_update.is_some()
                 let parts: Vec<_> = result.parts_to_send
                     .iter()
                     .filter_map(|&idx| {
@@ -54,7 +54,7 @@ async fn handle_resource_request(
                             .map(|d| (idx, d.to_vec()))
                     })
                     .collect();
-                parts
+                (parts, result.hashmap_update)
             }
             Err(e) => {
                 log::error!("Failed to handle resource request: {:?}", e);
@@ -62,6 +62,12 @@ async fn handle_resource_request(
             }
         }
     };
+
+    // Send hashmap update if the receiver needs more hashmap entries
+    if let Some(ref hmu_data) = hashmap_update {
+        log::info!("Sending hashmap update ({} bytes)", hmu_data.len());
+        transport.send_resource_hashmap_update(link_id, hmu_data).await;
+    }
 
     // Send requested parts
     for (part_idx, part_data) in parts_to_send {
@@ -304,6 +310,7 @@ pub async fn run_send_mode(
                             handle_resource_request(
                                 &transport,
                                 &link,
+                                &link_id,
                                 &resource,
                                 payload.as_slice(),
                                 &mut progress,

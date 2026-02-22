@@ -501,31 +501,25 @@ async fn handle_link_event(
                 payload.len()
             );
 
-            // The hashmap update contains: [resource_hash:16][hashmap_data...]
-            if payload.len() < 16 {
-                log::error!("Hashmap update too short");
-                return false;
-            }
+            // Parse HMU: [full_hash (32 bytes)] + [msgpack([segment, hashmap_bytes])]
+            if let Some((resource_hash, segment, hashmap_data)) =
+                reticulum::resource::Resource::parse_hashmap_update(payload.as_slice())
+            {
+                let mut resources = incoming_resources.write().await;
+                if let Some(tracked) = resources.get_mut(&resource_hash) {
+                    tracked.resource.update_hashmap(segment, &hashmap_data);
 
-            let mut resource_hash = [0u8; 16];
-            resource_hash.copy_from_slice(&payload.as_slice()[..16]);
-            let hashmap_data = &payload.as_slice()[16..];
+                    println!(
+                        "RESOURCE_HASHMAP_UPDATED={}:{}:{}",
+                        link_id_hex,
+                        hex::encode(resource_hash),
+                        hashmap_data.len()
+                    );
 
-            let mut resources = incoming_resources.write().await;
-            if let Some(tracked) = resources.get_mut(&resource_hash) {
-                // Update the hashmap (segment 0 for now, can be improved)
-                tracked.resource.update_hashmap(0, hashmap_data);
-
-                println!(
-                    "RESOURCE_HASHMAP_UPDATED={}:{}:{}",
-                    link_id_hex,
-                    hex::encode(resource_hash),
-                    hashmap_data.len()
-                );
-
-                // Request more parts now that we have more hashmap
-                if let Some(request_data) = tracked.resource.request_next() {
-                    transport.send_resource_request(&link_id, &request_data).await;
+                    // Request more parts now that we have more hashmap
+                    if let Some(request_data) = tracked.resource.request_next() {
+                        transport.send_resource_request(&link_id, &request_data).await;
+                    }
                 }
             }
         }

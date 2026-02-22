@@ -329,6 +329,9 @@ pub struct Link {
     q: Option<f32>,
     /// Whether to track physical layer statistics
     track_phy_stats: bool,
+    /// Traffic timeout factor for receipt and request timeout calculations.
+    /// Matches Python's Link.traffic_timeout_factor (default 6.0).
+    traffic_timeout_factor: f64,
 }
 
 impl Link {
@@ -370,6 +373,7 @@ impl Link {
             snr: None,
             q: None,
             track_phy_stats: false,
+            traffic_timeout_factor: 6.0,
         }
     }
 
@@ -454,6 +458,7 @@ impl Link {
             snr: None,
             q: None,
             track_phy_stats: false,
+            traffic_timeout_factor: 6.0,
         };
 
         link.handshake(peer_identity);
@@ -524,6 +529,7 @@ impl Link {
 
         Packet {
             header: Header {
+                destination_type: DestinationType::Link,
                 packet_type: PacketType::Proof,
                 ..Default::default()
             },
@@ -1116,6 +1122,24 @@ impl Link {
     /// Get round-trip time measurement
     pub fn rtt(&self) -> Duration {
         self.rtt
+    }
+
+    /// Get the traffic timeout factor for this link.
+    pub fn traffic_timeout_factor(&self) -> f64 {
+        self.traffic_timeout_factor
+    }
+
+    /// Calculate dynamic request timeout based on link RTT.
+    /// Matches Python Link.py:260
+    pub fn request_timeout(&self) -> Duration {
+        let rtt_secs = self.rtt.as_secs_f64();
+        if rtt_secs > 0.0 {
+            let timeout = rtt_secs * self.traffic_timeout_factor
+                + crate::resource::RESPONSE_MAX_GRACE_TIME * 1.125;
+            Duration::from_secs_f64(timeout)
+        } else {
+            DEFAULT_REQUEST_TIMEOUT
+        }
     }
 
     /// Whether this link was initiated by us (client) or received from remote (server).

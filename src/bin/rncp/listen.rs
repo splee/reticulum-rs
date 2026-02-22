@@ -314,6 +314,34 @@ async fn handle_listen_link_event(
             )
             .await;
         }
+        LinkEvent::ResourceHashmapUpdate(payload) => {
+            log::debug!(
+                "Link {}: resource hashmap update {} bytes",
+                link_id_hex,
+                payload.len()
+            );
+
+            // Parse HMU: [full_hash (32 bytes)] + [msgpack([segment, hashmap_bytes])]
+            if let Some((resource_hash, segment, hashmap_data)) =
+                reticulum::resource::Resource::parse_hashmap_update(payload.as_slice())
+            {
+                let mut resources = incoming_resources.write().await;
+                if let Some(tracked) = resources.get_mut(&resource_hash) {
+                    tracked.resource.update_hashmap(segment, &hashmap_data);
+                    log::info!(
+                        "Updated hashmap for resource {} (segment {}, {} bytes)",
+                        hex::encode(resource_hash),
+                        segment,
+                        hashmap_data.len()
+                    );
+
+                    // Request more parts now that we have more hashmap
+                    if let Some(request_data) = tracked.resource.request_next() {
+                        transport.send_resource_request(&link_id, &request_data).await;
+                    }
+                }
+            }
+        }
         LinkEvent::Closed => {
             log::info!("Link {} closed", link_id_hex);
         }

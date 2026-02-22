@@ -192,6 +192,19 @@ pub struct Resource {
     consecutive_completed_height: isize,
     /// Receiver's minimum consecutive height (for outgoing)
     receiver_min_consecutive_height: usize,
+
+    /// Whether first response to a request has been received (triggers part_timeout_factor transition)
+    req_resp_received: bool,
+
+    /// When the last RESOURCE_REQ was sent
+    req_sent: Option<Instant>,
+    /// When first response to the request was received
+    req_resp: Option<Instant>,
+    /// Bytes sent in the last request
+    req_sent_bytes: usize,
+
+    /// Previous EIFR from link's last resource transfer
+    previous_eifr: Option<f64>,
 }
 
 impl Resource {
@@ -445,6 +458,11 @@ impl Resource {
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
             receiver_min_consecutive_height: 0,
+            req_resp_received: false,
+            req_sent: None,
+            req_resp: None,
+            req_sent_bytes: 0,
+            previous_eifr: None,
         })
     }
 
@@ -514,6 +532,11 @@ impl Resource {
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
             receiver_min_consecutive_height: 0,
+            req_resp_received: false,
+            req_sent: None,
+            req_resp: None,
+            req_sent_bytes: 0,
+            previous_eifr: None,
         })
     }
 
@@ -638,6 +661,37 @@ impl Resource {
         self.last_activity = now;
     }
 
+    /// Mark that a resource request was sent, recording the timestamp and size.
+    pub fn mark_request_sent(&mut self, bytes: usize) {
+        self.req_sent = Some(Instant::now());
+        self.req_resp = None;
+        self.req_sent_bytes = bytes;
+        self.req_resp_received = false;
+        self.rtt_rxd_bytes = 0;
+    }
+
+    /// Set the previous EIFR from the link's last resource transfer.
+    pub fn set_previous_eifr(&mut self, eifr: Option<f64>) {
+        self.previous_eifr = eifr;
+    }
+
+    /// Mark resource as rejected. Sets status to None (Python's REJECTED = 0x00 = NONE)
+    /// and invokes the completion callback with failure.
+    pub fn mark_rejected(&mut self) {
+        self.set_status(ResourceStatus::None);
+        if let Some(ref callback) = self.completion_callback {
+            callback(self, false);
+        }
+    }
+
+    /// Extract hash data from an advertisement for building a rejection (RESOURCE_RCL) packet.
+    /// Returns the truncated hash (16 bytes) of the resource to reject.
+    pub fn rejection_data(adv: &ResourceAdvertisement) -> Vec<u8> {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&adv.hash[..16]);
+        data
+    }
+
     /// Get time of last part sent
     pub fn last_part_sent(&self) -> Option<Instant> {
         self.last_part_sent
@@ -756,6 +810,61 @@ impl Resource {
         }
     }
 
+    /// Parse a raw HMU (Hashmap Update) packet payload.
+    /// Format: [full_hash (32 bytes)] + [msgpack([segment, hashmap_bytes])]
+    /// Returns (truncated_hash, segment, hashmap_data) on success.
+    pub fn parse_hashmap_update(payload: &[u8]) -> Option<([u8; 16], usize, Vec<u8>)> {
+        if payload.len() < 32 {
+            log::error!("Hashmap update too short ({} bytes)", payload.len());
+            return None;
+        }
+
+        // Extract the 32-byte full hash and truncate to 16 bytes for resource lookup
+        let mut truncated_hash = [0u8; 16];
+        truncated_hash.copy_from_slice(&payload[..16]);
+
+        // Decode msgpack array [segment, hashmap_bytes] from remaining data
+        let msgpack_data = &payload[32..];
+        let mut cursor = std::io::Cursor::new(msgpack_data);
+
+        let array_len = match rmp::decode::read_array_len(&mut cursor) {
+            Ok(len) => len,
+            Err(e) => {
+                log::error!("Failed to decode HMU msgpack array length: {:?}", e);
+                return None;
+            }
+        };
+        if array_len != 2 {
+            log::error!("HMU msgpack array has unexpected length: {}", array_len);
+            return None;
+        }
+
+        let segment = match rmp::decode::read_int::<u64, _>(&mut cursor) {
+            Ok(s) => s as usize,
+            Err(e) => {
+                log::error!("Failed to decode HMU segment: {:?}", e);
+                return None;
+            }
+        };
+
+        // Read bin header to get length, then extract the bytes
+        let bin_len = match rmp::decode::read_bin_len(&mut cursor) {
+            Ok(len) => len as usize,
+            Err(e) => {
+                log::error!("Failed to decode HMU hashmap bin length: {:?}", e);
+                return None;
+            }
+        };
+        let bin_start = cursor.position() as usize;
+        if bin_start + bin_len > msgpack_data.len() {
+            log::error!("HMU hashmap bin data out of bounds");
+            return None;
+        }
+        let hashmap_data = msgpack_data[bin_start..bin_start + bin_len].to_vec();
+
+        Some((truncated_hash, segment, hashmap_data))
+    }
+
     /// Update hashmap from a hashmap update packet
     pub fn update_hashmap(&mut self, segment: usize, hashmap_data: &[u8]) {
         let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
@@ -838,6 +947,33 @@ impl Resource {
                     self.rtt_rxd_bytes += self.sdu;
                     self.received_count += 1;
                     self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
+
+                    // Track first response to request and transition part_timeout_factor
+                    if self.req_resp.is_none() {
+                        if let Some(req_sent) = self.req_sent {
+                            self.req_resp = Some(Instant::now());
+                            let rtt = req_sent.elapsed();
+                            self.update_rtt(rtt);
+                            // Calculate request-response RTT rate
+                            if rtt.as_secs_f64() > 0.0 {
+                                self.req_resp_rtt_rate =
+                                    self.req_sent_bytes as f64 / rtt.as_secs_f64();
+                            }
+                            self.req_resp_received = true;
+                            self.part_timeout_factor = PART_TIMEOUT_FACTOR_AFTER_RTT;
+                        }
+                    }
+
+                    // Calculate data RTT rate when all outstanding parts received
+                    if self.outstanding_parts == 0 {
+                        if let Some(req_sent) = self.req_sent {
+                            let elapsed = req_sent.elapsed();
+                            if elapsed.as_secs_f64() > 0.0 {
+                                self.req_data_rtt_rate =
+                                    self.rtt_rxd_bytes as f64 / elapsed.as_secs_f64();
+                            }
+                        }
+                    }
 
                     // Update consecutive completed height
                     if i as isize == self.consecutive_completed_height + 1 {
@@ -1051,8 +1187,9 @@ impl Resource {
 
         if self.req_data_rtt_rate != 0.0 {
             self.eifr = Some(self.req_data_rtt_rate * 8.0);
+        } else if let Some(prev_eifr) = self.previous_eifr {
+            self.eifr = Some(prev_eifr);
         } else if let Some(prev_eifr) = self.eifr {
-            // Keep previous
             self.eifr = Some(prev_eifr);
         } else {
             // Estimate from link establishment
@@ -1122,6 +1259,8 @@ impl Resource {
         }
 
         self.outstanding_parts = 0;
+        self.req_resp_received = false;
+        self.rtt_rxd_bytes = 0;
         let mut hashmap_exhausted = HASHMAP_IS_NOT_EXHAUSTED;
         let mut requested_hashes: Vec<u8> = Vec::new();
 
@@ -1292,6 +1431,30 @@ impl Resource {
             }
         }
 
+        // Update receiver_min_consecutive_height based on the receiver's reported state
+        if wants_more_hashmap {
+            let last_hash = &request_data[1..1 + MAPHASH_LEN];
+            for i in 0..self.total_parts {
+                let h_start = i * MAPHASH_LEN;
+                let h_end = h_start + MAPHASH_LEN;
+                if h_end <= self.hashmap.len() && &self.hashmap[h_start..h_end] == last_hash {
+                    self.receiver_min_consecutive_height = i.saturating_sub(WINDOW_MAX);
+                    break;
+                }
+            }
+        } else if !requested_hashes.is_empty() {
+            // Find the first requested hash in our hashmap
+            let first_hash = &requested_hashes[..MAPHASH_LEN];
+            for i in 0..self.total_parts {
+                let h_start = i * MAPHASH_LEN;
+                let h_end = h_start + MAPHASH_LEN;
+                if h_end <= self.hashmap.len() && &self.hashmap[h_start..h_end] == first_hash {
+                    self.receiver_min_consecutive_height = i.saturating_sub(WINDOW_MAX);
+                    break;
+                }
+            }
+        }
+
         // Update status
         if self.status() != ResourceStatus::Transferring {
             self.set_status(ResourceStatus::Transferring);
@@ -1310,18 +1473,28 @@ impl Resource {
 
     /// Get hashmap data for a hashmap update packet.
     /// Returns data to send in RESOURCE_HMU packet.
+    /// Format: [full_hash (32 bytes)] + [msgpack([segment, hashmap_slice])]
+    /// This matches Python's `self.hash + umsgpack.packb([segment, hashmap])`.
     pub fn get_hashmap_update(&self, segment: usize) -> Vec<u8> {
         let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
         let hashmap_start = segment * seg_len * MAPHASH_LEN;
         let hashmap_end = ((segment + 1) * seg_len * MAPHASH_LEN).min(self.hashmap.len());
 
+        let hashmap_slice = if hashmap_start < self.hashmap.len() {
+            &self.hashmap[hashmap_start..hashmap_end]
+        } else {
+            &[] as &[u8]
+        };
+
         let mut update_data = Vec::new();
-        // Add resource hash (truncated)
-        update_data.extend_from_slice(&self.truncated_hash);
-        // Add hashmap segment
-        if hashmap_start < self.hashmap.len() {
-            update_data.extend_from_slice(&self.hashmap[hashmap_start..hashmap_end]);
-        }
+        // Use full 32-byte hash (matching Python's self.hash)
+        update_data.extend_from_slice(&self.hash);
+        // Msgpack-encode [segment, hashmap_slice] matching Python's umsgpack.packb()
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 2).unwrap();
+        rmp::encode::write_uint(&mut packed, segment as u64).unwrap();
+        rmp::encode::write_bin(&mut packed, hashmap_slice).unwrap();
+        update_data.extend_from_slice(&packed);
         update_data
     }
 
@@ -1628,8 +1801,21 @@ mod tests {
         // Get hashmap update from outgoing
         let hashmap_update = outgoing.get_hashmap_update(0);
 
-        // Verify update has content (truncated hash + hashmap data)
-        assert!(hashmap_update.len() > 16);
+        // Verify update has content: 32-byte full hash + msgpack payload
+        assert!(hashmap_update.len() > 32);
+        // First 32 bytes should be the full resource hash
+        assert_eq!(&hashmap_update[..32], &outgoing.hash);
+
+        // Parse the HMU payload and verify round-trip
+        let parsed = Resource::parse_hashmap_update(&hashmap_update);
+        assert!(parsed.is_some(), "Failed to parse HMU");
+        let (truncated_hash, segment, hashmap_data) = parsed.unwrap();
+        assert_eq!(segment, 0);
+        assert_eq!(&truncated_hash, &outgoing.truncated_hash);
+        assert!(!hashmap_data.is_empty());
+
+        // Apply parsed HMU to incoming resource
+        incoming.update_hashmap(segment, &hashmap_data);
     }
 
     #[test]

@@ -312,11 +312,14 @@ impl RatchetManager {
         Ok(&self.storage_dir)
     }
 
-    /// Load all ratchets from disk
+    /// Load all ratchets from disk, cleaning expired entries.
     pub fn load(&self) -> io::Result<()> {
         if !self.storage_dir.exists() {
             return Ok(());
         }
+
+        // Clean expired ratchets from disk before loading
+        self.clean_expired()?;
 
         let mut cache = self.cache.write().map_err(|_| {
             io::Error::other("Failed to acquire write lock")
