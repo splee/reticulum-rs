@@ -22,6 +22,8 @@ pub enum RnsError {
     ParseError,
     /// Request data exceeds link MDU; must use a Resource transfer instead
     ResourceRequired,
+    /// No identity is known for the target destination hash
+    UnknownDestination,
 }
 
 impl fmt::Display for RnsError {
@@ -40,6 +42,7 @@ impl fmt::Display for RnsError {
             RnsError::IoError => write!(f, "I/O error"),
             RnsError::ParseError => write!(f, "parse error"),
             RnsError::ResourceRequired => write!(f, "resource required for large data"),
+            RnsError::UnknownDestination => write!(f, "no known identity for destination"),
         }
     }
 }
