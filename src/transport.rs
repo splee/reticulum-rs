@@ -6,6 +6,7 @@ use packet_cache::PacketCache;
 // PathTable is accessed via PathManager
 use rand_core::OsRng;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +30,7 @@ use crate::destination::SingleOutputDestination;
 
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
-use crate::identity::{Identity, PrivateIdentity};
+use crate::identity::{Identity, PrivateIdentity, get_ratchet_id, RATCHET_KEY_SIZE};
 
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceRegistry;
@@ -51,7 +52,7 @@ use crate::packet::PacketType;
 use crate::packet::TransportType;
 use crate::receipt::{PacketReceipt, ReceiptManager, EXPLICIT_PROOF_LENGTH};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
-use crate::persistence::KnownDestinations;
+use crate::persistence::{KnownDestinations, RatchetManager};
 
 pub mod announce_handler;
 mod announce_limits;
@@ -121,6 +122,9 @@ pub struct TransportConfig {
     /// When false, proofs contain hash + signature (explicit).
     /// Default: true, matching Python's default behavior.
     use_implicit_proof: bool,
+    /// Path to persistent storage directory (for ratchets, known destinations, etc.)
+    /// Defaults to `std::env::temp_dir()` if not set.
+    storage_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -151,6 +155,9 @@ struct TransportHandler {
 
     /// Known destinations cache for collision detection and identity recall
     known_destinations: KnownDestinations,
+
+    /// Ratchet manager for forward secrecy key storage
+    ratchet_manager: RatchetManager,
 
     /// Registry of announce handlers for receiving announce notifications
     announce_handler_registry: AnnounceHandlerRegistry,
@@ -190,6 +197,7 @@ impl TransportConfig {
             retransmit: enable_transport,
             client_mode: false,
             use_implicit_proof: true,
+            storage_path: None,
         }
     }
 
@@ -205,6 +213,7 @@ impl TransportConfig {
             retransmit: false,
             client_mode: true,
             use_implicit_proof: true,
+            storage_path: None,
         }
     }
 
@@ -223,6 +232,11 @@ impl TransportConfig {
     pub fn set_use_implicit_proof(&mut self, use_implicit_proof: bool) {
         self.use_implicit_proof = use_implicit_proof;
     }
+
+    /// Set the persistent storage path for ratchets and known destinations.
+    pub fn set_storage_path(&mut self, path: PathBuf) {
+        self.storage_path = Some(path);
+    }
 }
 
 impl Default for TransportConfig {
@@ -234,6 +248,7 @@ impl Default for TransportConfig {
             retransmit: false,
             client_mode: false,
             use_implicit_proof: true,
+            storage_path: None,
         }
     }
 }
@@ -275,6 +290,11 @@ impl Transport {
             });
         }
         let name = config.name.clone();
+        let storage_path = config.storage_path.clone().unwrap_or_else(std::env::temp_dir);
+        let ratchet_manager = RatchetManager::new(&storage_path);
+        if let Err(e) = ratchet_manager.load() {
+            log::warn!("Failed to load ratchets from disk: {}", e);
+        }
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
             iface_manager: iface_manager.clone(),
@@ -284,7 +304,8 @@ impl Transport {
             announce_queue_manager: AnnounceQueueManager::new(),
             link_manager: LinkManager::new(link_in_event_tx.clone()),
             blackhole_manager: blackhole::BlackholeManager::new(),
-            known_destinations: KnownDestinations::new(std::env::temp_dir()),
+            known_destinations: KnownDestinations::new(&storage_path),
+            ratchet_manager,
             announce_handler_registry: AnnounceHandlerRegistry::new(),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
@@ -771,26 +792,42 @@ impl Transport {
         context: PacketContext,
     ) -> Result<Arc<Mutex<PacketReceipt>>, RnsError> {
         // Try to encrypt via a cached SingleOutputDestination first, then
-        // fall back to known_destinations for identity lookup.
-        let ciphertext = {
+        // fall back to known_destinations for identity lookup. Both paths
+        // consult the ratchet manager for forward secrecy.
+        let (ciphertext, ratchet_id) = {
             let handler = self.handler.lock().await;
             if let Some(dest) = handler.single_out_destinations.get(destination_hash) {
-                // Ratchet support deferred — pass None for ratchet_manager.
-                dest.lock().await.encrypt(OsRng, plaintext, None)?
+                let mut dest_guard = dest.lock().await;
+                let ct = dest_guard.encrypt(OsRng, plaintext, Some(&handler.ratchet_manager))?;
+                let rid = dest_guard.latest_ratchet_id;
+                (ct, rid)
             } else {
                 // Fall back to known_destinations persistence cache.
                 let hash: [u8; 16] = destination_hash.as_slice().try_into()
                     .map_err(|_| RnsError::InvalidData)?;
                 let identity = handler.known_destinations.recall_identity(&hash)
                     .ok_or(RnsError::UnknownDestination)?;
+
+                // Check for a stored ratchet key for this destination
+                let ratchet = handler.ratchet_manager.get(&hash);
+                let (target_pub, rid) = if let Some(ref ratchet_bytes) = ratchet {
+                    let rbytes: [u8; RATCHET_KEY_SIZE] = ratchet_bytes.as_slice()
+                        .try_into()
+                        .map_err(|_| RnsError::InvalidData)?;
+                    (x25519_dalek::PublicKey::from(rbytes), Some(get_ratchet_id(&rbytes)))
+                } else {
+                    (identity.public_key, None)
+                };
+
                 // encrypt_single uses the identity hash (not destination hash) as salt,
                 // matching Python's Identity.get_salt().
-                crate::destination::encrypt_single(
+                let ct = crate::destination::encrypt_single(
                     OsRng,
-                    &identity.public_key,
+                    &target_pub,
                     identity.address_hash.as_slice(),
                     plaintext,
-                )?
+                )?;
+                (ct, rid)
             }
         };
 
@@ -809,7 +846,7 @@ impl Transport {
             transport: None,
             context,
             data: PacketDataBuffer::new_from_slice(&ciphertext),
-            ratchet_id: None,
+            ratchet_id,
         };
 
         Ok(self.send_packet_with_receipt(packet, *destination_hash, 0).await)
@@ -1973,10 +2010,10 @@ async fn handle_announce<'a>(
         packet.destination
     );
 
-    if let Ok(result) = DestinationAnnounce::validate(packet) {
+    if let Ok(validation) = DestinationAnnounce::validate_full(packet) {
         log::debug!("handle_announce: validation succeeded for {}", packet.destination);
-        let destination = result.0;
-        let app_data = result.1;
+        let destination = validation.destination;
+        let app_data = validation.app_data;
         let dest_hash = destination.identity.address_hash;
 
         // Build the full 64-byte public key (encryption + signing) for comparison
@@ -2015,6 +2052,13 @@ async fn handle_announce<'a>(
             &announced_pub_key,
             if app_data.is_empty() { None } else { Some(app_data) },
         );
+
+        // Store ratchet if present (Python: Identity.py:477-478)
+        if let Some(ref ratchet) = validation.ratchet {
+            if let Err(e) = handler.ratchet_manager.remember(&dest_hash_bytes, ratchet) {
+                log::warn!("Failed to store ratchet for {}: {}", packet.destination, e);
+            }
+        }
 
         // Capture the announced identity before wrapping in Arc<Mutex<>>
         let announced_identity = destination.identity;
@@ -2713,6 +2757,7 @@ mod tests {
     use super::*;
 
     use crate::packet::HeaderType;
+    use rand_core::RngCore;
 
     #[tokio::test]
     async fn drop_duplicates() {
@@ -3295,5 +3340,290 @@ mod tests {
             plaintext,
             "decrypted plaintext should match original"
         );
+    }
+
+    #[tokio::test]
+    async fn test_announce_with_ratchet_stores_in_ratchet_manager() {
+        // When a ratchet-bearing announce is processed via handle_announce,
+        // the ratchet should be stored in the transport's ratchet_manager.
+        use crate::destination::{DestinationName, SingleInputDestination};
+        use crate::identity::ratchet_public_bytes;
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let dest = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("test", "ratchet").unwrap(),
+        );
+
+        // Generate a ratchet key pair and create a ratchet-bearing announce
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        let announce = dest
+            .announce_with_ratchet(OsRng, &ratchet_pub, None)
+            .expect("valid ratchet announce");
+
+        // Verify context_flag is set (signals ratchet presence)
+        assert!(announce.header.context_flag, "ratchet announce should have context_flag set");
+
+        // Process the announce
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        // The ratchet should now be stored in the ratchet_manager
+        let dest_hash: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(announce.destination.as_slice());
+            buf
+        };
+        let stored = handler.lock().await.ratchet_manager.get(&dest_hash);
+        assert!(stored.is_some(), "ratchet should be stored after ratchet announce");
+        assert_eq!(
+            stored.unwrap().as_slice(),
+            &ratchet_pub[..],
+            "stored ratchet should match announced ratchet public key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announce_without_ratchet_does_not_store_ratchet() {
+        // When a normal announce (no ratchet) is processed, no ratchet should
+        // be stored in the ratchet_manager.
+        use crate::destination::{DestinationName, SingleInputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut dest = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("test", "noratchet").unwrap(),
+        );
+        let announce = dest.announce(OsRng, None).expect("valid announce");
+
+        // context_flag should be false for a non-ratchet announce
+        assert!(!announce.header.context_flag, "non-ratchet announce should not have context_flag");
+
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        let dest_hash: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(announce.destination.as_slice());
+            buf
+        };
+        let stored = handler.lock().await.ratchet_manager.get(&dest_hash);
+        assert!(stored.is_none(), "no ratchet should be stored for non-ratchet announce");
+    }
+
+    #[tokio::test]
+    async fn test_send_to_destination_uses_ratchet_via_single_out() {
+        // When a ratchet is available, send_to_destination should encrypt
+        // with the ratchet key and set the ratchet_id on the packet.
+        use crate::destination::{DestinationName, SingleOutputDestination};
+        use crate::identity::ratchet_public_bytes;
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Create remote identity and destination
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let remote_pub = *remote_priv.as_identity();
+        let name = DestinationName::new("test", "ratchetsend").unwrap();
+        let out_dest = SingleOutputDestination::new(remote_pub, name.clone());
+        let address_hash = out_dest.desc.address_hash;
+
+        // Store a ratchet for this destination
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+        let dest_hash: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(address_hash.as_slice());
+            buf
+        };
+        handler
+            .lock()
+            .await
+            .ratchet_manager
+            .remember(&dest_hash, &ratchet_pub)
+            .expect("remember ratchet should succeed");
+
+        // Insert the output destination
+        handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address_hash, Arc::new(Mutex::new(out_dest)));
+
+        // Send — should use the ratchet key for encryption
+        let plaintext = b"ratchet encrypted";
+        let result = transport
+            .send_to_destination(&address_hash, plaintext, PacketContext::None)
+            .await;
+        assert!(result.is_ok(), "send_to_destination with ratchet should succeed");
+
+        // Verify the output destination has a ratchet_id set after encryption
+        let dest_arc = handler
+            .lock()
+            .await
+            .single_out_destinations
+            .get(&address_hash)
+            .unwrap()
+            .clone();
+        let dest_guard = dest_arc.lock().await;
+        assert!(
+            dest_guard.latest_ratchet_id.is_some(),
+            "latest_ratchet_id should be set when ratchet is used"
+        );
+        let expected_rid = get_ratchet_id(&ratchet_pub);
+        assert_eq!(
+            dest_guard.latest_ratchet_id.unwrap(),
+            expected_rid,
+            "ratchet_id should match the stored ratchet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_to_destination_uses_ratchet_via_known_destinations() {
+        // When a destination is only in known_destinations and a ratchet is stored,
+        // send_to_destination should encrypt with the ratchet key.
+        use crate::identity::ratchet_public_bytes;
+
+        let tmp = std::env::temp_dir().join("reticulum_test_ratchet_known_dest");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let mut config: TransportConfig = Default::default();
+        config.set_storage_path(tmp.clone());
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = remote_priv.as_identity();
+        let public_key_bytes = pub_id.to_bytes();
+
+        // Use a synthetic destination hash
+        let dest_hash_bytes = [0xCCu8; 16];
+        let dest_hash = AddressHash::new(dest_hash_bytes);
+
+        // Populate known_destinations only
+        handler
+            .lock()
+            .await
+            .known_destinations
+            .remember(&dest_hash_bytes, &[], &public_key_bytes, None)
+            .expect("remember should succeed");
+
+        // Store a ratchet for this destination
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+        handler
+            .lock()
+            .await
+            .ratchet_manager
+            .remember(&dest_hash_bytes, &ratchet_pub)
+            .expect("remember ratchet should succeed");
+
+        // Send — should use ratchet key for encryption via fallback path
+        let plaintext = b"ratchet fallback";
+        let result = transport
+            .send_to_destination(&dest_hash, plaintext, PacketContext::None)
+            .await;
+        assert!(result.is_ok(), "send_to_destination should succeed via known_destinations with ratchet");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_ratchet_roundtrip_encrypt_decrypt() {
+        // End-to-end: encrypt with ratchet public key → decrypt with ratchet
+        // private key. Verifies the crypto primitives match Python's ratchet path.
+        use crate::destination::{DestinationName, SingleInputDestination};
+        use crate::identity::ratchet_public_bytes;
+
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let remote_pub = *remote_priv.as_identity();
+        let name = DestinationName::new("test", "ratchetrt").unwrap();
+
+        // Create ratchet key pair
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        // Encrypt with ratchet public key
+        let salt = remote_pub.address_hash.as_slice();
+
+        let plaintext = b"ratchet roundtrip test";
+        let ciphertext = crate::destination::encrypt_single(
+            OsRng,
+            &x25519_dalek::PublicKey::from(ratchet_pub),
+            salt,
+            plaintext,
+        )
+        .expect("ratchet encrypt should succeed");
+
+        // Build input destination and decrypt with the ratchet private key
+        let in_dest = SingleInputDestination::new(remote_priv.clone(), name);
+        let ratchets = vec![ratchet_priv.to_vec()];
+        let result = in_dest.decrypt(OsRng, &ciphertext, Some(&ratchets), false);
+        assert!(result.is_ok(), "decryption with ratchet key should succeed");
+
+        let decrypted = result.unwrap();
+        assert_eq!(decrypted.plaintext, plaintext, "plaintext should match");
+        assert!(
+            decrypted.ratchet_id.is_some(),
+            "ratchet_id should be set when decrypted with ratchet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_storage_path_propagates_to_transport() {
+        // Verify that setting storage_path on TransportConfig is used by
+        // the TransportHandler's KnownDestinations and RatchetManager.
+        let tmp = std::env::temp_dir().join("reticulum_test_storage_path");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let mut config: TransportConfig = Default::default();
+        config.set_storage_path(tmp.clone());
+        let transport = Transport::new(config);
+
+        // The ratchet_manager should have its storage_dir based on our tmp path
+        // We verify by remembering a ratchet and checking it persists at the right location
+        let handler = transport.get_handler();
+        let dest_hash = [0xEEu8; 16];
+        let ratchet_bytes = [0x42u8; RATCHET_KEY_SIZE];
+        handler
+            .lock()
+            .await
+            .ratchet_manager
+            .remember(&dest_hash, &ratchet_bytes)
+            .expect("remember should succeed");
+
+        let recalled = handler.lock().await.ratchet_manager.get(&dest_hash);
+        assert!(recalled.is_some(), "ratchet should be recallable");
+        assert_eq!(recalled.unwrap().as_slice(), &ratchet_bytes[..]);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

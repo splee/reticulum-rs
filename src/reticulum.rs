@@ -519,6 +519,7 @@ impl Reticulum {
     ) -> Result<Arc<Transport>, ReticulumError> {
         let mut tc = TransportConfig::new("reticulum", identity, config.enable_transport);
         tc.set_use_implicit_proof(config.use_implicit_proof);
+        tc.set_storage_path(config.paths.storage_path.clone());
         let transport = Transport::new(tc);
         let transport_arc = Arc::new(transport);
 
@@ -565,6 +566,7 @@ impl Reticulum {
     ) -> Result<Transport, ReticulumError> {
         let mut tc = TransportConfig::new("reticulum", identity, config.enable_transport);
         tc.set_use_implicit_proof(config.use_implicit_proof);
+        tc.set_storage_path(config.paths.storage_path.clone());
         let transport = Transport::new(tc);
 
         if !skip_interfaces {
