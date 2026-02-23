@@ -1185,6 +1185,16 @@ impl Transport {
         }
     }
 
+    /// Recall cached announce app_data for a destination.
+    ///
+    /// Returns the app_data bytes if an announce from this destination has been
+    /// received and cached. Mirrors Python's `Identity.recall_app_data()`.
+    pub async fn recall_app_data(&self, destination: &AddressHash) -> Option<Vec<u8>> {
+        let handler = self.handler.lock().await;
+        let hash: &[u8; 16] = destination.as_slice().try_into().ok()?;
+        handler.known_destinations.recall_app_data(hash)
+    }
+
     /// Get all paths in the path table, optionally filtered by max hops
     pub async fn get_path_table(&self, max_hops: Option<u8>) -> Vec<path_table::PathInfo> {
         self.handler.lock().await.path_manager.get_paths(max_hops)

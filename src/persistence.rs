@@ -609,6 +609,58 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_app_data_present() {
+        let temp = temp_dir().join("rns_test_recall_app_data");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        let dest_hash = [0xAAu8; TRUNCATED_HASH_LENGTH];
+        let public_key = vec![2u8; FULL_PUBLIC_KEY_LENGTH];
+        let app_data = b"hello from announce";
+
+        kd.remember(&dest_hash, &[1u8; 32], &public_key, Some(app_data.as_slice()))
+            .unwrap();
+
+        // recall_app_data should return the stored app_data
+        let result = kd.recall_app_data(&dest_hash);
+        assert_eq!(result, Some(app_data.to_vec()));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recall_app_data_none_when_absent() {
+        let temp = temp_dir().join("rns_test_recall_app_data_none");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        let dest_hash = [0xBBu8; TRUNCATED_HASH_LENGTH];
+        let public_key = vec![2u8; FULL_PUBLIC_KEY_LENGTH];
+
+        // Store a destination with no app_data
+        kd.remember(&dest_hash, &[1u8; 32], &public_key, None)
+            .unwrap();
+
+        // recall_app_data should return None for a known destination with no app_data
+        assert_eq!(kd.recall_app_data(&dest_hash), None);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recall_app_data_unknown_destination() {
+        let temp = temp_dir().join("rns_test_recall_app_data_unknown");
+        let _ = fs::remove_dir_all(&temp);
+        let kd = KnownDestinations::new(&temp);
+
+        // recall_app_data for a destination that was never remembered
+        let unknown_hash = [0xFFu8; TRUNCATED_HASH_LENGTH];
+        assert_eq!(kd.recall_app_data(&unknown_hash), None);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn test_ratchet_manager() {
         let temp = temp_dir().join("rns_test_ratchet");
         let _ = fs::remove_dir_all(&temp);
