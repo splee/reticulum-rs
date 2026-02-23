@@ -1080,7 +1080,9 @@ impl Transport {
         if let Some(dest) = handler.single_out_destinations.get(destination) {
             Some(dest.lock().await.identity)
         } else {
-            None
+            // Fall back to known_destinations (populated from announces)
+            let hash: &[u8; 16] = destination.as_slice().try_into().ok()?;
+            handler.known_destinations.recall_identity(hash)
         }
     }
 
@@ -2970,5 +2972,118 @@ mod tests {
             key
         };
         assert_eq!(stored.public_key, expected_key);
+    }
+
+    #[tokio::test]
+    async fn test_recall_identity_returns_none_for_unknown() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let unknown_hash = AddressHash::new_from_slice(&[0xDEu8; 32]);
+        assert!(
+            transport.recall_identity(&unknown_hash).await.is_none(),
+            "recall_identity should return None for an unknown destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_identity_from_known_destinations() {
+        // Verifies the fallback path: when a destination is only in
+        // known_destinations (e.g. loaded from disk) and NOT in
+        // single_out_destinations, recall_identity should still find it.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = identity.as_identity();
+        let public_key_bytes = pub_id.to_bytes();
+
+        // Use a synthetic destination hash (not derived from any real
+        // destination name) — we only need the hash to be a valid key.
+        let dest_hash_bytes = [0xAAu8; 16];
+        let dest_hash = AddressHash::new({
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(&dest_hash_bytes);
+            buf
+        });
+
+        // Populate known_destinations directly (simulates loading from disk).
+        // Do NOT insert into single_out_destinations.
+        handler
+            .lock()
+            .await
+            .known_destinations
+            .remember(&dest_hash_bytes, &[], &public_key_bytes, None)
+            .expect("remember should succeed");
+
+        // recall_identity should find the identity via the fallback path
+        let recalled = transport.recall_identity(&dest_hash).await;
+        assert!(recalled.is_some(), "recall_identity should fall back to known_destinations");
+
+        let recalled = recalled.unwrap();
+        assert_eq!(
+            recalled.public_key.as_bytes(),
+            pub_id.public_key.as_bytes(),
+            "recalled identity public key should match"
+        );
+        assert_eq!(
+            recalled.verifying_key.as_bytes(),
+            pub_id.verifying_key.as_bytes(),
+            "recalled identity verifying key should match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_identity_prefers_single_out_destinations() {
+        // When the same destination hash exists in both single_out_destinations
+        // and known_destinations, the single_out_destinations entry should win.
+        use crate::destination::{DestinationName, SingleOutputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let identity_a = PrivateIdentity::new_from_rand(OsRng);
+        let identity_b = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id_a = *identity_a.as_identity();
+        let pub_id_b = *identity_b.as_identity();
+
+        let name = DestinationName::new("test", "recall").unwrap();
+
+        // Build a SingleOutputDestination with identity A and grab its address hash
+        let dest_a = SingleOutputDestination::new(pub_id_a, name);
+        let address_hash = dest_a.desc.address_hash;
+        let dest_hash_bytes: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(address_hash.as_slice());
+            buf
+        };
+
+        // Insert identity A's destination into single_out_destinations
+        handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address_hash, Arc::new(Mutex::new(dest_a)));
+
+        // Insert identity B's key into known_destinations under the SAME hash
+        let key_b = pub_id_b.to_bytes();
+        handler
+            .lock()
+            .await
+            .known_destinations
+            .remember(&dest_hash_bytes, &[], &key_b, None)
+            .expect("remember should succeed");
+
+        // recall_identity should return identity A (from single_out_destinations)
+        let recalled = transport.recall_identity(&address_hash).await
+            .expect("recall_identity should return an identity");
+
+        assert_eq!(
+            recalled.public_key.as_bytes(),
+            pub_id_a.public_key.as_bytes(),
+            "recall_identity should prefer single_out_destinations over known_destinations"
+        );
     }
 }

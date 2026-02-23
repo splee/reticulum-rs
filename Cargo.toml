@@ -88,6 +88,10 @@ hex = "0.4"
 # Base32/Base64 encoding
 data-encoding = "2.6"
 
+# libc for Linux-specific TCP socket options (TCP_USER_TIMEOUT)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["alloc"]
 alloc = []
@@ -98,7 +102,7 @@ tonic-build = "0.13.0"
 
 [dev-dependencies]
 tempfile = "3.10"
-libc = "0.2"  # For SIGTERM handling in integration tests
+libc = "0.2"  # Also needed in dev for SIGTERM handling in integration tests
 
 [[test]]
 name = "integration"
