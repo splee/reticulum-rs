@@ -236,6 +236,35 @@ impl Stamper {
         }
     }
 
+    /// Async wrapper around `generate_stamp` that offloads CPU-bound work
+    /// to a blocking thread pool, keeping the async runtime responsive.
+    pub async fn generate_stamp_async(
+        message_id: Vec<u8>,
+        stamp_cost: u8,
+        expand_rounds: u32,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(Vec<u8>, u8), RnsError> {
+        tokio::task::spawn_blocking(move || {
+            Self::generate_stamp(&message_id, stamp_cost, expand_rounds, cancel)
+        })
+        .await
+        .map_err(|_| RnsError::CryptoError)?
+    }
+
+    /// Async wrapper around `generate_stamp_with_workblock` that offloads
+    /// CPU-bound work to a blocking thread pool.
+    pub async fn generate_stamp_with_workblock_async(
+        workblock: Vec<u8>,
+        stamp_cost: u8,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(Vec<u8>, u8), RnsError> {
+        tokio::task::spawn_blocking(move || {
+            Self::generate_stamp_with_workblock(&workblock, stamp_cost, cancel)
+        })
+        .await
+        .map_err(|_| RnsError::CryptoError)?
+    }
+
     /// Search for a valid stamp (internal function).
     fn search_stamp<R: RngCore + CryptoRng>(
         rng: &mut R,
@@ -448,5 +477,39 @@ mod tests {
 
         // Validate using the convenience function
         assert!(Stamper::validate_discovery_stamp(info_hash, &stamp, 4));
+    }
+
+    #[tokio::test]
+    async fn test_stamp_generation_async() {
+        let message_id = b"test_message_id".to_vec();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = Stamper::generate_stamp_async(
+            message_id,
+            4,
+            WORKBLOCK_EXPAND_ROUNDS_PEERING,
+            cancel,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let (stamp, value) = result.unwrap();
+        assert_eq!(stamp.len(), STAMP_SIZE);
+        assert!(value >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_stamp_generation_async_cancel() {
+        let message_id = b"test_message_id".to_vec();
+        let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+
+        let result = Stamper::generate_stamp_async(
+            message_id,
+            20,
+            WORKBLOCK_EXPAND_ROUNDS_PEERING,
+            cancel,
+        )
+        .await;
+        assert!(matches!(result, Err(RnsError::Cancelled)));
     }
 }
