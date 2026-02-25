@@ -463,6 +463,11 @@ impl RemoteClient {
 /// Build a request packet data for a given path and payload.
 ///
 /// Request format: [timestamp, path_hash, data]
+///
+/// `data` must be pre-serialized msgpack bytes. They are spliced directly
+/// into the array so the receiver sees the native msgpack type (Array, Map,
+/// Integer, etc.) rather than a Binary wrapper. This matches Python's
+/// `umsgpack.packb([timestamp, path_hash, data])` behaviour.
 pub fn build_request(path: &str, data: &[u8]) -> Vec<u8> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -471,15 +476,13 @@ pub fn build_request(path: &str, data: &[u8]) -> Vec<u8> {
 
     let path_hash = RequestRouter::path_hash(path);
 
-    // Build the full request
-    let request = rmpv::Value::Array(vec![
-        rmpv::Value::F64(timestamp),
-        rmpv::Value::Binary(path_hash.to_vec()),
-        rmpv::Value::Binary(data.to_vec()),
-    ]);
-
+    // Pack manually so we can splice pre-serialized data bytes directly,
+    // avoiding double-encoding them inside a Binary envelope.
     let mut packed = Vec::new();
-    rmpv::encode::write_value(&mut packed, &request).unwrap();
+    rmp::encode::write_array_len(&mut packed, 3).unwrap();
+    rmp::encode::write_f64(&mut packed, timestamp).unwrap();
+    rmp::encode::write_bin(&mut packed, &path_hash).unwrap();
+    packed.extend_from_slice(data);
     packed
 }
 
@@ -509,5 +512,70 @@ pub fn parse_response(data: &[u8]) -> Result<Vec<u8>, RemoteError> {
         rmpv::encode::write_value(&mut packed, response_data)
             .map_err(|e| RemoteError::ParseError(format!("Failed to re-encode response: {}", e)))?;
         Ok(packed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_request_embeds_data_natively() {
+        // Pre-serialize an Array value, simulating what callers pass as data.
+        let inner = rmpv::Value::Array(vec![
+            rmpv::Value::Integer(1.into()),
+            rmpv::Value::String("test".into()),
+        ]);
+        let mut pre_serialized = Vec::new();
+        rmpv::encode::write_value(&mut pre_serialized, &inner).unwrap();
+
+        let packed = build_request("test.path", &pre_serialized);
+
+        // Decode and verify the third element is a native Array, not Binary.
+        let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+        let arr = decoded.as_array().expect("should be an array");
+        assert_eq!(arr.len(), 3);
+        assert!(arr[0].is_f64(), "element 0 should be timestamp");
+        assert!(arr[1].is_bin(), "element 1 should be path_hash");
+        assert!(
+            arr[2].is_array(),
+            "element 2 should be native Array, got: {:?}",
+            arr[2]
+        );
+        let data_arr = arr[2].as_array().unwrap();
+        assert_eq!(data_arr[0].as_i64(), Some(1));
+        assert_eq!(data_arr[1].as_str(), Some("test"));
+    }
+
+    #[test]
+    fn test_build_request_embeds_integer_natively() {
+        let inner = rmpv::Value::Integer(42.into());
+        let mut pre_serialized = Vec::new();
+        rmpv::encode::write_value(&mut pre_serialized, &inner).unwrap();
+
+        let packed = build_request("some.path", &pre_serialized);
+
+        let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+        let arr = decoded.as_array().unwrap();
+        assert!(
+            arr[2].is_i64() || arr[2].is_u64(),
+            "element 2 should be native Integer, got: {:?}",
+            arr[2]
+        );
+        assert_eq!(arr[2].as_i64(), Some(42));
+    }
+
+    #[test]
+    fn test_build_request_path_hash_is_16_bytes() {
+        let inner = rmpv::Value::Nil;
+        let mut pre_serialized = Vec::new();
+        rmpv::encode::write_value(&mut pre_serialized, &inner).unwrap();
+
+        let packed = build_request("test.path", &pre_serialized);
+
+        let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+        let arr = decoded.as_array().unwrap();
+        let path_hash = arr[1].as_slice().unwrap();
+        assert_eq!(path_hash.len(), 16, "path_hash should be truncated to 16 bytes");
     }
 }
