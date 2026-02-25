@@ -986,6 +986,38 @@ impl Transport {
         false
     }
 
+    /// Send a resource request packet on an outgoing link by address hash.
+    /// Used when receiving a resource from a remote server (e.g., propagation node).
+    pub async fn send_resource_request_out(&self, link_id: &AddressHash, request_data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.link_manager.get_out_link(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_request_packet(request_data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send a resource proof packet on an outgoing link by address hash.
+    /// Used when receiving a resource from a remote server (e.g., propagation node).
+    pub async fn send_resource_proof_out(&self, link_id: &AddressHash, proof_data: &[u8]) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.link_manager.get_out_link(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.resource_proof_packet(proof_data) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Send a resource data packet on an outgoing link by link ID (for sender side).
     pub async fn send_resource_data(&self, link_id: &AddressHash, data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
@@ -1030,6 +1062,20 @@ impl Transport {
         if let Some(link) = self.find_in_link(link_id).await {
             let link = link.lock().await;
             let mut buffer = vec![0u8; data.len() + 64]; // Add padding for decryption overhead
+            let decrypted = link.decrypt(data, &mut buffer)?;
+            Ok(decrypted.to_vec())
+        } else {
+            Err(RnsError::InvalidArgument)
+        }
+    }
+
+    /// Decrypt data using an outgoing link's key.
+    /// This is used for decrypting resource data received from a remote server
+    /// (e.g., a propagation node sending a response resource).
+    pub async fn decrypt_with_out_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
+        if let Some(link) = self.find_out_link(link_id).await {
+            let link = link.lock().await;
+            let mut buffer = vec![0u8; data.len() + 64];
             let decrypted = link.decrypt(data, &mut buffer)?;
             Ok(decrypted.to_vec())
         } else {
@@ -3635,5 +3681,194 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // =========================================================================
+    // Helper: create a handshaked (Active) link pair for out-link tests
+    // =========================================================================
+
+    /// Create an initiator link and a server link, complete the handshake, and
+    /// return the (initiator_link, link_id). Both links will be in Active state
+    /// with matching derived keys.
+    fn create_active_link_pair() -> (Link, Link, AddressHash) {
+        use crate::destination::link::LinkEventData;
+
+        // Server destination identity
+        let server_priv = PrivateIdentity::new_from_rand(OsRng);
+        let server_pub = *server_priv.as_identity();
+        let dest_desc = crate::destination::DestinationDesc {
+            address_hash: server_pub.address_hash,
+            identity: server_pub,
+            name: crate::destination::DestinationName::new("test", "outlink").unwrap(),
+        };
+
+        let (tx1, _) = tokio::sync::broadcast::channel::<LinkEventData>(16);
+        let (tx2, _) = tokio::sync::broadcast::channel::<LinkEventData>(16);
+
+        // Initiator creates link and sends request
+        let mut initiator = Link::new(dest_desc.clone(), tx1);
+        let request_packet = initiator.request();
+        let link_id = *initiator.id();
+
+        // Server creates link from request (using destination's signing key)
+        let signing_key = server_priv.sign_key().clone();
+        let mut server_link =
+            Link::new_from_request(&request_packet, signing_key, dest_desc.clone(), tx2)
+                .expect("new_from_request should succeed");
+
+        // Server proves the link (also activates server side)
+        let mut proof_packet = server_link.prove();
+
+        // Set the context that transport normally adds when routing
+        proof_packet.context = PacketContext::LinkRequestProof;
+
+        // Initiator handles proof → completes handshake and activates
+        let result = initiator.handle_packet(&proof_packet);
+        assert!(matches!(result, LinkHandleResult::Activated));
+        assert_eq!(initiator.status(), LinkStatus::Active);
+        assert_eq!(server_link.status(), LinkStatus::Active);
+
+        (initiator, server_link, link_id)
+    }
+
+    // =========================================================================
+    // Tests for send_resource_request_out / send_resource_proof_out
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_send_resource_request_out_active_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let (initiator, _server, link_id) = create_active_link_pair();
+
+        // Insert initiator as an out-link
+        transport
+            .get_handler()
+            .lock()
+            .await
+            .link_manager
+            .insert_out_link(link_id, Arc::new(Mutex::new(initiator)));
+
+        let result = transport
+            .send_resource_request_out(&link_id, b"test request data")
+            .await;
+        assert!(result, "should succeed for an active out-link");
+    }
+
+    #[tokio::test]
+    async fn test_send_resource_request_out_no_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let fake_id = AddressHash::new_from_slice(&[0xAAu8; 32]);
+        let result = transport
+            .send_resource_request_out(&fake_id, b"data")
+            .await;
+        assert!(!result, "should return false when out-link does not exist");
+    }
+
+    #[tokio::test]
+    async fn test_send_resource_proof_out_active_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let (initiator, _server, link_id) = create_active_link_pair();
+
+        transport
+            .get_handler()
+            .lock()
+            .await
+            .link_manager
+            .insert_out_link(link_id, Arc::new(Mutex::new(initiator)));
+
+        let result = transport
+            .send_resource_proof_out(&link_id, b"proof data")
+            .await;
+        assert!(result, "should succeed for an active out-link");
+    }
+
+    #[tokio::test]
+    async fn test_send_resource_proof_out_no_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let fake_id = AddressHash::new_from_slice(&[0xBBu8; 32]);
+        let result = transport
+            .send_resource_proof_out(&fake_id, b"data")
+            .await;
+        assert!(!result, "should return false when out-link does not exist");
+    }
+
+    #[tokio::test]
+    async fn test_send_resource_request_out_closed_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let (mut initiator, _server, link_id) = create_active_link_pair();
+        initiator.close();
+
+        transport
+            .get_handler()
+            .lock()
+            .await
+            .link_manager
+            .insert_out_link(link_id, Arc::new(Mutex::new(initiator)));
+
+        let result = transport
+            .send_resource_request_out(&link_id, b"data")
+            .await;
+        assert!(!result, "should return false when out-link is closed");
+    }
+
+    // =========================================================================
+    // Tests for decrypt_with_out_link
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_decrypt_with_out_link_roundtrip() {
+        // Encrypt with the server link, decrypt via the initiator (out-link).
+        // This matches the real use case: a remote server encrypts data on
+        // its side of the link, and the local client decrypts via the out-link.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let (initiator, server, link_id) = create_active_link_pair();
+
+        // Server encrypts
+        let plaintext = b"secret resource data";
+        let mut enc_buf = vec![0u8; plaintext.len() + 256];
+        let ciphertext = server
+            .encrypt(plaintext, &mut enc_buf)
+            .expect("server encrypt should succeed");
+        let ciphertext = ciphertext.to_vec();
+
+        // Insert initiator as out-link
+        transport
+            .get_handler()
+            .lock()
+            .await
+            .link_manager
+            .insert_out_link(link_id, Arc::new(Mutex::new(initiator)));
+
+        // Decrypt via transport API
+        let decrypted = transport
+            .decrypt_with_out_link(&link_id, &ciphertext)
+            .await
+            .expect("decrypt_with_out_link should succeed");
+        assert_eq!(decrypted, plaintext, "decrypted data should match original");
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_with_out_link_no_link() {
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let fake_id = AddressHash::new_from_slice(&[0xCCu8; 32]);
+        let result = transport
+            .decrypt_with_out_link(&fake_id, b"ciphertext")
+            .await;
+        assert!(result.is_err(), "should error when link does not exist");
+        assert_eq!(result.unwrap_err(), RnsError::InvalidArgument);
     }
 }
