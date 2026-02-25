@@ -209,8 +209,10 @@ pub enum LinkEvent {
     Data(LinkPayload),
     /// Channel data received (for Channel message system)
     Channel(LinkPayload),
-    /// Request received (path, data, request_id)
-    Request(LinkPayload),
+    /// Request received: (decrypted payload, truncated hash of raw packet).
+    /// The truncated hash is the request_id that must be echoed in the
+    /// response so the remote peer can match it to its pending request.
+    Request(LinkPayload, [u8; 16]),
     /// Response received (request_id, data)
     Response(LinkPayload),
     /// Resource advertisement received (contains unpacked ResourceAdvertisement)
@@ -652,7 +654,16 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): request {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Request(LinkPayload::new_from_slice(plain_text)));
+                    // Compute truncated hash of the raw packet for request_id.
+                    // This must match Python's packet.getTruncatedHash() so the
+                    // remote peer can correlate the response to its pending request.
+                    let hash = packet.hash();
+                    let mut request_id = [0u8; 16];
+                    request_id.copy_from_slice(&hash.as_bytes()[..16]);
+                    self.post_event(LinkEvent::Request(
+                        LinkPayload::new_from_slice(plain_text),
+                        request_id,
+                    ));
                 } else {
                     log::error!("link({}): can't decrypt request", self.id);
                 }
@@ -1815,18 +1826,15 @@ impl Link {
             return Err(RnsError::ResourceRequired);
         }
 
-        // Generate request_id from truncated hash of packed data
-        let request_id_hash = Hash::new(
-            Hash::generator()
-                .chain_update(&packed)
-                .finalize()
-                .into(),
-        );
-        let mut request_id = [0u8; 16];
-        request_id.copy_from_slice(&request_id_hash.as_bytes()[..16]);
-
-        // Create the request packet
+        // Create the request packet (encrypts the data)
         let packet = self.request_packet(&packed)?;
+
+        // Generate request_id from the packet's truncated hash. This matches
+        // Python's `packet_receipt.truncated_hash = packet.getTruncatedHash()`
+        // which hashes the packet's hashable part (with encrypted data).
+        let packet_hash = packet.hash();
+        let mut request_id = [0u8; 16];
+        request_id.copy_from_slice(&packet_hash.as_bytes()[..16]);
 
         // Create receipt and register it
         let request_timeout = timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
@@ -2286,6 +2294,32 @@ mod tests {
                 assert_eq!(p.as_slice(), &[4, 5, 6]);
             } else {
                 panic!("Expected Channel event");
+            }
+        }
+
+        #[test]
+        fn test_event_request_payload_and_id() {
+            let payload = LinkPayload::new_from_slice(&[7, 8, 9]);
+            let request_id = [0xABu8; 16];
+            let event = LinkEvent::Request(payload.clone(), request_id);
+            if let LinkEvent::Request(p, id) = event {
+                assert_eq!(p.as_slice(), &[7, 8, 9]);
+                assert_eq!(id, [0xABu8; 16]);
+            } else {
+                panic!("Expected Request event");
+            }
+        }
+
+        #[test]
+        fn test_event_request_clone_preserves_id() {
+            let payload = LinkPayload::new_from_slice(&[1, 2]);
+            let request_id = [0xCDu8; 16];
+            let event1 = LinkEvent::Request(payload, request_id);
+            let event2 = event1.clone();
+            if let (LinkEvent::Request(_, id1), LinkEvent::Request(_, id2)) = (&event1, &event2) {
+                assert_eq!(id1, id2);
+            } else {
+                panic!("Clone failed");
             }
         }
 
@@ -3098,6 +3132,116 @@ mod tests {
             assert!(link.get_pending_request(&id1).is_some());
             assert!(link.get_pending_request(&id2).is_some());
             assert!(link.get_pending_request(&id3).is_some());
+        }
+    }
+
+    /// Tests for request_id computation on the receiver side.
+    ///
+    /// The receiver computes request_id = packet.hash()[..16], matching
+    /// Python's `request_id = packet.getTruncatedHash()`.
+    mod request_id_computation {
+        use super::*;
+        use crate::hash::Hash;
+        use crate::packet::{
+            DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
+            PacketType, TransportType,
+        };
+
+        /// Simulate receiver-side request_id computation: packet.hash()[..16].
+        fn compute_receiver_request_id(packet: &Packet) -> [u8; 16] {
+            let hash = packet.hash();
+            let mut request_id = [0u8; 16];
+            request_id.copy_from_slice(&hash.as_bytes()[..16]);
+            request_id
+        }
+
+        fn make_request_packet(data: &[u8]) -> Packet {
+            let mut pdb = PacketDataBuffer::new();
+            pdb.safe_write(data);
+            Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    transport_type: TransportType::Transport,
+                    destination_type: DestinationType::Link,
+                    packet_type: PacketType::Data,
+                    hops: 0,
+                },
+                destination: AddressHash::new([0xAA; 16]),
+                transport: None,
+                context: PacketContext::Request,
+                data: pdb,
+                ifac: None,
+                ratchet_id: None,
+            }
+        }
+
+        #[test]
+        fn test_receiver_request_id_is_16_bytes() {
+            let packet = make_request_packet(b"test data");
+            let request_id = compute_receiver_request_id(&packet);
+            assert_eq!(request_id.len(), 16);
+        }
+
+        #[test]
+        fn test_receiver_request_id_is_deterministic() {
+            let packet = make_request_packet(b"same data");
+            let id1 = compute_receiver_request_id(&packet);
+            let id2 = compute_receiver_request_id(&packet);
+            assert_eq!(id1, id2);
+        }
+
+        #[test]
+        fn test_receiver_request_id_differs_by_data() {
+            let p1 = make_request_packet(b"data A");
+            let p2 = make_request_packet(b"data B");
+            let id1 = compute_receiver_request_id(&p1);
+            let id2 = compute_receiver_request_id(&p2);
+            assert_ne!(id1, id2);
+        }
+
+        #[test]
+        fn test_receiver_request_id_stable_across_hops() {
+            // Python's getTruncatedHash() excludes hops from the hashable part.
+            // Verify that changing hops doesn't change the request_id.
+            let mut p1 = make_request_packet(b"routed data");
+            let mut p2 = p1;
+            p1.header.hops = 0;
+            p2.header.hops = 5;
+            let id1 = compute_receiver_request_id(&p1);
+            let id2 = compute_receiver_request_id(&p2);
+            assert_eq!(id1, id2, "request_id must be stable across hop count changes");
+        }
+
+        #[test]
+        fn test_receiver_request_id_matches_packet_hash_prefix() {
+            // The request_id should be exactly the first 16 bytes of packet.hash()
+            let packet = make_request_packet(b"hello world");
+            let full_hash = packet.hash();
+            let request_id = compute_receiver_request_id(&packet);
+            assert_eq!(&full_hash.as_bytes()[..16], &request_id);
+        }
+
+        #[test]
+        fn test_packet_hash_differs_from_data_hash() {
+            // Verify that the packet-hash based request_id (used by both sender
+            // and receiver, matching Python) differs from a naive data-only hash.
+            // This confirms the migration from compute_request_id() to
+            // packet.hash() was necessary for Python interop.
+            use crate::destination::request::compute_request_id;
+
+            let data = b"request payload";
+            let packet = make_request_packet(data);
+
+            let packet_based_id = compute_receiver_request_id(&packet);
+            let data_based_id = compute_request_id(data);
+
+            assert_ne!(
+                packet_based_id, data_based_id,
+                "packet hash includes header fields beyond raw data; \
+                 using data-only hash would break Python interop"
+            );
         }
     }
 }

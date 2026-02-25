@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::destination::request::{
-    AllowPolicy, RequestHandler, RequestRouter, compute_request_id, pack_response, parse_request,
+    AllowPolicy, RequestHandler, RequestRouter, pack_response, parse_request,
 };
 use crate::destination::{DestinationName, SingleInputDestination};
 use crate::hash::AddressHash;
@@ -118,6 +118,7 @@ impl BlackholeInfoService {
         link_id: &[u8],
         remote_identity: Option<&[u8; 16]>,
         context: &BlackholeInfoContext,
+        request_id: &[u8; 16],
     ) -> Option<Vec<u8>> {
         // Parse the request to get timestamp, path_hash, and data
         let (requested_at, path_hash, data) = match parse_request(request_data) {
@@ -127,9 +128,6 @@ impl BlackholeInfoService {
                 return None;
             }
         };
-
-        // Compute request ID from the packed request
-        let request_id = compute_request_id(request_data);
 
         // Check if this is a /list request
         let path_hash_for_list = RequestRouter::path_hash("/list");
@@ -149,7 +147,7 @@ impl BlackholeInfoService {
             match self.router.handle_request(
                 &path_hash,
                 &data,
-                &request_id,
+                request_id,
                 link_id,
                 remote_identity,
                 requested_at,
@@ -164,7 +162,7 @@ impl BlackholeInfoService {
 
         // Pack the response with the request_id
         if let Some(response_data) = response_data {
-            match pack_response(&request_id, &response_data) {
+            match pack_response(request_id, &response_data) {
                 Ok(packed) => Some(packed),
                 Err(e) => {
                     log::warn!("blackhole_info: failed to pack response: {}", e);

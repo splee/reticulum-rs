@@ -37,7 +37,7 @@ use crate::transport::announce_limits::RateInfo;
 
 use crate::destination::link::{LinkEvent, LinkEventData, LinkId};
 use crate::destination::request::{
-    AllowPolicy, RequestHandler, RequestRouter, compute_request_id, pack_response, parse_request,
+    AllowPolicy, RequestHandler, RequestRouter, pack_response, parse_request,
 };
 use crate::destination::{DestinationName, SingleInputDestination};
 use crate::identity::PrivateIdentity;
@@ -165,6 +165,7 @@ impl RemoteManagementService {
         link_id: &[u8],
         remote_identity: Option<&[u8; 16]>,
         context: &RemoteManagementContext,
+        request_id: &[u8; 16],
     ) -> Option<Vec<u8>> {
         // Parse the request to get timestamp, path_hash, and data
         let (requested_at, path_hash, data) = match parse_request(request_data) {
@@ -174,9 +175,6 @@ impl RemoteManagementService {
                 return None;
             }
         };
-
-        // Compute request ID from the packed request
-        let request_id = compute_request_id(request_data);
 
         // Check if this is a /path request - we handle it specially with context
         let path_hash_for_path = RequestRouter::path_hash("/path");
@@ -205,7 +203,7 @@ impl RemoteManagementService {
             match self.router.handle_request(
                 &path_hash,
                 &data,
-                &request_id,
+                request_id,
                 link_id,
                 remote_identity,
                 requested_at,
@@ -220,7 +218,7 @@ impl RemoteManagementService {
 
         // Pack the response with the request_id
         if let Some(response_data) = response_data {
-            match pack_response(&request_id, &response_data) {
+            match pack_response(request_id, &response_data) {
                 Ok(packed) => Some(packed),
                 Err(e) => {
                     log::warn!("remote_management: failed to pack response: {}", e);
@@ -594,7 +592,7 @@ pub async fn process_link_event(
                 );
             }
         }
-        LinkEvent::Request(payload) => {
+        LinkEvent::Request(payload, request_id) => {
             // Process the request
             // Note: We need the remote identity from the link, which would
             // need to be passed through the event or looked up.
@@ -603,6 +601,7 @@ pub async fn process_link_event(
                 event.id.as_slice(),
                 None, // Would need to get this from the link
                 context,
+                request_id,
             ) {
                 send_response(event.id, response);
             }

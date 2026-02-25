@@ -553,7 +553,7 @@ impl Transport {
                                             event.id
                                         );
                                     }
-                                    LinkEvent::Request(payload, _request_id) => {
+                                    LinkEvent::Request(payload, request_id) => {
                                         // Get the remote identity from the link
                                         let remote_identity_hash = {
                                             let handler = transport.lock().await;
@@ -582,6 +582,7 @@ impl Transport {
                                             event.id.as_slice(),
                                             remote_identity_hash.as_ref(),
                                             &context,
+                                            request_id,
                                         ) {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
@@ -684,7 +685,7 @@ impl Transport {
                                     LinkEvent::Activated => {
                                         log::debug!("blackhole_info: link {} activated", event.id);
                                     }
-                                    LinkEvent::Request(payload, _request_id) => {
+                                    LinkEvent::Request(payload, request_id) => {
                                         // Get the remote identity from the link
                                         let remote_identity_hash = {
                                             let handler = transport.lock().await;
@@ -708,6 +709,7 @@ impl Transport {
                                             event.id.as_slice(),
                                             remote_identity_hash.as_ref(),
                                             &context,
+                                            request_id,
                                         ) {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;

@@ -551,7 +551,7 @@ async fn handle_link_event(
         LinkEvent::Channel(payload) => {
             log::debug!("Link {}: channel data {} bytes", link_id_hex, payload.len());
         }
-        LinkEvent::Request(payload) => {
+        LinkEvent::Request(payload, _request_id) => {
             log::debug!("Link {}: request {} bytes", link_id_hex, payload.len());
         }
         LinkEvent::Response(payload) => {

@@ -277,7 +277,7 @@ async fn handle_listen_link_event(
         LinkEvent::Activated => {
             log::info!("Incoming link {} established", link_id_hex);
         }
-        LinkEvent::Request(payload) => {
+        LinkEvent::Request(payload, _request_id) => {
             // Handle fetch file requests
             handle_fetch_request(
                 transport,

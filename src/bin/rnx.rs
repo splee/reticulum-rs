@@ -552,7 +552,7 @@ async fn handle_server_event(
         LinkEvent::Activated => {
             log::info!("Link {} activated", link_id_hex);
         }
-        LinkEvent::Request(payload) => {
+        LinkEvent::Request(payload, _request_id) => {
             log::info!(
                 "Request received on link {} ({} bytes)",
                 link_id_hex,
