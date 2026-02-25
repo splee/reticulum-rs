@@ -1797,7 +1797,10 @@ impl Link {
         rmp::encode::write_f64(&mut packed, timestamp).map_err(|_| RnsError::SerializationError)?;
         rmp::encode::write_bin(&mut packed, path_hash).map_err(|_| RnsError::SerializationError)?;
         match data {
-            Some(d) => rmp::encode::write_bin(&mut packed, d).map_err(|_| RnsError::SerializationError)?,
+            // Splice pre-serialized msgpack bytes directly into the array,
+            // matching Python's format: [timestamp, path_hash, data].
+            // Python embeds data as a nested msgpack value, not Binary-wrapped.
+            Some(d) => packed.extend_from_slice(d),
             None => rmp::encode::write_nil(&mut packed).map_err(|_| RnsError::SerializationError)?,
         }
 
@@ -1880,13 +1883,19 @@ impl Link {
             }
         };
 
-        // Extract response data
+        // Extract response data.
+        // Python sends Array/Integer directly (not Binary-wrapped);
+        // re-encode non-Binary values to bytes for the receipt.
         let response_data = match &arr[1] {
             rmpv::Value::Binary(b) => b.clone(),
             rmpv::Value::Nil => Vec::new(),
-            _ => {
-                log::warn!("link({}): response data not binary or nil", self.id);
-                return;
+            other => {
+                let mut buf = Vec::new();
+                if let Err(e) = rmpv::encode::write_value(&mut buf, other) {
+                    log::warn!("link({}): failed to re-encode response: {}", self.id, e);
+                    return;
+                }
+                buf
             }
         };
 
@@ -2669,6 +2678,349 @@ mod tests {
 
             // Just had activity, should not be stale
             assert!(!link.is_stale());
+        }
+    }
+
+    /// Tests for link request/response msgpack serialization.
+    ///
+    /// These verify that the packing format matches Python's behavior:
+    /// - Request data is spliced as a native msgpack value, not Binary-wrapped
+    /// - Response parsing handles all msgpack value types, not just Binary/Nil
+    mod request_response_serialization {
+        use super::*;
+        use crate::destination::request_receipt::new_shared_request_receipt;
+
+        /// Helper: pack a link request array the same way send_request does,
+        /// returning the raw bytes.
+        fn pack_request_data(timestamp: f64, path_hash: &[u8], data: Option<&[u8]>) -> Vec<u8> {
+            let mut packed = Vec::new();
+            rmp::encode::write_array_len(&mut packed, 3).unwrap();
+            rmp::encode::write_f64(&mut packed, timestamp).unwrap();
+            rmp::encode::write_bin(&mut packed, path_hash).unwrap();
+            match data {
+                Some(d) => packed.extend_from_slice(d),
+                None => rmp::encode::write_nil(&mut packed).unwrap(),
+            }
+            packed
+        }
+
+        /// Pre-serialize a msgpack value to bytes, simulating what callers pass
+        /// as the `data` parameter to send_request.
+        fn serialize_value(value: &rmpv::Value) -> Vec<u8> {
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, value).unwrap();
+            buf
+        }
+
+        #[test]
+        fn test_request_packing_embeds_array_natively() {
+            // Simulate what a caller does: pre-serialize an Array value, then
+            // pass those bytes as data to the request packer.
+            let inner = rmpv::Value::Array(vec![
+                rmpv::Value::Integer(42.into()),
+                rmpv::Value::String("hello".into()),
+            ]);
+            let pre_serialized = serialize_value(&inner);
+
+            let path_hash = [0xABu8; 16];
+            let packed = pack_request_data(1234567890.0, &path_hash, Some(&pre_serialized));
+
+            // Decode the packed result and verify the third element is an Array,
+            // not a Binary blob wrapping the serialized bytes.
+            let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+            let arr = decoded.as_array().expect("should be an array");
+            assert_eq!(arr.len(), 3);
+
+            // Element 0: timestamp (f64)
+            assert!(arr[0].is_f64());
+
+            // Element 1: path_hash (binary)
+            assert!(arr[1].is_bin());
+
+            // Element 2: should be a native Array [42, "hello"], not Binary
+            assert!(
+                arr[2].is_array(),
+                "data should be embedded as native Array, got: {:?}",
+                arr[2]
+            );
+            let data_arr = arr[2].as_array().unwrap();
+            assert_eq!(data_arr[0].as_i64(), Some(42));
+            assert_eq!(data_arr[1].as_str(), Some("hello"));
+        }
+
+        #[test]
+        fn test_request_packing_embeds_integer_natively() {
+            let inner = rmpv::Value::Integer(999.into());
+            let pre_serialized = serialize_value(&inner);
+
+            let path_hash = [0xCDu8; 16];
+            let packed = pack_request_data(1000.0, &path_hash, Some(&pre_serialized));
+
+            let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+            let arr = decoded.as_array().unwrap();
+
+            // Element 2: should be a native Integer 999, not Binary
+            assert!(
+                arr[2].is_i64() || arr[2].is_u64(),
+                "data should be embedded as native Integer, got: {:?}",
+                arr[2]
+            );
+            assert_eq!(arr[2].as_i64(), Some(999));
+        }
+
+        #[test]
+        fn test_request_packing_none_data_is_nil() {
+            let path_hash = [0xEFu8; 16];
+            let packed = pack_request_data(2000.0, &path_hash, None);
+
+            let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+            let arr = decoded.as_array().unwrap();
+            assert!(arr[2].is_nil(), "None data should serialize as Nil");
+        }
+
+        #[test]
+        fn test_request_packing_embeds_map_natively() {
+            // Python callers can pass dicts as request data
+            let inner = rmpv::Value::Map(vec![(
+                rmpv::Value::String("key".into()),
+                rmpv::Value::Boolean(true),
+            )]);
+            let pre_serialized = serialize_value(&inner);
+
+            let path_hash = [0x11u8; 16];
+            let packed = pack_request_data(3000.0, &path_hash, Some(&pre_serialized));
+
+            let decoded = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+            let arr = decoded.as_array().unwrap();
+
+            assert!(
+                arr[2].is_map(),
+                "data should be embedded as native Map, got: {:?}",
+                arr[2]
+            );
+        }
+
+        #[test]
+        fn test_handle_response_with_binary_data() {
+            // Binary response data should be passed through directly
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xAAu8; 16];
+            let receipt = new_shared_request_receipt(
+                request_id,
+                Duration::from_secs(30),
+                None,
+            );
+            link.pending_requests.insert(request_id, receipt.clone());
+
+            // Build response: [request_id_bytes, binary_data]
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                rmpv::Value::Binary(vec![1, 2, 3, 4]),
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            link.handle_response(&response_bytes);
+
+            // Verify the receipt got the binary data directly
+            let receipt = futures::executor::block_on(receipt.lock());
+            assert_eq!(
+                receipt.status(),
+                crate::destination::request_receipt::RequestReceiptStatus::Ready,
+            );
+            assert_eq!(receipt.response(), Some([1, 2, 3, 4].as_slice()));
+        }
+
+        #[test]
+        fn test_handle_response_with_nil_data() {
+            // Nil response should produce empty Vec
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xBBu8; 16];
+            let receipt = new_shared_request_receipt(
+                request_id,
+                Duration::from_secs(30),
+                None,
+            );
+            link.pending_requests.insert(request_id, receipt.clone());
+
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                rmpv::Value::Nil,
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            link.handle_response(&response_bytes);
+
+            let receipt = futures::executor::block_on(receipt.lock());
+            assert_eq!(
+                receipt.status(),
+                crate::destination::request_receipt::RequestReceiptStatus::Ready,
+            );
+            assert_eq!(receipt.response(), Some([].as_slice()));
+        }
+
+        #[test]
+        fn test_handle_response_with_array_data() {
+            // Array response (e.g., Python list) should be re-encoded to msgpack bytes
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xCCu8; 16];
+            let receipt = new_shared_request_receipt(
+                request_id,
+                Duration::from_secs(30),
+                None,
+            );
+            link.pending_requests.insert(request_id, receipt.clone());
+
+            let inner_array = rmpv::Value::Array(vec![
+                rmpv::Value::Integer(10.into()),
+                rmpv::Value::Integer(20.into()),
+            ]);
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                inner_array.clone(),
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            link.handle_response(&response_bytes);
+
+            let receipt = futures::executor::block_on(receipt.lock());
+            assert_eq!(
+                receipt.status(),
+                crate::destination::request_receipt::RequestReceiptStatus::Ready,
+            );
+
+            // The response data should be the msgpack-encoded form of [10, 20]
+            let response = receipt.response().unwrap();
+            let decoded = rmpv::decode::read_value(&mut &response[..]).unwrap();
+            assert_eq!(decoded, inner_array);
+        }
+
+        #[test]
+        fn test_handle_response_with_integer_data() {
+            // Integer response (e.g., Python returns an int) should be re-encoded
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xDDu8; 16];
+            let receipt = new_shared_request_receipt(
+                request_id,
+                Duration::from_secs(30),
+                None,
+            );
+            link.pending_requests.insert(request_id, receipt.clone());
+
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                rmpv::Value::Integer(42.into()),
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            link.handle_response(&response_bytes);
+
+            let receipt = futures::executor::block_on(receipt.lock());
+            assert_eq!(
+                receipt.status(),
+                crate::destination::request_receipt::RequestReceiptStatus::Ready,
+            );
+
+            // The response data should be msgpack-encoded integer 42
+            let response = receipt.response().unwrap();
+            let decoded = rmpv::decode::read_value(&mut &response[..]).unwrap();
+            assert_eq!(decoded.as_i64(), Some(42));
+        }
+
+        #[test]
+        fn test_handle_response_with_string_data() {
+            // String response should be re-encoded
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xEEu8; 16];
+            let receipt = new_shared_request_receipt(
+                request_id,
+                Duration::from_secs(30),
+                None,
+            );
+            link.pending_requests.insert(request_id, receipt.clone());
+
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                rmpv::Value::String("result".into()),
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            link.handle_response(&response_bytes);
+
+            let receipt = futures::executor::block_on(receipt.lock());
+            assert_eq!(
+                receipt.status(),
+                crate::destination::request_receipt::RequestReceiptStatus::Ready,
+            );
+
+            let response = receipt.response().unwrap();
+            let decoded = rmpv::decode::read_value(&mut &response[..]).unwrap();
+            assert_eq!(decoded.as_str(), Some("result"));
+        }
+
+        #[test]
+        fn test_handle_response_unknown_request_id_ignored() {
+            // Response for a non-existent request should be silently ignored
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let request_id: [u8; 16] = [0xFFu8; 16];
+            let response_value = rmpv::Value::Array(vec![
+                rmpv::Value::Binary(request_id.to_vec()),
+                rmpv::Value::Integer(1.into()),
+            ]);
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &response_value).unwrap();
+
+            // Should not panic
+            link.handle_response(&response_bytes);
+            assert!(link.pending_requests.is_empty());
+        }
+
+        #[test]
+        fn test_handle_response_invalid_msgpack_ignored() {
+            // Garbage data should be silently ignored
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            // Should not panic
+            link.handle_response(&[0xFF, 0xFF, 0xFF]);
+        }
+
+        #[test]
+        fn test_handle_response_not_array_ignored() {
+            // A non-array response should be silently ignored
+            let dest = super::link_lifecycle::create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+
+            let value = rmpv::Value::Integer(42.into());
+            let mut response_bytes = Vec::new();
+            rmpv::encode::write_value(&mut response_bytes, &value).unwrap();
+
+            // Should not panic
+            link.handle_response(&response_bytes);
         }
     }
 
