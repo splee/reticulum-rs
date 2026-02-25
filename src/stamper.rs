@@ -512,4 +512,33 @@ mod tests {
         .await;
         assert!(matches!(result, Err(RnsError::Cancelled)));
     }
+
+    #[tokio::test]
+    async fn test_stamp_with_workblock_async() {
+        let material = b"test_workblock_async";
+        let workblock = Stamper::stamp_workblock(material, WORKBLOCK_EXPAND_ROUNDS_DISCOVERY);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result =
+            Stamper::generate_stamp_with_workblock_async(workblock.clone(), 4, cancel).await;
+        assert!(result.is_ok());
+
+        let (stamp, value) = result.unwrap();
+        assert_eq!(stamp.len(), STAMP_SIZE);
+        assert!(value >= 4);
+
+        // Cross-validate: the stamp should also pass sync validation
+        assert!(Stamper::stamp_valid(&stamp, 4, &workblock));
+    }
+
+    #[tokio::test]
+    async fn test_stamp_with_workblock_async_cancel() {
+        let material = b"test_workblock_async_cancel";
+        let workblock = Stamper::stamp_workblock(material, WORKBLOCK_EXPAND_ROUNDS_DISCOVERY);
+        let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+
+        let result =
+            Stamper::generate_stamp_with_workblock_async(workblock, 20, cancel).await;
+        assert!(matches!(result, Err(RnsError::Cancelled)));
+    }
 }
