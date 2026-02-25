@@ -16,6 +16,8 @@ pub struct AnnounceEntry {
     pub received_from: AddressHash,
     pub retries: u8,
     pub hops: u8,
+    /// Context to use when retransmitting (e.g., PathResponse for path request answers)
+    pub context: PacketContext,
 }
 
 impl AnnounceEntry {
@@ -56,7 +58,7 @@ impl AnnounceEntry {
             ifac: None,
             destination: self.packet.destination,
             transport: Some(*transport_id),
-            context: PacketContext::None,
+            context: self.context,
             data: self.packet.data,
             ratchet_id: None,
         };
@@ -108,6 +110,44 @@ impl AnnounceTable {
             received_from,
             retries,
             hops,
+            context: PacketContext::None,
+        };
+
+        self.map.insert(destination, entry);
+    }
+
+    /// Add a path response to the announce table with a grace period delay.
+    ///
+    /// Unlike `add()`, this does NOT increment hops (the hops value from the
+    /// path table is already correct). Any existing entry for this destination
+    /// is replaced, since path responses take priority.
+    ///
+    /// # Arguments
+    /// * `packet` - The cached announce packet to retransmit
+    /// * `destination` - The destination hash
+    /// * `exclude_interface` - The interface the path request came from (excluded on retransmit)
+    /// * `hops` - Hop count from the path table (not incremented)
+    /// * `grace` - Grace period before sending (allows closer peers to answer first)
+    pub fn add_path_response(
+        &mut self,
+        packet: &Packet,
+        destination: AddressHash,
+        exclude_interface: AddressHash,
+        hops: u8,
+        grace: Duration,
+    ) {
+        // Remove any existing entry — path response takes priority
+        self.map.remove(&destination);
+
+        let now = Instant::now();
+        let entry = AnnounceEntry {
+            packet: *packet,
+            timestamp: now,
+            timeout: now + grace,
+            received_from: exclude_interface,
+            retries: super::PATHFINDER_R,
+            hops,
+            context: PacketContext::PathResponse,
         };
 
         self.map.insert(destination, entry);
@@ -385,6 +425,7 @@ mod tests {
             received_from: test_address_hash(1),
             retries: 0, // No retries left
             hops: 1,
+            context: PacketContext::None,
         };
 
         let transport_id = test_address_hash(99);
@@ -403,6 +444,7 @@ mod tests {
             received_from: test_address_hash(1),
             retries: 5,
             hops: 1,
+            context: PacketContext::None,
         };
 
         let transport_id = test_address_hash(99);
@@ -421,6 +463,7 @@ mod tests {
             received_from: test_address_hash(1),
             retries: 3,
             hops: 3,
+            context: PacketContext::None,
         };
 
         let transport_id = test_address_hash(99);
@@ -448,6 +491,7 @@ mod tests {
             received_from: test_address_hash(1),
             retries: 1, // Only one retry left
             hops: 1,
+            context: PacketContext::None,
         };
 
         let transport_id = test_address_hash(99);
@@ -463,5 +507,69 @@ mod tests {
         // Second retransmit should fail (no retries left)
         let result2 = entry.retransmit(&transport_id);
         assert!(result2.is_none());
+    }
+
+    #[test]
+    fn test_add_path_response_basic() {
+        let mut table = AnnounceTable::new();
+        let packet = test_announce_packet(2);
+        let destination = test_address_hash(1);
+        let exclude_iface = test_address_hash(5);
+        let hops = 3u8;
+        let grace = Duration::from_millis(400);
+
+        table.add_path_response(&packet, destination, exclude_iface, hops, grace);
+
+        assert_eq!(table.map.len(), 1);
+        let entry = table.map.get(&destination).unwrap();
+        // Hops should NOT be incremented (unlike add())
+        assert_eq!(entry.hops, 3);
+        assert_eq!(entry.received_from, exclude_iface);
+        assert_eq!(entry.retries, super::super::PATHFINDER_R);
+        assert_eq!(entry.context, PacketContext::PathResponse);
+        // Timeout should be in the future (grace period)
+        assert!(entry.timeout > Instant::now());
+    }
+
+    #[test]
+    fn test_add_path_response_replaces_existing() {
+        let mut table = AnnounceTable::new();
+        let packet = test_announce_packet(0);
+        let destination = test_address_hash(1);
+        let received_from = test_address_hash(2);
+
+        // Add a regular announce entry
+        table.add(&packet, destination, received_from, false);
+        assert_eq!(table.map.get(&destination).unwrap().context, PacketContext::None);
+
+        // Add path response for same destination — should replace
+        let exclude_iface = test_address_hash(5);
+        table.add_path_response(&packet, destination, exclude_iface, 2, Duration::from_millis(400));
+
+        assert_eq!(table.map.len(), 1);
+        let entry = table.map.get(&destination).unwrap();
+        assert_eq!(entry.context, PacketContext::PathResponse);
+        assert_eq!(entry.received_from, exclude_iface);
+        assert_eq!(entry.hops, 2);
+    }
+
+    #[test]
+    fn test_path_response_retransmit_uses_context() {
+        let mut table = AnnounceTable::new();
+        let packet = test_announce_packet(1);
+        let destination = test_address_hash(1);
+        let exclude_iface = test_address_hash(5);
+
+        // Add with zero grace so it's immediately retransmittable
+        table.add_path_response(&packet, destination, exclude_iface, 2, Duration::ZERO);
+
+        let transport_id = test_address_hash(99);
+        let packets = table.to_retransmit(&transport_id);
+
+        assert_eq!(packets.len(), 1);
+        let (recv_from, retransmit_packet) = &packets[0];
+        assert_eq!(*recv_from, exclude_iface);
+        assert_eq!(retransmit_packet.context, PacketContext::PathResponse);
+        assert_eq!(retransmit_packet.header.hops, 2);
     }
 }

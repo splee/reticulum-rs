@@ -92,6 +92,21 @@ impl AnnounceManager {
         self.table.get_announce_packet(destination)
     }
 
+    /// Schedule a path response via the announce table with a grace period.
+    ///
+    /// The retransmit loop will pick this up after the grace period expires,
+    /// allowing closer/directly-reachable peers to answer first.
+    pub fn add_path_response(
+        &mut self,
+        packet: &Packet,
+        destination: AddressHash,
+        exclude_interface: AddressHash,
+        hops: u8,
+        grace: Duration,
+    ) {
+        self.table.add_path_response(packet, destination, exclude_interface, hops, grace)
+    }
+
     /// Get a retransmit packet for a specific destination.
     ///
     /// Returns (received_from, packet) if a retransmit is ready.

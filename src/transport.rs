@@ -553,7 +553,7 @@ impl Transport {
                                             event.id
                                         );
                                     }
-                                    LinkEvent::Request(payload) => {
+                                    LinkEvent::Request(payload, _request_id) => {
                                         // Get the remote identity from the link
                                         let remote_identity_hash = {
                                             let handler = transport.lock().await;
@@ -684,7 +684,7 @@ impl Transport {
                                     LinkEvent::Activated => {
                                         log::debug!("blackhole_info: link {} activated", event.id);
                                     }
-                                    LinkEvent::Request(payload) => {
+                                    LinkEvent::Request(payload, _request_id) => {
                                         // Get the remote identity from the link
                                         let remote_identity_hash = {
                                             let handler = transport.lock().await;
@@ -984,6 +984,21 @@ impl Transport {
             }
         }
         false
+    }
+
+    /// Get the remote identity from an inbound link, if the peer has identified.
+    ///
+    /// Returns the identity set synchronously during LNID packet processing,
+    /// which is available before the `LinkEvent::Identified` event is dispatched.
+    /// Useful as a fallback when the event-based identity map may not yet be populated.
+    pub async fn get_in_link_remote_identity(&self, link_id: &AddressHash) -> Option<Identity> {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.link_manager.get_in_link(link_id) {
+            let link = link.lock().await;
+            link.remote_identity().copied()
+        } else {
+            None
+        }
     }
 
     /// Send a resource request packet on an outgoing link by address hash.
@@ -1706,6 +1721,7 @@ async fn handle_keepalive_response<'a>(
 async fn handle_path_request<'a>(
     packet: &Packet,
     iface: AddressHash,
+    from_local_client: bool,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
     let data = packet.data.as_slice();
@@ -1759,6 +1775,7 @@ async fn handle_path_request<'a>(
         requesting_transport_id,
         Some(&tag),
         iface,
+        from_local_client,
         handler,
     )
     .await;
@@ -1775,7 +1792,8 @@ async fn process_path_request<'a>(
     requestor_transport_id: Option<AddressHash>,
     _tag: Option<&[u8]>,
     attached_interface: AddressHash,
-    handler: MutexGuard<'a, TransportHandler>,
+    from_local_client: bool,
+    mut handler: MutexGuard<'a, TransportHandler>,
 ) {
     let is_transport_enabled = handler.config.retransmit;
 
@@ -1797,8 +1815,8 @@ async fn process_path_request<'a>(
         return;
     }
 
-    // Case 2: Path known in path_table - queue retransmission with grace period
-    if (is_transport_enabled || !handler.single_in_destinations.is_empty())
+    // Case 2: Path known in path_table — answer if transport enabled or request is from local client
+    if (is_transport_enabled || from_local_client)
         && handler.path_manager.has_path(&destination_hash)
     {
         if let Some(next_hop) = handler.path_manager.next_hop(&destination_hash) {
@@ -1814,28 +1832,44 @@ async fn process_path_request<'a>(
                 }
             }
 
-            // Schedule announce retransmission with grace period
-            // For now, we'll trigger an immediate retransmit if we have the announce cached
-            if let Some(announce_packet) = handler.announce_manager.get_announce_packet(&destination_hash) {
-                let hops = handler.path_manager.hops_to(&destination_hash).unwrap_or(0);
+            // Copy the announce packet and hops before mutating handler
+            let announce_and_hops = handler
+                .announce_manager
+                .get_announce_packet(&destination_hash)
+                .map(|p| (*p, handler.path_manager.hops_to(&destination_hash).unwrap_or(0)));
+
+            if let Some((announce_packet, hops)) = announce_and_hops {
                 log::debug!(
-                    "tp({}): answering path request for {}, path known ({} hops)",
+                    "tp({}): answering path request for {}, path known ({} hops, local_client={})",
                     handler.config.name,
                     destination_hash,
-                    hops
+                    hops,
+                    from_local_client
                 );
 
-                // Set PathResponse context and send
-                let mut response_packet = *announce_packet;
-                response_packet.context = PacketContext::PathResponse;
-
-                // Send excluding the interface that sent the request
-                handler
-                    .send(TxMessage {
-                        tx_type: TxMessageType::Broadcast(Some(attached_interface)),
-                        packet: response_packet,
-                    })
-                    .await;
+                if from_local_client {
+                    // Local client requests get an immediate response (matches Python:
+                    // retransmit_timeout = now when is_from_local_client)
+                    let mut response_packet = announce_packet;
+                    response_packet.context = PacketContext::PathResponse;
+                    handler
+                        .send(TxMessage {
+                            tx_type: TxMessageType::Broadcast(Some(attached_interface)),
+                            packet: response_packet,
+                        })
+                        .await;
+                } else {
+                    // Transport node answering a network request: schedule via announce
+                    // table with grace period so closer peers can answer first (matches
+                    // Python: retransmit_timeout = now + PATH_REQUEST_GRACE)
+                    handler.announce_manager.add_path_response(
+                        &announce_packet,
+                        destination_hash,
+                        attached_interface,
+                        hops,
+                        path_request::PATH_REQUEST_RESPONSE_GRACE,
+                    );
+                }
             }
         }
         return;
@@ -1863,14 +1897,16 @@ async fn process_path_request<'a>(
             .await;
     } else {
         log::debug!(
-            "tp({}): ignoring path request for {}, no path known and transport disabled",
+            "tp({}): ignoring path request for {}, no path known (transport={}, local_client={})",
             handler.config.name,
-            destination_hash
+            destination_hash,
+            is_transport_enabled,
+            from_local_client
         );
     }
 }
 
-async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client: bool, handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
 
     // Check for path request control packets (PLAIN destination type)
@@ -1880,7 +1916,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, handler: MutexGuar
             .address_hash();
 
         if packet.destination == path_request_hash {
-            handle_path_request(packet, iface, handler).await;
+            handle_path_request(packet, iface, from_local_client, handler).await;
             return;
         }
     }
@@ -2657,7 +2693,7 @@ async fn manage_transport(
                                 handler
                             ).await,
                             PacketType::Proof => handle_proof(&packet, handler).await,
-                            PacketType::Data => handle_data(&packet, message.address, handler).await,
+                            PacketType::Data => handle_data(&packet, message.address, from_local_client, handler).await,
                         }
                     }
                 };
