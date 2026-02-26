@@ -50,14 +50,22 @@ impl AnnounceEntry {
             + Duration::from_secs(super::PATHFINDER_G)
             + Duration::from_secs_f64(random_delay);
 
-        // Create retransmit packet
-        // Set context_flag when context is not None (matches Python's FLAG_SET behavior)
-        let has_context = self.context != PacketContext::None;
+        // Create retransmit packet.
+        //
+        // For announces, the header's context_flag indicates whether a ratchet
+        // public key is embedded in the data — it must be preserved from the
+        // original packet, NOT recomputed from the PacketContext field.
+        // Overwriting it would cause announce validation failure on receivers
+        // (they'd mis-parse the ratchet/signature boundary in the data).
+        //
+        // The PacketContext (PathResponse vs None) is stored in the separate
+        // `context` byte of the wire format, which does not affect signature
+        // verification.
         let new_packet = Packet {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type2,
-                context_flag: has_context,
+                context_flag: self.packet.header.context_flag,
                 transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
@@ -76,7 +84,7 @@ impl AnnounceEntry {
             new_packet.header.to_meta(),
             new_packet.header.hops,
             new_packet.context,
-            has_context,
+            new_packet.header.context_flag,
             new_packet.destination,
             transport_id,
             new_packet.data.as_slice().len(),
@@ -603,5 +611,52 @@ mod tests {
         assert_eq!(*recv_from, exclude_iface);
         assert_eq!(retransmit_packet.context, PacketContext::PathResponse);
         assert_eq!(retransmit_packet.header.hops, 2);
+    }
+
+    /// Verify that retransmit preserves the original packet's context_flag
+    /// rather than recomputing it from PacketContext.
+    ///
+    /// Python Transport.py always passes `context_flag = packet.context_flag`
+    /// at every announce retransmit site.  The context_flag for announces
+    /// indicates whether a ratchet public key is embedded in the data, which
+    /// is independent of the PacketContext (None vs PathResponse).
+    #[test]
+    fn test_retransmit_preserves_context_flag() {
+        let transport_id = test_address_hash(99);
+
+        // Case 1: Ratchet announce (context_flag=true) retransmitted with no context
+        let mut ratchet_announce = test_announce_packet(0);
+        ratchet_announce.header.context_flag = true;
+
+        let mut entry = AnnounceEntry {
+            packet: ratchet_announce,
+            timestamp: Instant::now(),
+            timeout: Instant::now(),
+            received_from: test_address_hash(1),
+            retries: 1,
+            hops: 1,
+            context: PacketContext::None,
+        };
+
+        let result = entry.retransmit(&transport_id).unwrap();
+        assert!(result.1.header.context_flag, "Ratchet flag must be preserved as true");
+        assert_eq!(result.1.context, PacketContext::None);
+
+        // Case 2: Non-ratchet announce (context_flag=false) retransmitted as PathResponse
+        let non_ratchet_announce = test_announce_packet(0); // context_flag defaults to false
+
+        let mut entry2 = AnnounceEntry {
+            packet: non_ratchet_announce,
+            timestamp: Instant::now(),
+            timeout: Instant::now(),
+            received_from: test_address_hash(1),
+            retries: 1,
+            hops: 1,
+            context: PacketContext::PathResponse,
+        };
+
+        let result2 = entry2.retransmit(&transport_id).unwrap();
+        assert!(!result2.1.header.context_flag, "Non-ratchet flag must be preserved as false");
+        assert_eq!(result2.1.context, PacketContext::PathResponse);
     }
 }

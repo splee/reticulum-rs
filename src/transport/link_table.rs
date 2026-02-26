@@ -3,7 +3,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::link::LinkId;
 use crate::hash::AddressHash;
-use crate::packet::{Header, HeaderType, IfacFlag, Packet};
+use crate::packet::{Header, Packet};
 
 pub struct LinkEntry {
     #[allow(dead_code)]
@@ -14,17 +14,23 @@ pub struct LinkEntry {
     pub next_hop_iface: AddressHash,
     pub received_from: AddressHash,
     pub original_destination: AddressHash,
-    #[allow(dead_code)]
     pub taken_hops: u8,
     pub remaining_hops: u8,
     pub validated: bool,
 }
 
+/// Route a packet backward through the link (toward the link initiator).
+///
+/// Matches Python Transport.py lines 2035-2037 and 1545-1547: the packet's
+/// raw flags byte (header type, transport type, etc.) is preserved as-is.
+/// Only the hop count is incremented.  The link table provides routing
+/// information (received_from interface), so no transport header
+/// manipulation is needed.
 fn send_backwards(packet: &Packet, entry: &LinkEntry) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
-            ifac_flag: IfacFlag::Authenticated,
-            header_type: HeaderType::Type2,
+            ifac_flag: packet.header.ifac_flag,
+            header_type: packet.header.header_type,
             context_flag: packet.header.context_flag,
             transport_type: packet.header.transport_type,
             destination_type: packet.header.destination_type,
@@ -33,7 +39,7 @@ fn send_backwards(packet: &Packet, entry: &LinkEntry) -> (Packet, AddressHash) {
         },
         ifac: None,
         destination: packet.destination,
-        transport: Some(entry.next_hop),
+        transport: packet.transport,
         context: packet.context,
         data: packet.data,
         ratchet_id: None,
@@ -123,7 +129,8 @@ impl LinkTable {
 mod tests {
     use super::*;
     use crate::packet::{
-        DestinationType, PacketContext, PacketDataBuffer, PacketType, TransportType,
+        DestinationType, HeaderType, IfacFlag, PacketContext, PacketDataBuffer, PacketType,
+        TransportType,
     };
 
     /// Create a test address hash with a specific byte pattern.
@@ -319,11 +326,63 @@ mod tests {
 
         let (backward_packet, to_iface) = result.unwrap();
 
-        // Check backward routing
+        // Check backward routing goes to received_from interface
         assert_eq!(to_iface, received_from);
-        assert_eq!(backward_packet.transport, Some(next_hop));
+        // Original packet fields are preserved (Python passes raw bytes through)
+        assert_eq!(backward_packet.header.header_type, HeaderType::Type2);
+        assert_eq!(backward_packet.transport, None); // preserved from proof packet
         // Hops should be incremented
         assert_eq!(backward_packet.header.hops, 4); // proof hops (3) + 1
+    }
+
+    /// Verify that send_backwards preserves the original packet's header type
+    /// and transport field, matching Python Transport.py lines 2035-2037 where
+    /// raw[0:1] (flags byte) is passed through unchanged.
+    #[test]
+    fn test_send_backwards_preserves_header_type() {
+        let mut table = LinkTable::new();
+        let link_request = test_link_request_packet(0, 0x77);
+        let destination = test_address_hash(10);
+        let received_from = test_address_hash(20);
+        let next_hop = test_address_hash(30);
+        let iface = test_address_hash(40);
+
+        table.add(&link_request, destination, received_from, next_hop, iface);
+        let link_id = LinkId::from(&link_request);
+
+        // Validate the link first
+        let proof = test_proof_packet(1, link_id);
+        table.handle_proof(&proof);
+
+        // Create a Type1 keepalive (as link traffic typically arrives)
+        let type1_keepalive = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                hops: 2,
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new(),
+            ratchet_id: None,
+        };
+
+        let result = table.handle_keepalive(&type1_keepalive);
+        assert!(result.is_some());
+        let (backward, to_iface) = result.unwrap();
+
+        // Header type preserved as Type1 (not wrapped to Type2)
+        assert_eq!(backward.header.header_type, HeaderType::Type1);
+        assert_eq!(backward.header.transport_type, TransportType::Broadcast);
+        assert_eq!(backward.transport, None);
+        assert_eq!(backward.header.hops, 3);
+        assert_eq!(to_iface, received_from);
     }
 
     #[test]
@@ -347,7 +406,9 @@ mod tests {
 
         let (backward_packet, to_iface) = result.unwrap();
         assert_eq!(to_iface, received_from);
-        assert_eq!(backward_packet.transport, Some(next_hop));
+        // Original packet fields preserved — transport was None in the proof packet
+        assert_eq!(backward_packet.transport, None);
+        assert_eq!(backward_packet.header.header_type, HeaderType::Type2);
     }
 
     #[test]

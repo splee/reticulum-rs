@@ -2685,9 +2685,20 @@ async fn manage_transport(
                                 .send_from_local_client(packet, message.address).await;
                         }
 
-                        if handler.config.broadcast && packet.header.packet_type != PacketType::Announce {
-                            // TODO: remove seperate handling for announces in handle_announce.
-                            // Send broadcast message expect current iface address
+                        // Determine whether to broadcast this packet.
+                        // Python never broadcasts LinkRequests or LinkRequestProofs —
+                        // LinkRequests are routed via path table (send_to_next_hop),
+                        // and LRPROOFs via link table (send_backwards).
+                        // Other proofs (receipt proofs) are broadcast here since
+                        // the reverse table is not yet implemented.
+                        // Announces are handled separately in handle_announce.
+                        let is_link_request_proof = packet.header.packet_type == PacketType::Proof
+                            && packet.context == PacketContext::LinkRequestProof;
+                        if handler.config.broadcast
+                            && packet.header.packet_type != PacketType::Announce
+                            && packet.header.packet_type != PacketType::LinkRequest
+                            && !is_link_request_proof
+                        {
                             handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet }).await;
                         }
 
