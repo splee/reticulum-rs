@@ -21,6 +21,12 @@ pub struct AnnounceEntry {
 }
 
 impl AnnounceEntry {
+    /// Returns true when this entry has exhausted all retransmit attempts
+    /// and can be removed from the announce table.
+    pub fn is_exhausted(&self) -> bool {
+        self.retries == 0 && Instant::now() >= self.timeout
+    }
+
     pub fn retransmit(
         &mut self,
         transport_id: &AddressHash,
@@ -45,11 +51,13 @@ impl AnnounceEntry {
             + Duration::from_secs_f64(random_delay);
 
         // Create retransmit packet
+        // Set context_flag when context is not None (matches Python's FLAG_SET behavior)
+        let has_context = self.context != PacketContext::None;
         let new_packet = Packet {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type2,
-                context_flag: false,
+                context_flag: has_context,
                 transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
@@ -62,6 +70,17 @@ impl AnnounceEntry {
             data: self.packet.data,
             ratchet_id: None,
         };
+
+        log::debug!(
+            "announce_table: retransmit Type2 announce: meta=0x{:02x}, hops={}, context={:?}, context_flag={}, dest={}, transport={}, data_len={}",
+            new_packet.header.to_meta(),
+            new_packet.header.hops,
+            new_packet.context,
+            has_context,
+            new_packet.destination,
+            transport_id,
+            new_packet.data.as_slice().len(),
+        );
 
         Some((self.received_from, new_packet))
     }
@@ -95,12 +114,14 @@ impl AnnounceTable {
         let hops = announce.header.hops + 1;
 
         // Match Python behavior: local clients get immediate retransmit,
-        // network announces get random delay for collision avoidance
+        // network announces get random delay for collision avoidance.
+        // Both get PATHFINDER_R retries so the announce is forwarded to all
+        // connected interfaces (critical for transport hub relay).
         let (timeout, retries) = if from_local_client {
             (now, super::PATHFINDER_R)  // Immediate, retransmit once
         } else {
             let random_delay = rand::random::<f64>() * super::PATHFINDER_RW;
-            (now + Duration::from_secs_f64(random_delay), 0)
+            (now + Duration::from_secs_f64(random_delay), super::PATHFINDER_R)
         };
 
         let entry = AnnounceEntry {
@@ -186,25 +207,29 @@ impl AnnounceTable {
         transport_id: &AddressHash,
     ) -> Vec<(AddressHash, Packet)> {
         let mut packets = vec![];
-        let mut completed = vec![];
+        let mut exhausted = vec![];
 
         for (destination, ref mut entry) in &mut self.map {
             if let Some(pair) = entry.retransmit(transport_id) {
                 packets.push(pair);
-            } else {
-                completed.push(*destination);
+            }
+            // Only remove entries that have used all retries and whose
+            // timeout has passed. Entries still waiting for their initial
+            // delay must stay in the table.
+            if entry.is_exhausted() {
+                exhausted.push(*destination);
             }
         }
 
-        if !(packets.is_empty() && completed.is_empty()) {
+        if !(packets.is_empty() && exhausted.is_empty()) {
             log::trace!(
                 "Announce cache: {} to retransmit, {} dropped",
                 packets.len(),
-                completed.len(),
+                exhausted.len(),
             );
         }
 
-        for destination in completed {
+        for destination in exhausted {
             self.map.remove(&destination);
         }
 
@@ -287,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_network_announce_no_retries() {
+    fn test_add_network_announce_has_retries() {
         let mut table = AnnounceTable::new();
         let packet = test_announce_packet(0);
         let destination = test_address_hash(1);
@@ -296,8 +321,8 @@ mod tests {
         table.add(&packet, destination, received_from, false);
 
         let entry = table.map.get(&destination).unwrap();
-        // Network announce should have retries set to 0
-        assert_eq!(entry.retries, 0);
+        // Network announces get PATHFINDER_R retries (forwarded after random delay)
+        assert_eq!(entry.retries, super::super::PATHFINDER_R);
     }
 
     #[test]
@@ -395,25 +420,32 @@ mod tests {
     }
 
     #[test]
-    fn test_to_retransmit_removes_completed() {
+    fn test_to_retransmit_removes_exhausted() {
         let mut table = AnnounceTable::new();
         let packet = test_announce_packet(0);
         let destination = test_address_hash(1);
         let received_from = test_address_hash(2);
         let transport_id = test_address_hash(99);
 
-        // Add a network announce (retries=0, so it will be "completed" after timeout)
+        // Add a network announce (retries=PATHFINDER_R, with random delay)
         table.add(&packet, destination, received_from, false);
         assert_eq!(table.map.len(), 1);
 
-        // Call to_retransmit - entry should be removed since retries=0
-        // and timeout may or may not have passed (depends on random delay)
-        // After first call, if timeout passed, entry should be removed
-        let _packets = table.to_retransmit(&transport_id);
+        // Force timeout to expired so retransmit fires
+        table.map.get_mut(&destination).unwrap().timeout = Instant::now();
+        let packets = table.to_retransmit(&transport_id);
+        // Should produce one retransmit packet
+        assert_eq!(packets.len(), 1);
+        // Entry still exists (retries just decremented to 0, but timeout was updated)
+        assert_eq!(table.map.len(), 1);
 
-        // The entry might still be there if timeout hasn't passed yet
-        // But if we force it by checking the behavior:
-        // Network announces have retries=0, so after timeout they're removed
+        // Force timeout again — now retries=0, so retransmit returns None
+        // and is_exhausted() returns true
+        table.map.get_mut(&destination).unwrap().timeout = Instant::now();
+        let packets = table.to_retransmit(&transport_id);
+        assert!(packets.is_empty());
+        // Entry should be removed now (exhausted)
+        assert_eq!(table.map.len(), 0);
     }
 
     #[test]

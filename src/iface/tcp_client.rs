@@ -279,6 +279,16 @@ impl TcpClient {
                                 }
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
                                 if packet.serialize(&mut output).is_ok() {
+                                    // Debug: log hex dump of announce packets for wire format debugging
+                                    if packet.header.packet_type == crate::packet::PacketType::Announce {
+                                        let raw = output.as_slice();
+                                        log::debug!(
+                                            "tcp_client: TX announce to {} ({} bytes): {:02x?}",
+                                            iface_address,
+                                            raw.len(),
+                                            &raw[..raw.len().min(60)]
+                                        );
+                                    }
 
                                     let mut encoded_output = OutputBuffer::new(&mut encoded_tx_buffer[..]);
 

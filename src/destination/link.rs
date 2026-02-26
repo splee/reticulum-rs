@@ -1567,23 +1567,25 @@ impl Link {
         })
     }
 
-    /// Create a resource proof packet.
+    /// Create a resource proof packet (receiver side).
+    ///
+    /// Resource proofs are sent as `PacketType::Proof` with
+    /// `PacketContext::ResourceProof` and are NOT link-level encrypted,
+    /// matching Python's `Resource.prove()` which sends:
+    ///   `RNS.Packet(link, proof_data, packet_type=PROOF, context=RESOURCE_PRF)`
     pub fn resource_proof_packet(&self, proof_data: &[u8]) -> Result<Packet, RnsError> {
         if self.status != LinkStatus::Active {
             return Err(RnsError::InvalidArgument);
         }
 
         let mut packet_data = PacketDataBuffer::new();
-        let cipher_text_len = {
-            let cipher_text = self.encrypt(proof_data, packet_data.accuire_buf_max())?;
-            cipher_text.len()
-        };
-        packet_data.resize(cipher_text_len);
+        packet_data.accuire_buf_max()[..proof_data.len()].copy_from_slice(proof_data);
+        packet_data.resize(proof_data.len());
 
         Ok(Packet {
             header: Header {
                 destination_type: DestinationType::Link,
-                packet_type: PacketType::Data,
+                packet_type: PacketType::Proof,
                 ..Default::default()
             },
             ifac: None,
@@ -3242,6 +3244,146 @@ mod tests {
                 "packet hash includes header fields beyond raw data; \
                  using data-only hash would break Python interop"
             );
+        }
+    }
+
+    /// Tests for resource proof packet creation.
+    ///
+    /// Validates that `resource_proof_packet` matches Python's `Resource.prove()`:
+    /// - packet_type = PROOF (not DATA)
+    /// - context = RESOURCE_PRF
+    /// - proof data is NOT link-level encrypted
+    mod resource_proof_packet {
+        use super::*;
+        use link_lifecycle::create_test_destination;
+
+        /// Helper: create a link with Active status for testing packet builders
+        /// that require an active link.
+        fn create_active_test_link() -> Link {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+            link.status = LinkStatus::Active;
+            link
+        }
+
+        #[test]
+        fn test_resource_proof_packet_type_is_proof() {
+            let link = create_active_test_link();
+            let proof_data = vec![0xAA; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(
+                packet.header.packet_type,
+                PacketType::Proof,
+                "Python sends resource proofs as packet_type=PROOF, not DATA"
+            );
+        }
+
+        #[test]
+        fn test_resource_proof_packet_context() {
+            let link = create_active_test_link();
+            let proof_data = vec![0xBB; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(
+                packet.context,
+                PacketContext::ResourceProof,
+                "Python uses context=RESOURCE_PRF for resource proofs"
+            );
+        }
+
+        #[test]
+        fn test_resource_proof_packet_destination_type() {
+            let link = create_active_test_link();
+            let proof_data = vec![0xCC; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(packet.header.destination_type, DestinationType::Link);
+        }
+
+        #[test]
+        fn test_resource_proof_data_is_not_encrypted() {
+            // Python explicitly does NOT encrypt resource proofs:
+            //   Packet.pack(): "Resource proofs are not encrypted"
+            //   self.ciphertext = self.data  (no encryption call)
+            let link = create_active_test_link();
+            let proof_data: Vec<u8> = (0..64).collect();
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(
+                packet.data.as_slice(),
+                &proof_data[..],
+                "proof data must be placed raw (unencrypted) in the packet"
+            );
+        }
+
+        #[test]
+        fn test_resource_proof_packet_preserves_data_length() {
+            let link = create_active_test_link();
+            // Real proof data is 64 bytes (32-byte resource hash + 32-byte proof hash)
+            let proof_data = vec![0x42; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(packet.data.len(), 64);
+        }
+
+        #[test]
+        fn test_resource_proof_packet_destination_is_link_id() {
+            let link = create_active_test_link();
+            let expected_id = *link.id();
+            let proof_data = vec![0xDD; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert_eq!(packet.destination, expected_id);
+        }
+
+        #[test]
+        fn test_resource_proof_packet_fails_when_not_active() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let link = Link::new(dest, tx);
+
+            // Link starts in Pending state
+            assert_eq!(link.status(), LinkStatus::Pending);
+
+            let result = link.resource_proof_packet(b"proof");
+            assert!(
+                result.is_err(),
+                "resource_proof_packet must fail on non-Active link"
+            );
+        }
+
+        #[test]
+        fn test_resource_proof_packet_fails_when_closed() {
+            let dest = create_test_destination();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let mut link = Link::new(dest, tx);
+            link.status = LinkStatus::Closed;
+
+            let result = link.resource_proof_packet(b"proof");
+            assert!(
+                result.is_err(),
+                "resource_proof_packet must fail on Closed link"
+            );
+        }
+
+        #[test]
+        fn test_resource_proof_packet_no_transport_or_ratchet() {
+            let link = create_active_test_link();
+            let proof_data = vec![0xFF; 64];
+
+            let packet = link.resource_proof_packet(&proof_data).unwrap();
+
+            assert!(packet.transport.is_none());
+            assert!(packet.ratchet_id.is_none());
+            assert!(packet.ifac.is_none());
         }
     }
 }

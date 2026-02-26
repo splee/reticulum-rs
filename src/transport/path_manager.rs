@@ -38,6 +38,15 @@ impl PathManager {
     // Path Query Methods
     // =========================================================================
 
+    /// Get the cached announce packet for a destination, if the path is still valid.
+    ///
+    /// Used for path responses — the announce packet persists in the path table
+    /// for the lifetime of the path, unlike the announce_table which evicts entries
+    /// after retransmission (~5-6s).
+    pub fn get_announce_packet(&self, destination: &AddressHash) -> Option<&Packet> {
+        self.table.get_announce_packet(destination)
+    }
+
     /// Check if a path to the destination exists and is not expired.
     pub fn has_path(&self, destination: &AddressHash) -> bool {
         self.table.has_path(destination)

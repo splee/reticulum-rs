@@ -115,6 +115,12 @@ pub struct PathEntry {
     /// Random blobs from announces for this destination, used for replay detection
     /// and emission timestamp comparison.
     pub random_blobs: Vec<RandomBlob>,
+    /// Cached announce packet for path responses.
+    ///
+    /// The announce_table evicts entries after retransmission completes (~5-6s),
+    /// but path responses need the announce packet for the lifetime of the path.
+    /// Storing it here ensures path requests can be answered at any time.
+    pub announce_packet: Packet,
 }
 
 /// Path information for external display/queries
@@ -150,6 +156,20 @@ impl PathTable {
             path_states: HashMap::new(),
             created_at: Instant::now(),
         }
+    }
+
+    /// Get the cached announce packet for a destination, if the path is still valid.
+    ///
+    /// Used for path responses — the announce packet is needed to construct the
+    /// response even long after the announce_table has evicted its copy.
+    pub fn get_announce_packet(&self, destination: &AddressHash) -> Option<&Packet> {
+        self.map.get(destination).and_then(|entry| {
+            if entry.timestamp.elapsed() > entry.expiry_duration {
+                None
+            } else {
+                Some(&entry.announce_packet)
+            }
+        })
     }
 
     /// Check if a path to destination exists and is not expired.
@@ -457,6 +477,7 @@ impl PathTable {
             packet_hash: announce.hash(),
             expiry_duration,
             random_blobs,
+            announce_packet: *announce,
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -614,10 +635,32 @@ impl Default for PathTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::{PacketContext, PacketDataBuffer};
 
     /// Helper to create a zero AddressHash for testing
     fn zero_address_hash() -> AddressHash {
         AddressHash::new_from_slice(&[0u8; 16])
+    }
+
+    /// Helper to create a dummy announce packet for PathEntry construction in tests.
+    fn dummy_announce_packet() -> Packet {
+        Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: zero_address_hash(),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new(),
+            ratchet_id: None,
+        }
     }
 
     #[test]
@@ -636,6 +679,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: Vec::new(),
+            announce_packet: dummy_announce_packet(),
         });
 
         assert!(table.has_path(&dest));
@@ -654,6 +698,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: Vec::new(),
+            announce_packet: dummy_announce_packet(),
         });
 
         assert!(table.drop_path(&dest));
@@ -679,6 +724,7 @@ mod tests {
                 packet_hash: Hash::new_empty(),
                 expiry_duration: PATH_EXPIRY_TIME,
                 random_blobs: Vec::new(),
+                announce_packet: dummy_announce_packet(),
             });
         }
 
@@ -803,6 +849,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: Vec::new(),
+            announce_packet: dummy_announce_packet(),
         });
 
         // Default state is not unresponsive
@@ -834,6 +881,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: Vec::new(),
+            announce_packet: dummy_announce_packet(),
         });
 
         table.mark_path_unresponsive(&dest);
@@ -866,6 +914,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: Vec::new(),
+            announce_packet: dummy_announce_packet(),
         });
 
         assert_eq!(table.hops_to_or_max(&dest), 3);
@@ -1066,6 +1115,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME, // 7 days
             random_blobs: vec![blob1],
+            announce_packet: dummy_announce_packet(),
         });
 
         // More hops but new blob on expired path → accepted
@@ -1092,6 +1142,7 @@ mod tests {
             packet_hash: Hash::new_empty(),
             expiry_duration: PATH_EXPIRY_TIME,
             random_blobs: blobs,
+            announce_packet: dummy_announce_packet(),
         });
 
         // Add one more via announce (fewer hops, newer timestamp)

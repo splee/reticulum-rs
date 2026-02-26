@@ -1834,13 +1834,20 @@ async fn process_path_request<'a>(
                 }
             }
 
-            // Copy the announce packet and hops before mutating handler
-            let announce_and_hops = handler
-                .announce_manager
+            // Get the cached announce packet and the interface it was received on
+            // from the path table. The path table persists for the lifetime of the
+            // path, unlike the announce_table which evicts after retransmission (~5-6s).
+            let announce_info = handler
+                .path_manager
                 .get_announce_packet(&destination_hash)
-                .map(|p| (*p, handler.path_manager.hops_to(&destination_hash).unwrap_or(0)));
+                .map(|p| {
+                    let hops = handler.path_manager.hops_to(&destination_hash).unwrap_or(0);
+                    let announce_iface = handler.path_manager.next_hop_iface(&destination_hash)
+                        .unwrap_or(attached_interface);
+                    (*p, hops, announce_iface)
+                });
 
-            if let Some((announce_packet, hops)) = announce_and_hops {
+            if let Some((announce_packet, hops, announce_iface)) = announce_info {
                 log::debug!(
                     "tp({}): answering path request for {}, path known ({} hops, local_client={})",
                     handler.config.name,
@@ -1863,11 +1870,13 @@ async fn process_path_request<'a>(
                 } else {
                     // Transport node answering a network request: schedule via announce
                     // table with grace period so closer peers can answer first (matches
-                    // Python: retransmit_timeout = now + PATH_REQUEST_GRACE)
+                    // Python: retransmit_timeout = now + PATH_REQUEST_GRACE).
+                    // Exclude the interface the announce was ORIGINALLY received from
+                    // (not the path request source), matching Python's behavior.
                     handler.announce_manager.add_path_response(
                         &announce_packet,
                         destination_hash,
-                        attached_interface,
+                        announce_iface,
                         hops,
                         path_request::PATH_REQUEST_RESPONSE_GRACE,
                     );
