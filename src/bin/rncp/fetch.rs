@@ -159,50 +159,53 @@ pub async fn run_fetch_mode(
     }
 
     // Wait for response and handle resource transfer
-    handle_fetch_response(
-        &transport,
-        &mut link_events,
-        &link_id,
+    let mut ctx = FetchContext {
+        transport: &transport,
+        link_events: &mut link_events,
+        link_id: &link_id,
         file_path_str,
-        &output_dir,
+        output_dir: &output_dir,
         allow_overwrite,
         silent,
         timeout,
-        &running,
-    )
-    .await
+        running: &running,
+    };
+    handle_fetch_response(&mut ctx).await
+}
+
+/// Context for a fetch response handler, grouping related parameters.
+struct FetchContext<'a> {
+    transport: &'a Transport,
+    link_events: &'a mut tokio::sync::broadcast::Receiver<reticulum::destination::link::LinkEventData>,
+    link_id: &'a reticulum::destination::link::LinkId,
+    file_path_str: &'a str,
+    output_dir: &'a Path,
+    allow_overwrite: bool,
+    silent: bool,
+    timeout: Duration,
+    running: &'a Arc<AtomicBool>,
 }
 
 /// Handle the fetch response and resource transfer.
 ///
 /// Waits for the server's response (either error or resource advertisement)
 /// and manages the incoming resource transfer.
-async fn handle_fetch_response(
-    transport: &Transport,
-    link_events: &mut tokio::sync::broadcast::Receiver<reticulum::destination::link::LinkEventData>,
-    link_id: &reticulum::destination::link::LinkId,
-    file_path_str: &str,
-    output_dir: &Path,
-    allow_overwrite: bool,
-    silent: bool,
-    timeout: Duration,
-    running: &Arc<AtomicBool>,
-) -> i32 {
+async fn handle_fetch_response(ctx: &mut FetchContext<'_>) -> i32 {
     // Track incoming resource
     let mut incoming_resource: Option<Resource> = None;
     let mut request_resolved = false;
     let mut request_failed = false;
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + ctx.timeout;
 
     // Wait for response (either error code or resource transfer)
     while tokio::time::Instant::now() < deadline
-        && running.load(Ordering::SeqCst)
+        && ctx.running.load(Ordering::SeqCst)
         && !request_resolved
     {
         tokio::select! {
-            Ok(event) = link_events.recv() => {
-                if event.id == *link_id {
+            Ok(event) = ctx.link_events.recv() => {
+                if event.id == *ctx.link_id {
                     match event.event {
                         LinkEvent::Response(payload) => {
                             if let Some(failed) = handle_response_event(payload.as_slice()) {
@@ -212,10 +215,10 @@ async fn handle_fetch_response(
                         }
                         LinkEvent::ResourceAdvertisement(payload) => {
                             match handle_advertisement_event(
-                                transport,
-                                link_id,
+                                ctx.transport,
+                                ctx.link_id,
                                 payload.as_slice(),
-                                silent,
+                                ctx.silent,
                             ).await {
                                 Ok(resource) => {
                                     incoming_resource = Some(resource);
@@ -229,13 +232,13 @@ async fn handle_fetch_response(
                         LinkEvent::ResourceData(payload) => {
                             if let Some(ref mut resource) = incoming_resource {
                                 match handle_data_event(
-                                    transport,
-                                    link_id,
+                                    ctx.transport,
+                                    ctx.link_id,
                                     resource,
                                     payload.as_slice(),
-                                    file_path_str,
-                                    output_dir,
-                                    allow_overwrite,
+                                    ctx.file_path_str,
+                                    ctx.output_dir,
+                                    ctx.allow_overwrite,
                                 ).await {
                                     DataEventResult::Complete => {
                                         request_resolved = true;

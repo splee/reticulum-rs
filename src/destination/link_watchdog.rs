@@ -19,7 +19,7 @@ pub enum WatchdogMessage {
     /// Send a keepalive packet for this link.
     SendKeepalive {
         link_id: AddressHash,
-        packet: Packet,
+        packet: Box<Packet>,
     },
     /// Tear down this link due to staleness or timeout.
     TeardownLink {
@@ -200,7 +200,7 @@ async fn link_watchdog_loop(
                 log::trace!("link_watchdog({}): sending keepalive", link_id);
                 let _ = msg_tx.send(WatchdogMessage::SendKeepalive {
                     link_id,
-                    packet,
+                    packet: Box::new(packet),
                 });
             }
         }
@@ -259,7 +259,7 @@ mod tests {
         // Test SendKeepalive variant
         let keepalive_msg = WatchdogMessage::SendKeepalive {
             link_id,
-            packet: Packet::default(),
+            packet: Box::new(Packet::default()),
         };
         match keepalive_msg {
             WatchdogMessage::SendKeepalive { link_id: id, .. } => {

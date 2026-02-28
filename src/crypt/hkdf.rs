@@ -72,7 +72,7 @@ pub fn hkdf(length: usize, derive_from: &[u8], salt: Option<&[u8]>, context: Opt
     let pseudorandom_key = hmac_sha256(salt, derive_from);
 
     // Expand phase
-    let num_blocks = (length + HASH_LEN - 1) / HASH_LEN;
+    let num_blocks = length.div_ceil(HASH_LEN);
     let mut block = Vec::new();
     let mut derived = Vec::with_capacity(num_blocks * HASH_LEN);
 

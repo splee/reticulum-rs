@@ -142,8 +142,8 @@ impl AnnounceManager {
 
     /// Emit an announce event to all subscribers.
     ///
-    /// Returns Ok(num_receivers) on success, or Err if no receivers.
-    pub fn emit(&self, event: AnnounceEvent) -> Result<usize, broadcast::error::SendError<AnnounceEvent>> {
+    /// Returns Ok(num_receivers) on success, or Err (boxed) if no receivers.
+    pub fn emit(&self, event: AnnounceEvent) -> Result<usize, Box<broadcast::error::SendError<AnnounceEvent>>> {
         let result = self.event_tx.send(event);
         match &result {
             Ok(count) => {
@@ -158,7 +158,7 @@ impl AnnounceManager {
                 );
             }
         }
-        result
+        result.map_err(Box::new)
     }
 
     /// Get a clone of the event sender for passing to other components.

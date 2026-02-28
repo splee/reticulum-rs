@@ -194,7 +194,7 @@ impl RatchetState {
 
     /// Get the current ratchet public key without rotation.
     pub fn current_public_key(&self) -> Option<[u8; RATCHET_KEY_SIZE]> {
-        self.ratchets.front().map(|r| ratchet_public_bytes(r))
+        self.ratchets.front().map(ratchet_public_bytes)
     }
 
     /// Get all ratchet private keys for decryption attempts.

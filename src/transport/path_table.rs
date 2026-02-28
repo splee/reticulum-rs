@@ -60,7 +60,7 @@ pub fn emission_timestamp_from_blob(blob: &RandomBlob) -> u64 {
 
 /// Get the maximum emission timestamp across all random blobs.
 pub fn timebase_from_blobs(blobs: &[RandomBlob]) -> u64 {
-    blobs.iter().map(|b| emission_timestamp_from_blob(b)).max().unwrap_or(0)
+    blobs.iter().map(emission_timestamp_from_blob).max().unwrap_or(0)
 }
 
 /// Extract the 10-byte random blob from announce packet data at the standard offset.
@@ -366,7 +366,7 @@ impl PathTable {
         let random_blob = extract_random_blob(announce.data.as_slice());
         let announce_emitted = random_blob
             .as_ref()
-            .map(|b| emission_timestamp_from_blob(b))
+            .map(emission_timestamp_from_blob)
             .unwrap_or(0);
 
         let should_add;

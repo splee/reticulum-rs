@@ -26,24 +26,26 @@ use crate::protocol::{
 };
 use crate::APP_NAME;
 
+/// Context for sending resource parts in response to requests.
+struct SendContext<'a> {
+    transport: &'a Transport,
+    link: &'a Arc<tokio::sync::Mutex<Link>>,
+    link_id: &'a AddressHash,
+    resource: &'a Arc<tokio::sync::Mutex<Resource>>,
+    progress: &'a mut TransferProgress,
+    total_parts: usize,
+    parts_sent: &'a mut usize,
+}
+
 /// Handle a resource request event by sending requested parts.
 ///
 /// Returns the number of parts sent, or None if the request failed.
-async fn handle_resource_request(
-    transport: &Transport,
-    link: &Arc<tokio::sync::Mutex<Link>>,
-    link_id: &AddressHash,
-    resource: &Arc<tokio::sync::Mutex<Resource>>,
-    payload: &[u8],
-    progress: &mut TransferProgress,
-    total_parts: usize,
-    parts_sent: &mut usize,
-) -> Option<()> {
+async fn handle_resource_request(ctx: &mut SendContext<'_>, payload: &[u8]) -> Option<()> {
     log::info!("Received resource request ({} bytes)", payload.len());
 
     // Handle request and collect parts to send
     let (parts_to_send, hashmap_update) = {
-        let mut resource_guard = resource.lock().await;
+        let mut resource_guard = ctx.resource.lock().await;
         match resource_guard.handle_request(payload) {
             Ok(result) => {
                 let parts: Vec<_> = result.parts_to_send
@@ -66,27 +68,27 @@ async fn handle_resource_request(
     // Send hashmap update if the receiver needs more hashmap entries
     if let Some(ref hmu_data) = hashmap_update {
         log::info!("Sending hashmap update ({} bytes)", hmu_data.len());
-        transport.send_resource_hashmap_update(link_id, hmu_data).await;
+        ctx.transport.send_resource_hashmap_update(ctx.link_id, hmu_data).await;
     }
 
     // Send requested parts
     for (part_idx, part_data) in parts_to_send {
         let part_size = part_data.len();
-        let link_guard = link.lock().await;
+        let link_guard = ctx.link.lock().await;
         match link_guard.resource_data_packet(&part_data) {
             Ok(packet) => {
                 drop(link_guard);
-                transport.send_packet(packet).await;
-                *parts_sent += 1;
+                ctx.transport.send_packet(packet).await;
+                *ctx.parts_sent += 1;
 
-                progress.update(part_size);
-                progress.display();
+                ctx.progress.update(part_size);
+                ctx.progress.display();
 
                 log::debug!(
                     "Sent part {}/{}, total sent: {}",
                     part_idx,
-                    total_parts,
-                    *parts_sent
+                    ctx.total_parts,
+                    *ctx.parts_sent
                 );
             }
             Err(e) => {
@@ -307,16 +309,16 @@ pub async fn run_send_mode(
                 if event.id == link_id {
                     match event.event {
                         LinkEvent::ResourceRequest(payload) => {
-                            handle_resource_request(
-                                &transport,
-                                &link,
-                                &link_id,
-                                &resource,
-                                payload.as_slice(),
-                                &mut progress,
+                            let mut send_ctx = SendContext {
+                                transport: &transport,
+                                link: &link,
+                                link_id: &link_id,
+                                resource: &resource,
+                                progress: &mut progress,
                                 total_parts,
-                                &mut parts_sent,
-                            )
+                                parts_sent: &mut parts_sent,
+                            };
+                            handle_resource_request(&mut send_ctx, payload.as_slice())
                             .await;
                         }
                         LinkEvent::ResourceProof(payload) => {

@@ -58,7 +58,7 @@ impl std::fmt::Debug for AnnounceData {
 }
 
 /// Configuration for an announce handler.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AnnounceHandlerConfig {
     /// Optional aspect filter - only receive announces matching this aspect
     ///
@@ -76,15 +76,6 @@ impl std::fmt::Debug for AnnounceHandlerConfig {
             .field("aspect_filter", &self.aspect_filter.is_some())
             .field("receive_path_responses", &self.receive_path_responses)
             .finish()
-    }
-}
-
-impl Default for AnnounceHandlerConfig {
-    fn default() -> Self {
-        Self {
-            aspect_filter: None,
-            receive_path_responses: false,
-        }
     }
 }
 

@@ -83,14 +83,18 @@ pub struct RequestReceipt {
     /// Timeout duration for this request
     timeout: Duration,
     /// When the request concluded (success or failure)
+    #[allow(dead_code)] // Python parity: diagnostics field
     concluded_at: Option<Instant>,
     /// When the response was fully received
     response_concluded_at: Option<Instant>,
     /// Request size in bytes
+    #[allow(dead_code)] // Python parity: diagnostics field
     request_size: Option<usize>,
     /// Response transfer size in bytes
+    #[allow(dead_code)] // Python parity: diagnostics field
     response_transfer_size: Option<usize>,
     /// Response size in bytes (uncompressed)
+    #[allow(dead_code)] // Python parity: diagnostics field
     response_size: Option<usize>,
     /// Callbacks for this request
     callbacks: RequestReceiptCallbacks,
@@ -192,11 +196,13 @@ impl RequestReceipt {
     }
 
     /// Mark the request as delivered.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn set_delivered(&mut self) {
         self.status = RequestReceiptStatus::Delivered;
     }
 
     /// Mark the request as receiving response.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn set_receiving(&mut self, progress: f32) {
         self.status = RequestReceiptStatus::Receiving;
         self.progress = progress;
@@ -224,6 +230,7 @@ impl RequestReceipt {
     }
 
     /// Mark the request as failed.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn set_failed(&mut self) {
         self.status = RequestReceiptStatus::Failed;
         self.concluded_at = Some(Instant::now());

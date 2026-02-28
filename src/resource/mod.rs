@@ -40,6 +40,9 @@ pub use status::{ResourceFlags, ResourceStatus};
 use compression::{compress_bz2, decompress_bz2};
 use parts::calculate_map_hash;
 
+/// Type alias for a resource encryption function.
+pub type EncryptFn = dyn Fn(&[u8]) -> Result<Vec<u8>, RnsError>;
+
 /// Type alias for progress callback
 pub type ProgressCallback = Arc<dyn Fn(&ResourceProgress) + Send + Sync>;
 
@@ -219,7 +222,7 @@ impl Resource {
         data: &[u8],
         config: ResourceConfig,
         metadata: Option<&[u8]>,
-        encrypt_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>, RnsError>>,
+        encrypt_fn: Option<&EncryptFn>,
     ) -> Result<Self, RnsError> {
         // Resource parts are sent as PacketContext::RESOURCE (link-level plaintext),
         // so SDU should match plain Reticulum MDU (MTU - header max - IFAC min).

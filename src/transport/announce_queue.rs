@@ -285,7 +285,7 @@ impl AnnounceQueueManager {
 
     /// Get or create the queue for an interface.
     pub fn get_or_create(&mut self, interface: &AddressHash) -> &mut InterfaceAnnounceQueue {
-        self.queues.entry(*interface).or_insert_with(InterfaceAnnounceQueue::new)
+        self.queues.entry(*interface).or_default()
     }
 
     /// Get the queue for an interface if it exists.

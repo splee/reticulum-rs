@@ -26,6 +26,9 @@ use crate::{
 
 use super::DestinationDesc;
 
+/// Callback type for resource acceptance decisions.
+type ResourceAcceptCallback = Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>;
+
 /// Size of MTU/mode signalling field in link packets (3 bytes).
 const LINK_MTU_SIZE: usize = 3;
 
@@ -33,40 +36,29 @@ const LINK_MTU_SIZE: usize = 3;
 const DEFAULT_LINK_MTU: u32 = 500;
 
 /// Link encryption/signing modes (matching Python Link.py).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LinkMode {
     /// AES-128 CBC mode for encryption
     Aes128Cbc = 0x00,
-    /// AES-256 CBC mode for encryption (default)
+    /// AES-256 CBC mode for encryption (default, matches Python's MODE_AES256_CBC)
+    #[default]
     Aes256Cbc = 0x01,
-}
-
-impl Default for LinkMode {
-    fn default() -> Self {
-        // Match Python's default mode (MODE_AES256_CBC)
-        LinkMode::Aes256Cbc
-    }
 }
 
 /// Resource acceptance strategy for incoming resources on a link.
 ///
 /// Matches Python's Link.ACCEPT_NONE / ACCEPT_APP / ACCEPT_ALL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ResourceStrategy {
     /// Reject all incoming resources
+    #[default]
     AcceptNone = 0x00,
     /// Accept resources based on application callback
     AcceptApp = 0x01,
     /// Accept all incoming resources
     AcceptAll = 0x02,
-}
-
-impl Default for ResourceStrategy {
-    fn default() -> Self {
-        ResourceStrategy::AcceptNone
-    }
 }
 
 /// MTU byte mask for extracting MTU from signalling bytes (21 bits).
@@ -319,7 +311,7 @@ pub struct Link {
     /// Resource acceptance strategy for incoming resources
     resource_strategy: ResourceStrategy,
     /// Application callback for AcceptApp strategy
-    resource_accept_callback: Option<Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>>,
+    resource_accept_callback: Option<ResourceAcceptCallback>,
     /// Teardown reason when link is closed
     teardown_reason: Option<LinkTeardownReason>,
     // Physical layer stats
@@ -1701,6 +1693,7 @@ impl Link {
     }
 
     /// Update timing fields when data is received.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn record_inbound(&mut self) {
         let now = Instant::now();
         self.last_inbound = Some(now);
@@ -1708,6 +1701,7 @@ impl Link {
     }
 
     /// Update timing fields when data is sent.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn record_outbound(&mut self) {
         let now = Instant::now();
         self.last_outbound = Some(now);
@@ -1715,11 +1709,13 @@ impl Link {
     }
 
     /// Record keepalive activity.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn record_keepalive(&mut self) {
         self.last_keepalive = Some(Instant::now());
     }
 
     /// Mark link as activated.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn mark_activated(&mut self) {
         self.activated_at = Some(Instant::now());
         self.update_keepalive_from_rtt();
@@ -1729,6 +1725,7 @@ impl Link {
     ///
     /// Formula matches Python's Link._update_keepalive():
     /// keepalive = clamp(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MIN, KEEPALIVE_MAX)
+    #[allow(dead_code)] // Python parity API — called by mark_activated
     pub(crate) fn update_keepalive_from_rtt(&mut self) {
         let rtt_secs = self.rtt.as_secs_f64();
         let keepalive_secs = (rtt_secs * (KEEPALIVE_MAX.as_secs_f64() / KEEPALIVE_MAX_RTT))
@@ -1756,11 +1753,13 @@ impl Link {
     }
 
     /// Add a pending request.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn add_pending_request(&mut self, request_id: [u8; 16], receipt: SharedRequestReceipt) {
         self.pending_requests.insert(request_id, receipt);
     }
 
     /// Remove a pending request.
+    #[allow(dead_code)] // Python parity API — will be wired into transport loop
     pub(crate) fn remove_pending_request(&mut self, request_id: &[u8; 16]) -> Option<SharedRequestReceipt> {
         self.pending_requests.remove(request_id)
     }
