@@ -131,6 +131,9 @@ pub struct TransportConfig {
 pub struct AnnounceEvent {
     pub destination: Arc<Mutex<SingleOutputDestination>>,
     pub app_data: PacketDataBuffer,
+    /// The ratchet public key from this announce, if present.
+    /// When set, indicates the announcing destination supports forward secrecy.
+    pub ratchet: Option<[u8; RATCHET_KEY_SIZE]>,
 }
 
 struct TransportHandler {
@@ -2330,6 +2333,7 @@ async fn handle_announce<'a>(
         let _ = handler.announce_manager.emit(AnnounceEvent {
             destination,
             app_data: PacketDataBuffer::new_from_slice(app_data),
+            ratchet: validation.ratchet,
         });
     } else {
         log::warn!(
@@ -3928,5 +3932,125 @@ mod tests {
             .await;
         assert!(result.is_err(), "should error when link does not exist");
         assert_eq!(result.unwrap_err(), RnsError::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_announce_event_contains_ratchet_when_present() {
+        // When a ratchet-bearing announce is processed, the emitted
+        // AnnounceEvent should carry the ratchet public key.
+        use crate::destination::{DestinationName, SingleInputDestination};
+        use crate::identity::ratchet_public_bytes;
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Subscribe to announce events before processing
+        let mut announce_rx = handler.lock().await.announce_manager.subscribe();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let dest = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("test", "ratchetevt").unwrap(),
+        );
+
+        // Generate ratchet key pair
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        let announce = dest
+            .announce_with_ratchet(OsRng, &ratchet_pub, None)
+            .expect("valid ratchet announce");
+
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        // Receive the emitted event and verify ratchet is present
+        let event = announce_rx.try_recv().expect("should have received announce event");
+        assert_eq!(
+            event.ratchet,
+            Some(ratchet_pub),
+            "AnnounceEvent should contain the ratchet public key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announce_event_ratchet_is_none_without_ratchet() {
+        // When a normal announce (no ratchet) is processed, the emitted
+        // AnnounceEvent.ratchet should be None.
+        use crate::destination::{DestinationName, SingleInputDestination};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Subscribe before processing
+        let mut announce_rx = handler.lock().await.announce_manager.subscribe();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut dest = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("test", "noratchetevt").unwrap(),
+        );
+        let announce = dest.announce(OsRng, None).expect("valid announce");
+
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        let event = announce_rx.try_recv().expect("should have received announce event");
+        assert_eq!(
+            event.ratchet, None,
+            "AnnounceEvent.ratchet should be None for non-ratchet announce"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announce_event_ratchet_with_app_data() {
+        // Verify ratchet is correctly set even when app_data is also present.
+        use crate::destination::{DestinationName, SingleInputDestination};
+        use crate::identity::ratchet_public_bytes;
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let mut announce_rx = handler.lock().await.announce_manager.subscribe();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let dest = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("test", "ratchetapp").unwrap(),
+        );
+
+        let ratchet_priv: [u8; RATCHET_KEY_SIZE] = {
+            let mut key = [0u8; RATCHET_KEY_SIZE];
+            OsRng.fill_bytes(&mut key);
+            key
+        };
+        let ratchet_pub = ratchet_public_bytes(&ratchet_priv);
+
+        let app_data = b"hello from ratchet announce";
+        let announce = dest
+            .announce_with_ratchet(OsRng, &ratchet_pub, Some(app_data))
+            .expect("valid ratchet announce with app_data");
+
+        let iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_announce(&announce, handler.lock().await, iface, false).await;
+
+        let event = announce_rx.try_recv().expect("should have received announce event");
+        assert_eq!(
+            event.ratchet,
+            Some(ratchet_pub),
+            "ratchet should be present even with app_data"
+        );
+        assert_eq!(
+            &event.app_data.as_slice()[..app_data.len()],
+            app_data,
+            "app_data should be preserved alongside ratchet"
+        );
     }
 }
