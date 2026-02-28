@@ -465,6 +465,13 @@ impl DestinationAnnounce {
     }
 }
 
+/// Callback that dynamically generates default app_data for announces.
+///
+/// Matches Python's `set_default_app_data(callable)` — when `announce()` is called
+/// without explicit app_data, this callback is invoked to generate it.
+/// Used by LXMF to include propagation node stamp costs in path responses.
+pub type DefaultAppDataCallback = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
+
 pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub direction: PhantomData<D>,
     pub r#type: PhantomData<T>,
@@ -478,6 +485,10 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub ratchet_state: RatchetState,
     /// ID of the ratchet used in the last encrypt or decrypt operation
     pub latest_ratchet_id: Option<[u8; RATCHET_ID_LENGTH]>,
+    /// Default app_data callback for announces (Python: Destination.default_app_data).
+    /// When set and announce() is called with app_data=None, this callback is invoked
+    /// to generate app_data dynamically.
+    pub default_app_data: Option<DefaultAppDataCallback>,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -495,6 +506,20 @@ impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
     /// Get the current proof strategy.
     pub fn get_proof_strategy(&self) -> ProofStrategy {
         self.proof_strategy
+    }
+
+    /// Set default app_data for announces (Python: Destination.set_default_app_data).
+    ///
+    /// When set, `announce()` calls this callback to generate app_data whenever
+    /// no explicit app_data is provided. This matches Python's behavior where
+    /// `self.default_app_data` can be a callable that returns bytes.
+    pub fn set_default_app_data(&mut self, callback: DefaultAppDataCallback) {
+        self.default_app_data = Some(callback);
+    }
+
+    /// Clear any previously set default app_data callback.
+    pub fn clear_default_app_data(&mut self) {
+        self.default_app_data = None;
     }
 
     /// Decide whether to send a proof for a given packet.
@@ -541,6 +566,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             proof_strategy: ProofStrategy::None,
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
+            default_app_data: None,
         }
     }
 
@@ -549,6 +575,15 @@ impl Destination<PrivateIdentity, Input, Single> {
         rng: R,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
+        // If no explicit app_data provided, invoke the default callback if set.
+        // Matches Python: Destination.py:289-295
+        let default_data = if app_data.is_none() {
+            self.default_app_data.as_ref().map(|cb| cb())
+        } else {
+            None
+        };
+        let app_data = app_data.or(default_data.as_deref());
+
         // Auto-rotate ratchet if enabled. When a ratchet is available,
         // delegate to announce_with_ratchet() so the ratchet public key
         // is included in the announce and context_flag is set.
@@ -989,6 +1024,7 @@ impl Destination<Identity, Output, Single> {
             proof_strategy: ProofStrategy::None,
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
+            default_app_data: None,
         }
     }
 
@@ -1061,6 +1097,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             proof_strategy: ProofStrategy::None,
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
+            default_app_data: None,
         }
     }
 }
@@ -1082,6 +1119,7 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use rand_core::OsRng;
 
     use crate::buffer::OutputBuffer;
@@ -1605,5 +1643,71 @@ mod tests {
     fn test_dot_in_app_name_rejected() {
         assert!(DestinationName::new("bad.app", "aspect").is_err());
         assert!(DestinationName::new("good_app", "aspect.sub").is_ok());
+    }
+
+    #[test]
+    fn test_default_app_data_used_when_no_explicit() {
+        // When announce() is called with app_data=None and a default callback is set,
+        // the callback should be invoked and its output included in the announce.
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "defaultdata").unwrap();
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        let expected_data = b"stamp_cost_42";
+        destination.set_default_app_data(Arc::new(|| expected_data.to_vec()));
+
+        let announce = destination.announce(OsRng, None).expect("valid announce");
+
+        let validation = DestinationAnnounce::validate_full(&announce)
+            .expect("announce should validate");
+        assert_eq!(
+            validation.app_data,
+            expected_data.as_slice(),
+            "default app_data callback output should appear in announce"
+        );
+    }
+
+    #[test]
+    fn test_explicit_app_data_overrides_default() {
+        // When announce() is called with explicit app_data, the default callback
+        // should NOT be invoked — explicit data takes precedence.
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "override").unwrap();
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        destination.set_default_app_data(Arc::new(|| b"should_not_appear".to_vec()));
+
+        let explicit = b"explicit_data";
+        let announce = destination
+            .announce(OsRng, Some(explicit))
+            .expect("valid announce");
+
+        let validation = DestinationAnnounce::validate_full(&announce)
+            .expect("announce should validate");
+        assert_eq!(
+            validation.app_data,
+            explicit.as_slice(),
+            "explicit app_data should take precedence over default callback"
+        );
+    }
+
+    #[test]
+    fn test_clear_default_app_data() {
+        // After clearing, announce() with app_data=None should produce no app_data.
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "cleartest").unwrap();
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        destination.set_default_app_data(Arc::new(|| b"temporary".to_vec()));
+        destination.clear_default_app_data();
+
+        let announce = destination.announce(OsRng, None).expect("valid announce");
+
+        let validation = DestinationAnnounce::validate_full(&announce)
+            .expect("announce should validate");
+        assert!(
+            validation.app_data.is_empty(),
+            "after clear, announce should have no app_data"
+        );
     }
 }

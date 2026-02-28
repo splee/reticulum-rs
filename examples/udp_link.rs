@@ -79,7 +79,7 @@ async fn main() {
                 LinkEvent::ResourceInitiatorCancel(_) |
                 LinkEvent::ResourceReceiverCancel(_) |
                 LinkEvent::Channel(_) |
-                LinkEvent::Request(_) |
+                LinkEvent::Request(..) |
                 LinkEvent::Response(_) |
                 LinkEvent::Identified(_) => {}
             }
