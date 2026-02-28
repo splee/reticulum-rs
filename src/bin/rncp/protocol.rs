@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reticulum::cli::format::format_hash;
-use reticulum::destination::link::{Link, LinkEvent, LinkEventData, LinkStatus};
+use reticulum::destination::link::{LinkEvent, LinkEventData, LinkStatus};
 use reticulum::destination::DestinationDesc;
 use reticulum::hash::AddressHash;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
+use reticulum::transport::link_handle::LinkHandle;
 use reticulum::transport::Transport;
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
@@ -144,7 +145,7 @@ pub async fn wait_for_announce(
 /// # Returns
 /// Ok(()) on success, or an error
 pub async fn wait_for_link_activation(
-    link: &Arc<tokio::sync::Mutex<Link>>,
+    link: &LinkHandle,
     link_id: &reticulum::destination::link::LinkId,
     link_events: &mut BroadcastReceiver<LinkEventData>,
     timeout: Duration,
@@ -155,7 +156,7 @@ pub async fn wait_for_link_activation(
     let deadline = tokio::time::Instant::now() + timeout;
 
     if !silent {
-        let dest_hash = link.lock().await.destination().address_hash;
+        let dest_hash = link.destination().address_hash;
         println!(
             "Establishing link with {}",
             format_hash(dest_hash.as_slice())
@@ -180,7 +181,7 @@ pub async fn wait_for_link_activation(
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 // Also check link status directly
-                if link.lock().await.status() == LinkStatus::Active {
+                if link.status().await == LinkStatus::Active {
                     log::info!("Link {} activated", link_id_hex);
                     return Ok(());
                 }

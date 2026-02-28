@@ -121,7 +121,7 @@ pub async fn run_fetch_mode(
 
     // Wait for link activation
     if let Err(e) =
-        wait_for_link_activation(link.inner(), &link_id, &mut link_events, timeout, &running, silent).await
+        wait_for_link_activation(&link, &link_id, &mut link_events, timeout, &running, silent).await
     {
         match e {
             ProtocolError::LinkClosed => {

@@ -74,11 +74,8 @@ async fn handle_resource_request(ctx: &mut SendContext<'_>, payload: &[u8]) -> O
     // Send requested parts
     for (part_idx, part_data) in parts_to_send {
         let part_size = part_data.len();
-        let link_guard = ctx.link.inner().lock().await;
-        match link_guard.resource_data_packet(&part_data) {
-            Ok(packet) => {
-                drop(link_guard);
-                ctx.transport.send_packet(packet).await;
+        match ctx.link.send_resource_data(&part_data).await {
+            Ok(()) => {
                 *ctx.parts_sent += 1;
 
                 ctx.progress.update(part_size);
@@ -92,7 +89,7 @@ async fn handle_resource_request(ctx: &mut SendContext<'_>, payload: &[u8]) -> O
                 );
             }
             Err(e) => {
-                log::error!("Failed to create resource data packet: {:?}", e);
+                log::error!("Failed to send resource data packet: {:?}", e);
             }
         }
     }
@@ -217,7 +214,7 @@ pub async fn run_send_mode(
 
     // Wait for link activation
     if let Err(e) =
-        wait_for_link_activation(link.inner(), &link_id, &mut link_events, timeout, &running, false).await
+        wait_for_link_activation(&link, &link_id, &mut link_events, timeout, &running, false).await
     {
         match e {
             ProtocolError::LinkClosed => {
@@ -266,20 +263,11 @@ pub async fn run_send_mode(
 
     // Create and send advertisement
     let advertisement = resource.create_advertisement();
-    {
-        let link_guard = link.inner().lock().await;
-        match link_guard.resource_advertisement_packet(&advertisement, 0) {
-            Ok(packet) => {
-                drop(link_guard);
-                transport.send_packet(packet).await;
-                log::info!("Sent resource advertisement");
-            }
-            Err(e) => {
-                eprintln!("Failed to send advertisement: {:?}", e);
-                return 1;
-            }
-        }
+    if let Err(e) = link.send_resource_advertisement(&advertisement, 0).await {
+        eprintln!("Failed to send advertisement: {:?}", e);
+        return 1;
     }
+    log::info!("Sent resource advertisement");
 
     // Store resource for handling requests
     let resource = Arc::new(tokio::sync::Mutex::new(resource));

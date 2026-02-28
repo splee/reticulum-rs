@@ -657,11 +657,8 @@ async fn handle_fetch_request(
     // Send resource advertisement
     let advertisement = resource.create_advertisement();
     if let Some(link_handle) = transport.find_in_link(link_id).await {
-        let link_guard = link_handle.inner().lock().await;
-        match link_guard.resource_advertisement_packet(&advertisement, 0) {
-            Ok(packet) => {
-                drop(link_guard);
-                transport.send_packet(packet).await;
+        match link_handle.send_resource_advertisement(&advertisement, 0).await {
+            Ok(()) => {
                 log::info!("Sent resource advertisement for fetch response");
 
                 // Store resource for handling requests
@@ -750,11 +747,8 @@ async fn handle_outgoing_resource_request(
     // Send the parts
     if let Some(link_handle) = transport.find_in_link(link_id).await {
         for (idx, part_data) in parts_to_send {
-            let link_guard = link_handle.inner().lock().await;
-            match link_guard.resource_data_packet(&part_data) {
-                Ok(packet) => {
-                    drop(link_guard);
-                    transport.send_packet(packet).await;
+            match link_handle.send_resource_data(&part_data).await {
+                Ok(()) => {
                     log::debug!("Sent part {} for fetch response", idx);
                 }
                 Err(e) => {

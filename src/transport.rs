@@ -1103,10 +1103,7 @@ impl Transport {
     /// This is used for decrypting resource data that was encrypted at the resource level.
     pub async fn decrypt_with_in_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
         if let Some(link_handle) = self.find_in_link(link_id).await {
-            let link = link_handle.inner().lock().await;
-            let mut buffer = vec![0u8; data.len() + 64]; // Add padding for decryption overhead
-            let decrypted = link.decrypt(data, &mut buffer)?;
-            Ok(decrypted.to_vec())
+            link_handle.decrypt(data).await
         } else {
             Err(RnsError::InvalidArgument)
         }
@@ -1117,10 +1114,7 @@ impl Transport {
     /// (e.g., a propagation node sending a response resource).
     pub async fn decrypt_with_out_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
         if let Some(link_handle) = self.find_out_link(link_id).await {
-            let link = link_handle.inner().lock().await;
-            let mut buffer = vec![0u8; data.len() + 64];
-            let decrypted = link.decrypt(data, &mut buffer)?;
-            Ok(decrypted.to_vec())
+            link_handle.decrypt(data).await
         } else {
             Err(RnsError::InvalidArgument)
         }

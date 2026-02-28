@@ -346,20 +346,15 @@ fn main() {
             );
 
             // Send advertisement packet
-            {
-                let link_guard = link.inner().lock().await;
-                match link_guard.resource_advertisement_packet(&advertisement, 0) {
-                    Ok(packet) => {
-                        drop(link_guard);
-                        transport.send_packet(packet).await;
-                        println!("RESOURCE_ADVERTISED={}", resource_hash_hex);
-                        log::info!("Resource advertised");
-                    }
-                    Err(e) => {
-                        log::error!("Failed to create advertisement packet: {:?}", e);
-                        println!("STATUS=ERROR:advertisement_send_failed");
-                        return 1;
-                    }
+            match link.send_resource_advertisement(&advertisement, 0).await {
+                Ok(()) => {
+                    println!("RESOURCE_ADVERTISED={}", resource_hash_hex);
+                    log::info!("Resource advertised");
+                }
+                Err(e) => {
+                    log::error!("Failed to send advertisement packet: {:?}", e);
+                    println!("STATUS=ERROR:advertisement_send_failed");
+                    return 1;
                 }
             }
 
@@ -422,16 +417,13 @@ fn main() {
                                                     part_data.len()
                                                 );
 
-                                                // Create encrypted packet using link
-                                                let link_guard = link.inner().lock().await;
-                                                match link_guard.resource_data_packet(&part_data) {
-                                                    Ok(packet) => {
-                                                        drop(link_guard);
-                                                        transport.send_packet(packet).await;
+                                                // Send resource data packet via link handle
+                                                match link.send_resource_data(&part_data).await {
+                                                    Ok(()) => {
                                                         parts_sent += 1;
                                                     }
                                                     Err(e) => {
-                                                        log::error!("Failed to create resource data packet: {:?}", e);
+                                                        log::error!("Failed to send resource data packet: {:?}", e);
                                                     }
                                                 }
                                             }

@@ -7,14 +7,16 @@
 //! `TransportHandler` mutex to transmit it, keeping the locking dance internal.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
-use crate::destination::link::{Link, LinkId, LinkStatus};
+use crate::destination::link::{Link, LinkId, LinkStatus, ResourceId};
+use crate::destination::request_receipt::SharedRequestReceipt;
 use crate::destination::DestinationDesc;
 use crate::error::RnsError;
 use crate::identity::{Identity, PrivateIdentity};
+use crate::resource::{Resource, ResourceAdvertisement};
 
 use super::TransportHandler;
 
@@ -155,15 +157,120 @@ impl LinkHandle {
     }
 
     // ========================================================================
-    // Escape hatch for advanced callers
+    // Resource packet send (lock inner → build packet → lock handler → send)
     // ========================================================================
 
-    /// Raw access to the inner `Link` mutex.
+    /// Send a resource advertisement packet over the link.
+    pub async fn send_resource_advertisement(
+        &self,
+        advertisement: &ResourceAdvertisement,
+        segment: usize,
+    ) -> Result<(), RnsError> {
+        let packet = self
+            .inner
+            .lock()
+            .await
+            .resource_advertisement_packet(advertisement, segment)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
+    /// Send a resource data packet over the link.
     ///
-    /// Use this for resource operations, physical layer stats, or other methods
-    /// not exposed on `LinkHandle`.
-    pub fn inner(&self) -> &Arc<Mutex<Link>> {
-        &self.inner
+    /// Resource data packets are NOT encrypted at the link level — the resource
+    /// handles its own encryption internally.
+    pub async fn send_resource_data(&self, data: &[u8]) -> Result<(), RnsError> {
+        let packet = self.inner.lock().await.resource_data_packet(data)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Resource tracking (lock inner only, no send)
+    // ========================================================================
+
+    /// Register an outgoing resource for tracking and transfer.
+    /// Returns the resource ID if registered successfully.
+    pub async fn register_outgoing_resource(
+        &self,
+        resource: Arc<RwLock<Resource>>,
+    ) -> Result<ResourceId, RnsError> {
+        self.inner.lock().await.register_outgoing_resource(resource)
+    }
+
+    /// Get a clone of an outgoing resource's Arc by resource ID.
+    ///
+    /// Returns `None` if no resource with that ID is tracked.
+    /// Note: returns a cloned `Arc`, not a reference, since we can't return
+    /// a borrow through a `MutexGuard`.
+    pub async fn get_outgoing_resource(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<Arc<RwLock<Resource>>> {
+        self.inner
+            .lock()
+            .await
+            .get_outgoing_resource(resource_id)
+            .map(|tracked| tracked.resource.clone())
+    }
+
+    /// Notify the link that a resource transfer has concluded.
+    /// Updates optimisation hints (window size, expected in-flight rate).
+    pub async fn resource_concluded(&self, resource_id: &ResourceId, success: bool) {
+        self.inner
+            .lock()
+            .await
+            .resource_concluded(resource_id, success);
+    }
+
+    // ========================================================================
+    // Decrypt (lock inner only, no send)
+    // ========================================================================
+
+    /// Decrypt data using the link's derived key.
+    ///
+    /// Allocates a buffer internally and returns the decrypted bytes.
+    pub async fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, RnsError> {
+        let mut buffer = vec![0u8; data.len() + 64];
+        let decrypted = self.inner.lock().await.decrypt(data, &mut buffer)?;
+        Ok(decrypted.to_vec())
+    }
+
+    // ========================================================================
+    // Simple getters (lock inner only)
+    // ========================================================================
+
+    /// Last time data was sent or received on this link.
+    pub async fn last_data(&self) -> Option<Instant> {
+        self.inner.lock().await.last_data()
+    }
+
+    /// When the link became active (completed handshake).
+    pub async fn activated_at(&self) -> Option<Instant> {
+        self.inner.lock().await.activated_at()
+    }
+
+    // ========================================================================
+    // High-level request/response (lock inner → build + register → send)
+    // ========================================================================
+
+    /// Send a structured request to a named path over the link.
+    ///
+    /// This is the high-level counterpart to `send_request()` (which sends
+    /// raw pre-packed bytes). It matches Python's `Link.request(path, data, timeout)`:
+    /// hashes the path, packs `[timestamp, path_hash, data]` as msgpack,
+    /// checks MDU, and registers a request receipt.
+    ///
+    /// Returns a `SharedRequestReceipt` for tracking the response.
+    pub async fn request(
+        &self,
+        path: &str,
+        data: Option<&[u8]>,
+        timeout: Option<Duration>,
+    ) -> Result<SharedRequestReceipt, RnsError> {
+        let (receipt, packet) = self.inner.lock().await.send_request(path, data, timeout)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(receipt)
     }
 }
 
