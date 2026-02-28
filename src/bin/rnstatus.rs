@@ -694,7 +694,7 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
             return 12;
         }
 
-        let status = link.lock().await.status();
+        let status = link.status().await;
         if status == LinkStatus::Active {
             if !args.json {
                 println!("OK");
@@ -722,23 +722,15 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
             io::stdout().flush().ok();
         }
 
-        let identify_packet = {
-            let link_guard = link.lock().await;
-            match link_guard.identify(mgmt_id) {
-                Ok(pkt) => pkt,
-                Err(e) => {
-                    if args.json {
-                        output_json_error("identify_error", &format!("{:?}", e));
-                    } else {
-                        println!("error");
-                        eprintln!("Could not create identify packet: {:?}", e);
-                    }
-                    return 13;
-                }
+        if let Err(e) = link.identify(mgmt_id).await {
+            if args.json {
+                output_json_error("identify_error", &format!("{:?}", e));
+            } else {
+                println!("error");
+                eprintln!("Could not create identify packet: {:?}", e);
             }
-        };
-
-        transport.send_packet(identify_packet).await;
+            return 13;
+        }
 
         // Give server time to process identity
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -755,23 +747,15 @@ async fn show_remote_status_async(args: &Args, config: &ReticulumConfig, transpo
     }
 
     let request_data = build_status_request(args.link_stats);
-    let request_packet = {
-        let link_guard = link.lock().await;
-        match link_guard.request_packet(&request_data) {
-            Ok(pkt) => pkt,
-            Err(e) => {
-                if args.json {
-                    output_json_error("request_error", &format!("{:?}", e));
-                } else {
-                    println!("error");
-                    eprintln!("Could not create request packet: {:?}", e);
-                }
-                return 14;
-            }
+    if let Err(e) = link.send_request(&request_data).await {
+        if args.json {
+            output_json_error("request_error", &format!("{:?}", e));
+        } else {
+            println!("error");
+            eprintln!("Could not create request packet: {:?}", e);
         }
-    };
-
-    transport.send_packet(request_packet).await;
+        return 14;
+    }
 
     // Wait for response
     let response_deadline = tokio::time::Instant::now() + timeout_duration;

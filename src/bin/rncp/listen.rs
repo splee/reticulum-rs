@@ -554,11 +554,8 @@ async fn finalize_received_resource(
 
 /// Send a response to a request (for error codes).
 async fn send_fetch_response(transport: &Transport, link_id: &LinkId, response: u8) {
-    if let Some(link_mutex) = transport.find_in_link(link_id).await {
-        let link = link_mutex.lock().await;
-        // Response format: single byte error code
-        if let Ok(packet) = link.response_packet(&[response]) {
-            transport.send_packet(packet).await;
+    if let Some(link_handle) = transport.find_in_link(link_id).await {
+        if let Ok(()) = link_handle.send_response(&[response]).await {
             log::debug!("Sent fetch response: {:#x}", response);
         }
     }
@@ -659,8 +656,8 @@ async fn handle_fetch_request(
 
     // Send resource advertisement
     let advertisement = resource.create_advertisement();
-    if let Some(link_mutex) = transport.find_in_link(link_id).await {
-        let link_guard = link_mutex.lock().await;
+    if let Some(link_handle) = transport.find_in_link(link_id).await {
+        let link_guard = link_handle.inner().lock().await;
         match link_guard.resource_advertisement_packet(&advertisement, 0) {
             Ok(packet) => {
                 drop(link_guard);
@@ -688,23 +685,15 @@ async fn handle_fetch_request(
 
 /// Send msgpack false (0xc2) as a response.
 async fn send_msgpack_false(transport: &Transport, link_id: &LinkId) {
-    if let Some(link_mutex) = transport.find_in_link(link_id).await {
-        let link = link_mutex.lock().await;
-        // 0xc2 is msgpack false
-        if let Ok(packet) = link.response_packet(&[0xc2]) {
-            transport.send_packet(packet).await;
-        }
+    if let Some(link_handle) = transport.find_in_link(link_id).await {
+        let _ = link_handle.send_response(&[0xc2]).await;
     }
 }
 
 /// Send msgpack true (0xc3) as a response.
 async fn send_msgpack_true(transport: &Transport, link_id: &LinkId) {
-    if let Some(link_mutex) = transport.find_in_link(link_id).await {
-        let link = link_mutex.lock().await;
-        // 0xc3 is msgpack true
-        if let Ok(packet) = link.response_packet(&[0xc3]) {
-            transport.send_packet(packet).await;
-        }
+    if let Some(link_handle) = transport.find_in_link(link_id).await {
+        let _ = link_handle.send_response(&[0xc3]).await;
     }
 }
 
@@ -759,9 +748,9 @@ async fn handle_outgoing_resource_request(
     }
 
     // Send the parts
-    if let Some(link_mutex) = transport.find_in_link(link_id).await {
+    if let Some(link_handle) = transport.find_in_link(link_id).await {
         for (idx, part_data) in parts_to_send {
-            let link_guard = link_mutex.lock().await;
+            let link_guard = link_handle.inner().lock().await;
             match link_guard.resource_data_packet(&part_data) {
                 Ok(packet) => {
                     drop(link_guard);

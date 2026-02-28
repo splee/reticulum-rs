@@ -117,11 +117,11 @@ pub async fn run_fetch_mode(
     // Create link
     let mut link_events = transport.out_link_events();
     let link = transport.link(dest_desc).await;
-    let link_id = *link.lock().await.id();
+    let link_id = *link.id();
 
     // Wait for link activation
     if let Err(e) =
-        wait_for_link_activation(&link, &link_id, &mut link_events, timeout, &running, silent).await
+        wait_for_link_activation(link.inner(), &link_id, &mut link_events, timeout, &running, silent).await
     {
         match e {
             ProtocolError::LinkClosed => {
@@ -143,20 +143,11 @@ pub async fn run_fetch_mode(
     }
 
     let request_data = create_request_data("fetch_file", file_path_str.as_bytes());
-    {
-        let link_guard = link.lock().await;
-        match link_guard.request_packet(&request_data) {
-            Ok(packet) => {
-                drop(link_guard);
-                transport.send_packet(packet).await;
-                log::info!("Sent fetch request");
-            }
-            Err(e) => {
-                eprintln!("Failed to send fetch request: {:?}", e);
-                return 1;
-            }
-        }
+    if let Err(e) = link.send_request(&request_data).await {
+        eprintln!("Failed to send fetch request: {:?}", e);
+        return 1;
     }
+    log::info!("Sent fetch request");
 
     // Wait for response and handle resource transfer
     let mut ctx = FetchContext {

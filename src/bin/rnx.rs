@@ -26,7 +26,6 @@ use reticulum::iface::tcp_server::TcpServer;
 use reticulum::logging;
 use reticulum::transport::{Transport, TransportConfig};
 use rmpv::Value;
-use tokio::sync::Mutex;
 
 const APP_NAME: &str = "rnx";
 const ASPECT: &str = "execute";
@@ -579,10 +578,8 @@ async fn handle_server_event(
                     log::debug!("Sending response: {} bytes", response_data.len());
 
                     // Get the link and send response using find_in_link
-                    if let Some(link_mutex) = transport.find_in_link(&event.id).await {
-                        let link = link_mutex.lock().await;
-                        if let Ok(packet) = link.response_packet(&response_data) {
-                            transport.send_packet(packet).await;
+                    if let Some(link_handle) = transport.find_in_link(&event.id).await {
+                        if let Ok(()) = link_handle.send_response(&response_data).await {
                             log::info!("Response sent for command [{}]", command);
                         }
                     } else {
@@ -825,7 +822,7 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
             return 1;
         }
 
-        let status = link.lock().await.status();
+        let status = link.status().await;
         if status == LinkStatus::Active {
             println!("OK");
             break;
@@ -852,16 +849,11 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
     );
 
     // Send request
-    {
-        let link_guard = link.lock().await;
-        if let Ok(packet) = link_guard.request_packet(&request_data) {
-            transport.send_packet(packet).await;
-            log::debug!("Request sent: {} bytes", request_data.len());
-        } else {
-            eprintln!("Could not send request");
-            return 244;
-        }
+    if let Err(e) = link.send_request(&request_data).await {
+        eprintln!("Could not send request: {:?}", e);
+        return 244;
     }
+    log::debug!("Request sent: {} bytes", request_data.len());
 
     print!("Command delivered, awaiting result ");
     std::io::stdout().flush().unwrap();
@@ -1072,7 +1064,7 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
             return 243;
         }
 
-        let status = link.lock().await.status();
+        let status = link.status().await;
         if status == LinkStatus::Active {
             println!("Link established");
             break;
@@ -1086,8 +1078,6 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
     // Interactive REPL
     let mut last_exit_code: Option<i32> = None;
-    let link = Arc::new(Mutex::new(link));
-    let transport = Arc::new(transport);
 
     loop {
         if !running.load(Ordering::SeqCst) {
@@ -1127,15 +1117,9 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
         let request_data = build_request_data(command, Some(args.timeout), args.stdout, args.stderr, None);
 
         // Send request
-        {
-            let link_guard = link.lock().await;
-            let inner_link = link_guard.lock().await;
-            if let Ok(packet) = inner_link.request_packet(&request_data) {
-                transport.send_packet(packet).await;
-            } else {
-                eprintln!("Could not send request");
-                continue;
-            }
+        if link.send_request(&request_data).await.is_err() {
+            eprintln!("Could not send request");
+            continue;
         }
 
         // Wait for response

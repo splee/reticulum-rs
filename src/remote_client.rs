@@ -13,17 +13,15 @@
 use std::fs;
 use std::io::Read as IoRead;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::OsRng;
 use sha2::{Sha256, Digest as Sha2Digest};
-use tokio::sync::Mutex;
 
 use crate::config::ReticulumConfig;
 use crate::error::RnsError;
 use crate::destination::{DestinationName, SingleOutputDestination};
-use crate::destination::link::{Link, LinkEvent, LinkStatus};
+use crate::destination::link::{LinkEvent, LinkStatus};
 use crate::destination::request::RequestRouter;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
@@ -350,7 +348,7 @@ impl RemoteClient {
         &self,
         aspect: &str,
         transport_identity_hash: &[u8; 16],
-    ) -> Result<Arc<Mutex<Link>>, RemoteError> {
+    ) -> Result<crate::transport::LinkHandle, RemoteError> {
         let dest_hash = compute_destination_hash(aspect, transport_identity_hash)
             .map_err(|e| RemoteError::Other(e.to_string()))?;
 
@@ -392,7 +390,7 @@ impl RemoteClient {
                 return Err(RemoteError::LinkTimeout);
             }
 
-            let status = link.lock().await.status();
+            let status = link.status().await;
             if status == LinkStatus::Active {
                 break;
             }
@@ -407,13 +405,8 @@ impl RemoteClient {
 
         // Identify with management identity if we have one
         if let Some(ref mgmt_id) = self.config.identity {
-            let identify_packet = {
-                let link_guard = link.lock().await;
-                link_guard.identify(mgmt_id)
-                    .map_err(|e| RemoteError::IdentifyError(format!("{:?}", e)))?
-            };
-
-            self.transport.send_packet(identify_packet).await;
+            link.identify(mgmt_id).await
+                .map_err(|e| RemoteError::IdentifyError(format!("{:?}", e)))?;
 
             // Give server time to process identity
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -425,19 +418,14 @@ impl RemoteClient {
     /// Send a request on an established link and wait for response.
     pub async fn request(
         &self,
-        link: &Arc<Mutex<Link>>,
+        link: &crate::transport::LinkHandle,
         path: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, RemoteError> {
         let request_data = build_request(path, data);
 
-        let request_packet = {
-            let link_guard = link.lock().await;
-            link_guard.request_packet(&request_data)
-                .map_err(|e| RemoteError::Other(format!("Failed to create request packet: {:?}", e)))?
-        };
-
-        self.transport.send_packet(request_packet).await;
+        link.send_request(&request_data).await
+            .map_err(|e| RemoteError::Other(format!("Failed to send request packet: {:?}", e)))?;
 
         // Wait for response
         let mut out_link_events = self.transport.out_link_events();

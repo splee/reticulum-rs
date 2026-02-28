@@ -239,7 +239,7 @@ fn main() {
 
         // Create link
         let link = transport.link(dest_desc).await;
-        let link_id = *link.lock().await.id();
+        let link_id = *link.id();
         let link_id_hex = hex::encode(link_id.as_slice());
 
         log::info!("Link request sent, waiting for activation...");
@@ -270,7 +270,7 @@ fn main() {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     // Check link status directly
-                    if link.lock().await.status() == LinkStatus::Active {
+                    if link.status().await == LinkStatus::Active {
                         link_activated = true;
                         println!("LINK_ACTIVATED={}", link_id_hex);
                         log::info!("Link {} activated (from status check)", link_id_hex);
@@ -347,7 +347,7 @@ fn main() {
 
             // Send advertisement packet
             {
-                let link_guard = link.lock().await;
+                let link_guard = link.inner().lock().await;
                 match link_guard.resource_advertisement_packet(&advertisement, 0) {
                     Ok(packet) => {
                         drop(link_guard);
@@ -423,7 +423,7 @@ fn main() {
                                                 );
 
                                                 // Create encrypted packet using link
-                                                let link_guard = link.lock().await;
+                                                let link_guard = link.inner().lock().await;
                                                 match link_guard.resource_data_packet(&part_data) {
                                                     Ok(packet) => {
                                                         drop(link_guard);

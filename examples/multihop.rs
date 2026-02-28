@@ -178,13 +178,9 @@ async fn main() {
                     }
 
                     if let Some(ref link) = link {
-                        let link = link.lock().await;
-
-                        if link.status() == LinkStatus::Active {
+                        if link.status().await == LinkStatus::Active {
                             log::info!("Sending message over link: {}", &message);
-
-                            let packet = link.data_packet(message.as_bytes()).unwrap();
-                            transport.send_packet(packet).await;
+                            link.send_data(message.as_bytes()).await.unwrap();
                             continue;
                         }
                     }

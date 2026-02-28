@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::destination::link::{Link, LinkEvent, LinkStatus};
+use reticulum::destination::link::{LinkEvent, LinkStatus};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
@@ -41,7 +41,7 @@ async fn main() {
     let mut announce_recv = transport.recv_announces().await;
     let mut out_link_events = transport.out_link_events();
 
-    let mut links = HashMap::<AddressHash, Arc<tokio::sync::Mutex<Link>>>::new();
+    let mut links = HashMap::<AddressHash, reticulum::transport::LinkHandle>::new();
 
     loop {
         while let Ok(announce) = announce_recv.try_recv() {
@@ -55,11 +55,9 @@ async fn main() {
                     link
                 }
             };
-            let link = link.lock().await;
-            log::info!("link {}: {:?}", link.id(), link.status());
-            if link.status() == LinkStatus::Active {
-                let packet = link.data_packet (b"foo").unwrap();
-                transport.send_packet(packet).await;
+            log::info!("link {}: {:?}", link.id(), link.status().await);
+            if link.status().await == LinkStatus::Active {
+                link.send_data(b"foo").await.unwrap();
             }
         }
         while let Ok(link_event) = out_link_events.try_recv() {

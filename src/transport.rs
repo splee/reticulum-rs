@@ -68,10 +68,13 @@ pub mod path_table;
 // Phase 5: Transport enhancements
 pub mod blackhole;
 pub mod blackhole_info;
+pub mod link_handle;
 pub mod path_request;
 pub mod remote_management;
 pub mod reverse_table;
 pub mod tunnel;
+
+pub use link_handle::LinkHandle;
 
 use announce_handler::{AnnounceCallback, AnnounceHandlerConfig, AnnounceHandlerHandle, AnnounceHandlerRegistry};
 use announce_manager::AnnounceManager;
@@ -1074,19 +1077,33 @@ impl Transport {
         false
     }
 
-    pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
-        self.handler.lock().await.link_manager.get_out_link(link_id)
+    pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<LinkHandle> {
+        let handler_guard = self.handler.lock().await;
+        let link_arc = handler_guard.link_manager.get_out_link(link_id)?;
+        let link_guard = link_arc.lock().await;
+        let id = *link_guard.id();
+        let destination = *link_guard.destination();
+        let initiator = link_guard.is_initiator();
+        drop(link_guard);
+        Some(LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator))
     }
 
-    pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
-        self.handler.lock().await.link_manager.get_in_link(link_id)
+    pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<LinkHandle> {
+        let handler_guard = self.handler.lock().await;
+        let link_arc = handler_guard.link_manager.get_in_link(link_id)?;
+        let link_guard = link_arc.lock().await;
+        let id = *link_guard.id();
+        let destination = *link_guard.destination();
+        let initiator = link_guard.is_initiator();
+        drop(link_guard);
+        Some(LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator))
     }
 
     /// Decrypt data using an incoming link's key.
     /// This is used for decrypting resource data that was encrypted at the resource level.
     pub async fn decrypt_with_in_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
-        if let Some(link) = self.find_in_link(link_id).await {
-            let link = link.lock().await;
+        if let Some(link_handle) = self.find_in_link(link_id).await {
+            let link = link_handle.inner().lock().await;
             let mut buffer = vec![0u8; data.len() + 64]; // Add padding for decryption overhead
             let decrypted = link.decrypt(data, &mut buffer)?;
             Ok(decrypted.to_vec())
@@ -1099,8 +1116,8 @@ impl Transport {
     /// This is used for decrypting resource data received from a remote server
     /// (e.g., a propagation node sending a response resource).
     pub async fn decrypt_with_out_link(&self, link_id: &AddressHash, data: &[u8]) -> Result<Vec<u8>, RnsError> {
-        if let Some(link) = self.find_out_link(link_id).await {
-            let link = link.lock().await;
+        if let Some(link_handle) = self.find_out_link(link_id).await {
+            let link = link_handle.inner().lock().await;
             let mut buffer = vec![0u8; data.len() + 64];
             let decrypted = link.decrypt(data, &mut buffer)?;
             Ok(decrypted.to_vec())
@@ -1109,17 +1126,22 @@ impl Transport {
         }
     }
 
-    pub async fn link(&self, destination: DestinationDesc) -> Arc<Mutex<Link>> {
-        let link = self
+    pub async fn link(&self, destination: DestinationDesc) -> LinkHandle {
+        let existing = self
             .handler
             .lock()
             .await
             .link_manager
             .get_out_link(&destination.address_hash);
 
-        if let Some(link) = link {
-            if link.lock().await.status() != LinkStatus::Closed {
-                return link;
+        if let Some(link_arc) = existing {
+            let link_guard = link_arc.lock().await;
+            if link_guard.status() != LinkStatus::Closed {
+                let id = *link_guard.id();
+                let dest = *link_guard.destination();
+                let initiator = link_guard.is_initiator();
+                drop(link_guard);
+                return LinkHandle::new(link_arc, self.handler.clone(), id, dest, initiator);
             } else {
                 log::warn!("tp({}): link was closed", self.name);
             }
@@ -1136,7 +1158,9 @@ impl Transport {
             destination
         );
 
-        let link = Arc::new(Mutex::new(link));
+        let id = *link.id();
+        let initiator = link.is_initiator();
+        let link_arc = Arc::new(Mutex::new(link));
 
         self.send_packet(packet).await;
 
@@ -1144,9 +1168,9 @@ impl Transport {
             .lock()
             .await
             .link_manager
-            .insert_out_link(destination.address_hash, link.clone());
+            .insert_out_link(destination.address_hash, link_arc.clone());
 
-        link
+        LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator)
     }
 
     pub fn out_link_events(&self) -> broadcast::Receiver<LinkEventData> {

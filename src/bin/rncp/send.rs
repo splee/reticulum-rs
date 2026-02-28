@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::cli::format::format_hash;
-use reticulum::destination::link::{Link, LinkEvent};
+use reticulum::destination::link::LinkEvent;
 use reticulum::hash::AddressHash;
 use reticulum::resource::{Resource, ResourceConfig};
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{LinkHandle, Transport, TransportConfig};
 
 use crate::config::{get_config_dir, get_identity_path, prepare_identity};
 use crate::metadata::encode_filename_metadata;
@@ -29,7 +29,7 @@ use crate::APP_NAME;
 /// Context for sending resource parts in response to requests.
 struct SendContext<'a> {
     transport: &'a Transport,
-    link: &'a Arc<tokio::sync::Mutex<Link>>,
+    link: &'a LinkHandle,
     link_id: &'a AddressHash,
     resource: &'a Arc<tokio::sync::Mutex<Resource>>,
     progress: &'a mut TransferProgress,
@@ -74,7 +74,7 @@ async fn handle_resource_request(ctx: &mut SendContext<'_>, payload: &[u8]) -> O
     // Send requested parts
     for (part_idx, part_data) in parts_to_send {
         let part_size = part_data.len();
-        let link_guard = ctx.link.lock().await;
+        let link_guard = ctx.link.inner().lock().await;
         match link_guard.resource_data_packet(&part_data) {
             Ok(packet) => {
                 drop(link_guard);
@@ -213,11 +213,11 @@ pub async fn run_send_mode(
     // Create link
     let mut link_events = transport.out_link_events();
     let link = transport.link(dest_desc).await;
-    let link_id = *link.lock().await.id();
+    let link_id = *link.id();
 
     // Wait for link activation
     if let Err(e) =
-        wait_for_link_activation(&link, &link_id, &mut link_events, timeout, &running, false).await
+        wait_for_link_activation(link.inner(), &link_id, &mut link_events, timeout, &running, false).await
     {
         match e {
             ProtocolError::LinkClosed => {
@@ -267,7 +267,7 @@ pub async fn run_send_mode(
     // Create and send advertisement
     let advertisement = resource.create_advertisement();
     {
-        let link_guard = link.lock().await;
+        let link_guard = link.inner().lock().await;
         match link_guard.resource_advertisement_packet(&advertisement, 0) {
             Ok(packet) => {
                 drop(link_guard);
