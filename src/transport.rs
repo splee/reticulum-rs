@@ -1275,6 +1275,29 @@ impl Transport {
         }
     }
 
+    /// Register a known identity for a destination hash.
+    ///
+    /// Stores the public key material in `known_destinations` so that
+    /// `recall_identity()` can look it up without a real announce having
+    /// been received. Useful for injecting identities in tests or when
+    /// the identity is already known through an out-of-band mechanism.
+    pub async fn register_known_identity(
+        &self,
+        destination_hash: &[u8; 16],
+        identity: &Identity,
+    ) {
+        let handler = self.handler.lock().await;
+        let mut public_key = Vec::with_capacity(64);
+        public_key.extend_from_slice(identity.public_key_bytes());
+        public_key.extend_from_slice(identity.verifying_key_bytes());
+        let _ = handler.known_destinations.remember(
+            destination_hash,
+            &[],          // no packet_hash
+            &public_key,
+            None,         // no app_data
+        );
+    }
+
     /// Recall cached announce app_data for a destination.
     ///
     /// Returns the app_data bytes if an announce from this destination has been
