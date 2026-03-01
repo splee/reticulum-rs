@@ -26,24 +26,22 @@ async fn main() {
 
     log::info!("start kaonic client");
 
-    let _ = transport.lock().await.iface_manager().lock().await.spawn(
+    let _ = transport.lock().await.spawn_interface(
         KaonicGrpc::new(
             format!("http://{}", &args[2]),
             RadioConfig::new_for_module(RadioModule::RadioA),
             None,
         ),
         KaonicGrpc::spawn,
-    );
+    ).await;
 
     log::info!("start tcp client");
 
     let _ = transport
         .lock()
         .await
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(TcpClient::new(&args[1]), TcpClient::spawn);
+        .spawn_interface(TcpClient::new(&args[1]), TcpClient::spawn)
+        .await;
 
     log::info!("start tcp client");
 

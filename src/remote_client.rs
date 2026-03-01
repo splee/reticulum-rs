@@ -238,14 +238,10 @@ pub async fn create_client_transport(config: &ReticulumConfig, name: &str) -> Tr
     // Daemon exists, connect as client via LocalClientInterface
     log::info!("Connecting to existing daemon via LocalClientInterface");
 
-    transport
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(
-            LocalClientInterface::new(local_addr.clone()),
-            LocalClientInterface::spawn,
-        );
+    transport.spawn_interface(
+        LocalClientInterface::new(local_addr.clone()),
+        LocalClientInterface::spawn,
+    ).await;
 
     // Give LocalClientInterface time to connect
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -269,14 +265,10 @@ async fn try_become_shared_instance(
             drop(_listener);
 
             // Start LocalServerInterface to serve other clients
-            transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(
-                    LocalServerInterface::new(local_addr, transport.iface_manager()),
-                    LocalServerInterface::spawn,
-                );
+            transport.spawn_interface(
+                LocalServerInterface::new(local_addr, transport.iface_manager()),
+                LocalServerInterface::spawn,
+            ).await;
 
             // Load network interfaces from config
             spawn_network_interfaces(transport, config).await;
@@ -306,11 +298,10 @@ async fn spawn_network_interfaces(transport: &Transport, config: &ReticulumConfi
                     let port = iface_config.target_port.unwrap_or(4242);
                     let addr = format!("{}:{}", target, port);
                     log::info!("Starting TCPClientInterface: {}", addr);
-                    transport
-                        .iface_manager()
-                        .lock()
-                        .await
-                        .spawn(TcpClient::new(&addr), TcpClient::spawn);
+                    transport.spawn_interface(
+                        TcpClient::new(&addr),
+                        TcpClient::spawn,
+                    ).await;
                 }
             }
             "TCPServerInterface" | "tcp_server" => {

@@ -526,14 +526,10 @@ impl Reticulum {
         // Start LocalServerInterface for IPC
         let local_addr = ipc.transport_addr();
 
-        {
-            let iface_manager_arc = transport_arc.iface_manager();
-            let mut iface_manager = iface_manager_arc.lock().await;
-            iface_manager.spawn(
-                LocalServerInterface::new(local_addr, transport_arc.iface_manager()),
-                LocalServerInterface::spawn,
-            );
-        }
+        transport_arc.spawn_interface(
+            LocalServerInterface::new(local_addr, transport_arc.iface_manager()),
+            LocalServerInterface::spawn,
+        ).await;
 
         // Start RPC server
         let rpc_addr = ipc.rpc_addr();
@@ -599,14 +595,10 @@ impl Reticulum {
         let transport_arc = Arc::new(transport);
 
         // Spawn LocalClientInterface to relay packets to/from daemon
-        {
-            let iface_manager_arc = transport_arc.iface_manager();
-            let mut iface_manager = iface_manager_arc.lock().await;
-            iface_manager.spawn(
-                LocalClientInterface::new(local_addr),
-                LocalClientInterface::spawn,
-            );
-        }
+        transport_arc.spawn_interface(
+            LocalClientInterface::new(local_addr),
+            LocalClientInterface::spawn,
+        ).await;
 
         transport_arc
     }
@@ -637,21 +629,20 @@ impl Reticulum {
                     let listen_port = iface_config.listen_port.unwrap_or(4242);
                     let addr = format!("{}:{}", listen_ip, listen_port);
 
-                    transport.iface_manager().lock().await.spawn(
+                    transport.spawn_interface(
                         TcpServer::new(&addr, transport.iface_manager()),
                         TcpServer::spawn,
-                    );
+                    ).await;
                 }
                 "TCPClientInterface" | "tcp_client" => {
                     if let (Some(host), Some(port)) =
                         (&iface_config.target_host, iface_config.target_port)
                     {
                         let addr = format!("{}:{}", host, port);
-                        transport
-                            .iface_manager()
-                            .lock()
-                            .await
-                            .spawn(TcpClient::new(&addr), TcpClient::spawn);
+                        transport.spawn_interface(
+                            TcpClient::new(&addr),
+                            TcpClient::spawn,
+                        ).await;
                     } else {
                         log::warn!(
                             "TCPClientInterface '{}' missing target_host or target_port",

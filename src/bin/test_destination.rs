@@ -128,13 +128,11 @@ fn main() {
             log::info!("Connecting to {}", local_addr.display());
 
             transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(
+                .spawn_interface(
                     LocalClientInterface::new(local_addr),
                     LocalClientInterface::spawn,
-                );
+                )
+                .await;
 
             // Give LocalClientInterface time to connect
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -143,22 +141,18 @@ fn main() {
             if let Some(server_addr) = &args.tcp_server {
                 log::info!("Starting TCP server on {}", server_addr);
                 transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(
+                    .spawn_interface(
                         TcpServer::new(server_addr, transport.iface_manager()),
                         TcpServer::spawn,
-                    );
+                    )
+                    .await;
             }
 
             if let Some(client_addr) = &args.tcp_client {
                 log::info!("Connecting TCP client to {}", client_addr);
                 transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+                    .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+                    .await;
             }
 
             // Give interfaces time to connect
@@ -170,7 +164,7 @@ fn main() {
             .expect("valid destination name");
         let destination = transport.add_destination(identity.clone(), dest_name).await;
 
-        let dest_hash = destination.lock().await.desc.address_hash;
+        let dest_hash = *destination.address_hash();
 
         // Output destination hash in a parseable format
         println!("DESTINATION_HASH={}", hex::encode(dest_hash.as_slice()));

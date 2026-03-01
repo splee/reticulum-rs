@@ -94,7 +94,7 @@ pub async fn run_listen_mode(
     };
     let destination = transport.add_destination(identity.clone(), dest_name).await;
 
-    let dest_hash = destination.lock().await.desc.address_hash;
+    let dest_hash = *destination.address_hash();
 
     // Handle print-identity mode
     if matches.get_flag("print-identity") {

@@ -1,7 +1,4 @@
-use rand_core::OsRng;
-
-use reticulum::destination::link::LinkEvent;
-use reticulum::destination::{DestinationAnnounce, DestinationName};
+use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::transport::{Transport, TransportConfig};
@@ -16,10 +13,8 @@ async fn main() {
 
     {
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn);
+            .spawn_interface(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn)
+            .await;
     }
 
     let identity = PrivateIdentity::new_from_name("link-example");
@@ -31,9 +26,7 @@ async fn main() {
         )
         .await;
 
-    transport
-        .send_packet(in_destination.lock().await.announce(OsRng, None).unwrap())
-        .await;
+    transport.send_announce(&in_destination, None).await;
 
     tokio::spawn(async move {
         let recv = transport.recv_announces();

@@ -11,11 +11,10 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::destination::{DestinationName, SingleInputDestination};
+use reticulum::destination::DestinationName;
 use reticulum::destination::link::{LinkEvent, LinkStatus};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
@@ -29,14 +28,13 @@ async fn main() {
     log::info!(">>> UDP LINK APP <<<");
 
     let id = PrivateIdentity::new_from_rand(OsRng);
-    let destination = SingleInputDestination::new(id.clone(), DestinationName::new("example", "app").unwrap());
     let transport = Transport::new(TransportConfig::new("server", &id, true));
 
-    let _ = transport.iface_manager().lock().await.spawn(
+    let _ = transport.spawn_interface(
         UdpInterface::new("0.0.0.0:4243", Some("127.0.0.1:4242")),
-        UdpInterface::spawn);
+        UdpInterface::spawn).await;
 
-    let dest = Arc::new(tokio::sync::Mutex::new (destination));
+    let dest = transport.add_destination(id, DestinationName::new("example", "app").unwrap()).await;
 
     let mut announce_recv = transport.recv_announces().await;
     let mut out_link_events = transport.out_link_events();

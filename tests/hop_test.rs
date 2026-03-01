@@ -16,17 +16,15 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
         true,
     ));
 
-    transport.iface_manager().lock().await.spawn(
+    transport.spawn_interface(
         TcpServer::new(server_addr, transport.iface_manager()),
         TcpServer::spawn,
-    );
+    ).await;
 
     for &addr in client_addr {
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new(addr), TcpClient::spawn);
+            .spawn_interface(TcpClient::new(addr), TcpClient::spawn)
+            .await;
     }
 
     log::info!("test: transport {} created", name);

@@ -444,7 +444,7 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
         // Create a minimal transport just to get the destination hash
         let transport = Transport::new(TransportConfig::new(APP_NAME, &identity, false));
         let destination = transport.add_destination(identity.clone(), dest_name).await;
-        let dest_hash = destination.lock().await.desc.address_hash;
+        let dest_hash = *destination.address_hash();
         println!("Listening on : {}", hex::encode(dest_hash.as_slice()));
         return 0;
     }
@@ -463,19 +463,17 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
         log::info!("Starting TCP server on {}", server_addr);
-        transport.iface_manager().lock().await.spawn(
+        transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
-        );
+        ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         log::info!("Connecting TCP client to {}", client_addr);
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .await;
     }
 
     // Give interfaces time to connect
@@ -491,7 +489,7 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
     };
     let destination = transport.add_destination(identity.clone(), dest_name).await;
 
-    let dest_hash = destination.lock().await.desc.address_hash;
+    let dest_hash = *destination.address_hash();
     log::info!(
         "rnx listening for commands on {}",
         hex::encode(dest_hash.as_slice())
@@ -748,18 +746,16 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
-        transport.iface_manager().lock().await.spawn(
+        transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
-        );
+        ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .await;
     }
 
     // Give interfaces time to connect
@@ -1009,18 +1005,16 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
-        transport.iface_manager().lock().await.spawn(
+        transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
-        );
+        ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .await;
     }
 
     tokio::time::sleep(Duration::from_secs(1)).await;

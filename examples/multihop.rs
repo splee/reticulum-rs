@@ -58,17 +58,17 @@ async fn main() {
 
     let our_address = format!("0.0.0.0:{}", our_hop + 5101);
 
-    let _ = transport.iface_manager().lock().await.spawn(
+    let _ = transport.spawn_interface(
         TcpServer::new(our_address, transport.iface_manager()),
         TcpServer::spawn,
-    );
+    ).await;
 
     if our_hop > 0 {
         let connect_to = format!("127.0.0.1:{}", our_hop + 5100);
-        let client_addr = transport.iface_manager().lock().await.spawn(
+        let client_addr = transport.spawn_interface(
             TcpClient::new(connect_to),
             TcpClient::spawn,
-        );
+        ).await;
 
         let destination;
         if our_hop == last_hop {
@@ -82,12 +82,11 @@ async fn main() {
             destination = transport.add_destination(id, name).await;
         }
 
-        log::info!("Created destination {}", destination.lock().await.desc);
+        log::info!("Created destination {}", destination.desc());
 
         let mut announce = destination
-            .lock()
+            .announce(None)
             .await
-            .announce(OsRng, None)
             .unwrap();
 
         announce.transport = Some(transport_id);

@@ -252,10 +252,10 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
             );
             log::info!("Starting LocalServerInterface on {}", local_addr.display());
 
-            transport.iface_manager().lock().await.spawn(
+            transport.spawn_interface(
                 LocalServerInterface::new(local_addr, transport.iface_manager()),
                 LocalServerInterface::spawn,
-            );
+            ).await;
 
             // Start RPC server for management queries
             // Uses Python-compatible HMAC authentication and pickle serialization
@@ -322,10 +322,10 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
 
                     log::info!("  TCP Server listening on {}", addr);
 
-                    transport.iface_manager().lock().await.spawn(
+                    transport.spawn_interface(
                         TcpServer::new(&addr, transport.iface_manager()),
                         TcpServer::spawn,
-                    );
+                    ).await;
                 }
                 "TCPClientInterface" | "tcp_client" => {
                     if let (Some(host), Some(port)) =
@@ -335,10 +335,10 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
 
                         log::info!("  TCP Client connecting to {}", addr);
 
-                        transport.iface_manager().lock().await.spawn(
+                        transport.spawn_interface(
                             TcpClient::new(&addr),
                             TcpClient::spawn,
-                        );
+                        ).await;
                     } else {
                         log::warn!("  TCP Client '{}' missing target_host or target_port",
                             iface_config.name);
@@ -408,20 +408,20 @@ fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBo
                         let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
                         let listen_port = iface_config.listen_port.unwrap_or(4242);
                         let addr = format!("{}:{}", listen_ip, listen_port);
-                        transport.iface_manager().lock().await.spawn(
+                        transport.spawn_interface(
                             TcpServer::new(&addr, transport.iface_manager()),
                             TcpServer::spawn,
-                        );
+                        ).await;
                     }
                     "TCPClientInterface" | "tcp_client" => {
                         if let (Some(host), Some(port)) =
                             (&iface_config.target_host, iface_config.target_port)
                         {
                             let addr = format!("{}:{}", host, port);
-                            transport.iface_manager().lock().await.spawn(
+                            transport.spawn_interface(
                                 TcpClient::new(&addr),
                                 TcpClient::spawn,
-                            );
+                            ).await;
                         }
                     }
                     _ => {}

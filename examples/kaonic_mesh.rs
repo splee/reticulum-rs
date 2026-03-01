@@ -17,14 +17,14 @@ async fn main() {
 
     let transport = Arc::new(Mutex::new(Transport::new(config)));
 
-    let _ = transport.lock().await.iface_manager().lock().await.spawn(
+    let _ = transport.lock().await.spawn_interface(
         KaonicGrpc::new(
             "http://127.0.0.1:8080",
             RadioConfig::new_for_module(RadioModule::RadioA),
             None,
         ),
         KaonicGrpc::spawn,
-    );
+    ).await;
 
     let _ = tokio::signal::ctrl_c().await;
 }

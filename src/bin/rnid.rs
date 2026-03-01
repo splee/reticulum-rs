@@ -957,17 +957,17 @@ async fn create_transport(args: &Args, _config: &ReticulumConfig) -> Transport {
 
     // Set up interfaces from command line args
     if let Some(ref server_addr) = args.tcp_server {
-        transport.iface_manager().lock().await.spawn(
+        transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
-        );
+        ).await;
     }
 
     if let Some(ref client_addr) = args.tcp_client {
-        transport.iface_manager().lock().await.spawn(
+        transport.spawn_interface(
             TcpClient::new(client_addr),
             TcpClient::spawn,
-        );
+        ).await;
     }
 
     // TODO: Connect to shared instance if available via IPC

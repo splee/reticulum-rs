@@ -32,6 +32,8 @@ use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::{Identity, PrivateIdentity, get_ratchet_id, RATCHET_KEY_SIZE};
 
+use crate::iface::Interface;
+use crate::iface::InterfaceContext;
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceRegistry;
 use crate::iface::InterfaceRxReceiver;
@@ -68,6 +70,7 @@ pub mod path_table;
 // Phase 5: Transport enhancements
 pub mod blackhole;
 pub mod blackhole_info;
+pub mod destination;
 pub mod link;
 pub mod path_request;
 pub mod receipt;
@@ -76,6 +79,7 @@ pub mod resource;
 pub mod reverse_table;
 pub mod tunnel;
 
+pub use destination::RegisteredDestination;
 pub use link::Link;
 pub use receipt::PacketReceipt;
 pub use resource::Resource;
@@ -362,6 +366,36 @@ impl Transport {
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
         self.iface_manager.clone()
+    }
+
+    /// Spawn a network interface and register it with the interface manager.
+    ///
+    /// This is the preferred API for most callers. Use `iface_manager()` directly
+    /// only when you need the raw `Arc<Mutex<InterfaceManager>>` (e.g. TcpServer
+    /// and LocalServerInterface constructors that spawn child connections at
+    /// accept time).
+    pub async fn spawn_interface<T: Interface, F, R>(&self, inner: T, worker: F) -> AddressHash
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.iface_manager.lock().await.spawn(inner, worker)
+    }
+
+    /// Spawn a local IPC client interface.
+    ///
+    /// Local client interfaces always receive packets regardless of broadcast
+    /// settings.
+    pub async fn spawn_local_client_interface<T: Interface, F, R>(
+        &self,
+        inner: T,
+        worker: F,
+    ) -> AddressHash
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.iface_manager.lock().await.spawn_local_client(inner, worker)
     }
 
     /// Get the interface registry for stats tracking.
@@ -875,14 +909,14 @@ impl Transport {
 
     pub async fn send_announce(
         &self,
-        destination: &Arc<Mutex<SingleInputDestination>>,
+        destination: &RegisteredDestination,
         app_data: Option<&[u8]>,
     ) {
         self.handler
             .lock()
             .await
             .send_packet(
-                match destination.lock().await.announce(OsRng, app_data) {
+                match destination.inner_arc().lock().await.announce(OsRng, app_data) {
                     Ok(packet) => packet,
                     Err(e) => {
                         log::error!("send_announce: failed to create announce packet: {}", e);
@@ -1192,21 +1226,21 @@ impl Transport {
         &self,
         identity: PrivateIdentity,
         name: DestinationName,
-    ) -> Arc<Mutex<SingleInputDestination>> {
+    ) -> RegisteredDestination {
         let destination = SingleInputDestination::new(identity, name);
-        let address_hash = destination.desc.address_hash;
+        let desc = destination.desc;
 
-        log::debug!("tp({}): add destination {}", self.name, address_hash);
+        log::debug!("tp({}): add destination {}", self.name, desc.address_hash);
 
-        let destination = Arc::new(Mutex::new(destination));
+        let inner = Arc::new(Mutex::new(destination));
 
         self.handler
             .lock()
             .await
             .single_in_destinations
-            .insert(address_hash, destination.clone());
+            .insert(desc.address_hash, inner.clone());
 
-        destination
+        RegisteredDestination::new(inner, desc)
     }
 
     pub async fn has_destination(&self, address: &AddressHash) -> bool {
