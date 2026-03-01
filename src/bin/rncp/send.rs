@@ -15,8 +15,8 @@ use rand_core::OsRng;
 use reticulum::cli::format::format_hash;
 use reticulum::destination::link::LinkEvent;
 use reticulum::hash::AddressHash;
-use reticulum::resource::{Resource, ResourceConfig};
-use reticulum::transport::{LinkHandle, Transport, TransportConfig};
+use reticulum::resource::ResourceConfig;
+use reticulum::transport::{Link, Resource, Transport, TransportConfig};
 
 use crate::config::{get_config_dir, get_identity_path, prepare_identity};
 use crate::metadata::encode_filename_metadata;
@@ -29,9 +29,9 @@ use crate::APP_NAME;
 /// Context for sending resource parts in response to requests.
 struct SendContext<'a> {
     transport: &'a Transport,
-    link: &'a LinkHandle,
+    link: &'a Link,
     link_id: &'a AddressHash,
-    resource: &'a Arc<tokio::sync::Mutex<Resource>>,
+    resource: &'a Resource,
     progress: &'a mut TransferProgress,
     total_parts: usize,
     parts_sent: &'a mut usize,
@@ -45,15 +45,14 @@ async fn handle_resource_request(ctx: &mut SendContext<'_>, payload: &[u8]) -> O
 
     // Handle request and collect parts to send
     let (parts_to_send, hashmap_update) = {
-        let mut resource_guard = ctx.resource.lock().await;
-        match resource_guard.handle_request(payload) {
+        match ctx.resource.handle_request(payload) {
             Ok(result) => {
                 let parts: Vec<_> = result.parts_to_send
                     .iter()
                     .filter_map(|&idx| {
-                        resource_guard
+                        ctx.resource
                             .get_part_data(idx)
-                            .map(|d| (idx, d.to_vec()))
+                            .map(|d| (idx, d))
                     })
                     .collect();
                 (parts, result.hashmap_update)
@@ -269,13 +268,10 @@ pub async fn run_send_mode(
     }
     log::info!("Sent resource advertisement");
 
-    // Store resource for handling requests
-    let resource = Arc::new(tokio::sync::Mutex::new(resource));
-
     // Wait for resource requests and send parts
     let mut transfer_complete = false;
-    let total_parts = resource.lock().await.total_parts();
-    let total_size = resource.lock().await.total_size();
+    let total_parts = resource.total_parts();
+    let total_size = resource.total_size();
     let mut parts_sent = 0usize;
     let silent = matches.get_flag("silent");
 
@@ -312,8 +308,7 @@ pub async fn run_send_mode(
                         LinkEvent::ResourceProof(payload) => {
                             log::info!("Received resource proof");
 
-                            let resource_guard = resource.lock().await;
-                            if resource_guard.verify_proof(payload.as_slice()) {
+                            if resource.verify_proof(payload.as_slice()) {
                                 progress.finish(true);
                                 transfer_complete = true;
                             } else {

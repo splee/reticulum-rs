@@ -15,9 +15,8 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::resource::{Resource, ResourceConfig};
-use reticulum::transport::{Transport, TransportConfig};
-use tokio::sync::Mutex;
+use reticulum::resource::ResourceConfig;
+use reticulum::transport::{Resource, Transport, TransportConfig};
 
 /// Test resource client for integration testing
 #[derive(Parser, Debug)]
@@ -164,11 +163,11 @@ fn main() {
 
                 tokio::select! {
                     Ok(event) = announce_rx.recv() => {
-                        let announced_hash = event.destination.lock().await.desc.address_hash;
+                        let announced_hash = event.destination.address_hash;
                         if announced_hash == address_hash {
                             log::info!("Received announce from target destination");
                             println!("ANNOUNCE_RECEIVED={}", dest_hex);
-                            break event.destination.lock().await.desc;
+                            break event.destination;
                         } else {
                             log::debug!(
                                 "Received announce from different destination: {}",
@@ -202,17 +201,16 @@ fn main() {
 
                 tokio::select! {
                     Ok(event) = announce_rx.recv() => {
-                        let dest = event.destination.lock().await;
                         log::info!(
                             "Received announce from: {}",
-                            hex::encode(dest.desc.address_hash.as_slice())
+                            hex::encode(event.destination.address_hash.as_slice())
                         );
                         println!(
                             "ANNOUNCE_RECEIVED={}",
-                            hex::encode(dest.desc.address_hash.as_slice())
+                            hex::encode(event.destination.address_hash.as_slice())
                         );
                         // Accept first announce we see
-                        break dest.desc;
+                        break event.destination;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         // Continue waiting
@@ -358,14 +356,11 @@ fn main() {
                 }
             }
 
-            // Store resource for handling requests
-            let resource = Arc::new(Mutex::new(resource));
-
             // Wait for resource requests and send parts
             let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
             let mut parts_sent = 0usize;
             let mut proof_received = false;
-            let total_parts = resource.lock().await.total_parts();
+            let total_parts = resource.total_parts();
 
             while tokio::time::Instant::now() < deadline && running.load(Ordering::SeqCst) {
                 tokio::select! {
@@ -385,8 +380,7 @@ fn main() {
                                     );
 
                                     // Handle request
-                                    let mut resource_guard = resource.lock().await;
-                                    match resource_guard.handle_request(request_data) {
+                                    match resource.handle_request(request_data) {
                                         Ok(result) => {
                                             if let Some(ref hmu_data) = result.hashmap_update {
                                                 log::info!(
@@ -404,11 +398,9 @@ fn main() {
                                             }
 
                                             // Send requested parts
-                                            // Drop resource guard before getting link
                                             let parts_to_send: Vec<_> = result.parts_to_send.iter()
-                                                .filter_map(|&idx| resource_guard.get_part_data(idx).map(|d| (idx, d.to_vec())))
+                                                .filter_map(|&idx| resource.get_part_data(idx).map(|d| (idx, d)))
                                                 .collect();
-                                            drop(resource_guard);
 
                                             for (part_idx, part_data) in parts_to_send {
                                                 log::debug!(
@@ -450,8 +442,7 @@ fn main() {
                                         proof_data.len()
                                     );
 
-                                    let resource_guard = resource.lock().await;
-                                    if resource_guard.verify_proof(proof_data) {
+                                    if resource.verify_proof(proof_data) {
                                         proof_received = true;
                                         println!("RESOURCE_PROOF_RECEIVED={}", resource_hash_hex);
                                         log::info!("Resource transfer completed successfully");

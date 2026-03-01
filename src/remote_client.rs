@@ -348,7 +348,7 @@ impl RemoteClient {
         &self,
         aspect: &str,
         transport_identity_hash: &[u8; 16],
-    ) -> Result<crate::transport::LinkHandle, RemoteError> {
+    ) -> Result<crate::transport::Link, RemoteError> {
         let dest_hash = compute_destination_hash(aspect, transport_identity_hash)
             .map_err(|e| RemoteError::Other(e.to_string()))?;
 
@@ -418,7 +418,7 @@ impl RemoteClient {
     /// Send a request on an established link and wait for response.
     pub async fn request(
         &self,
-        link: &crate::transport::LinkHandle,
+        link: &crate::transport::Link,
         path: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, RemoteError> {

@@ -19,7 +19,7 @@ use core::{fmt, marker::PhantomData};
 use std::path::PathBuf;
 
 use crate::{
-    destination::link::Link,
+    destination::link::LinkInner,
     destination::ratchet::RatchetState,
     crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
@@ -167,7 +167,7 @@ pub(crate) fn decrypt_single<R: CryptoRngCore + Copy>(
 
 /// Callback type for link establishment events.
 /// Called with a reference to the established link.
-pub type LinkEstablishedCallback = Arc<dyn Fn(&Link) + Send + Sync + 'static>;
+pub(crate) type LinkEstablishedCallback = Arc<dyn Fn(&LinkInner) + Send + Sync + 'static>;
 
 /// Callback type for packet reception events.
 /// Called with the packet data and the full packet.
@@ -187,7 +187,7 @@ pub type ProofRequestedCallback = Arc<dyn Fn(&Packet) -> bool + Send + Sync + 's
 #[derive(Clone, Default)]
 pub struct DestinationCallbacks {
     /// Called when a link is established to this destination
-    pub link_established: Option<LinkEstablishedCallback>,
+    pub(crate) link_established: Option<LinkEstablishedCallback>,
     /// Called when a packet is received for this destination
     pub packet: Option<PacketCallback>,
     /// Called when a proof is requested (for PROVE_APP strategy).
@@ -765,7 +765,7 @@ impl Destination<PrivateIdentity, Input, Single> {
     /// Notify destination that a link has been established.
     ///
     /// This invokes the link_established callback if set.
-    pub fn notify_link_established(&self, link: &Link) {
+    pub(crate) fn notify_link_established(&self, link: &LinkInner) {
         if let Some(ref callback) = self.callbacks.link_established {
             callback(link);
         }
@@ -774,9 +774,9 @@ impl Destination<PrivateIdentity, Input, Single> {
     /// Set the callback for link establishment events.
     ///
     /// Matches Python's `set_link_established_callback()` method.
-    pub fn set_link_established_callback<F>(&mut self, callback: F)
+    pub(crate) fn set_link_established_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&Link) + Send + Sync + 'static,
+        F: Fn(&LinkInner) + Send + Sync + 'static,
     {
         self.callbacks.link_established = Some(Arc::new(callback));
     }

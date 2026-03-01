@@ -14,8 +14,8 @@ use std::time::Duration;
 use reticulum::destination::link::LinkEvent;
 use reticulum::hash::AddressHash;
 use reticulum::packet::RETICULUM_MDU;
-use reticulum::resource::{Resource, ResourceAdvertisement};
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::resource::ResourceAdvertisement;
+use reticulum::transport::{Resource, Transport, TransportConfig};
 
 use crate::config::{get_config_dir, get_identity_path, prepare_identity};
 use crate::metadata::create_request_data;
@@ -221,7 +221,7 @@ async fn handle_fetch_response(ctx: &mut FetchContext<'_>) -> i32 {
                             }
                         }
                         LinkEvent::ResourceData(payload) => {
-                            if let Some(ref mut resource) = incoming_resource {
+                            if let Some(ref resource) = incoming_resource {
                                 match handle_data_event(
                                     ctx.transport,
                                     ctx.link_id,
@@ -329,7 +329,7 @@ async fn handle_advertisement_event(
     }
 
     let sdu = RETICULUM_MDU;
-    let mut resource = match Resource::from_advertisement(&adv, sdu) {
+    let resource = match Resource::from_advertisement(&adv, sdu) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to create resource: {:?}", e);
@@ -362,7 +362,7 @@ enum DataEventResult {
 async fn handle_data_event(
     transport: &Transport,
     link_id: &reticulum::destination::link::LinkId,
-    resource: &mut Resource,
+    resource: &Resource,
     payload: &[u8],
     file_path_str: &str,
     output_dir: &Path,

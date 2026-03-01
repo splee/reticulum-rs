@@ -47,7 +47,7 @@ pub type EncryptFn = dyn Fn(&[u8]) -> Result<Vec<u8>, RnsError>;
 pub type ProgressCallback = Arc<dyn Fn(&ResourceProgress) + Send + Sync>;
 
 /// Type alias for completion callback
-pub type CompletionCallback = Arc<dyn Fn(&Resource, bool) + Send + Sync>;
+pub type CompletionCallback = Arc<dyn Fn(&ResourceInner, bool) + Send + Sync>;
 
 /// Result from handling a resource request (for outgoing resources).
 ///
@@ -65,7 +65,7 @@ pub struct HandleRequestResult {
 }
 
 /// A resource for transferring data over a link
-pub struct Resource {
+pub(crate) struct ResourceInner {
     /// Current status
     status: RwLock<ResourceStatus>,
 
@@ -210,7 +210,7 @@ pub struct Resource {
     previous_eifr: Option<f64>,
 }
 
-impl Resource {
+impl ResourceInner {
     /// Create a new outgoing resource from data.
     ///
     /// The optional `encrypt_fn` encrypts the resource data stream before
@@ -1595,9 +1595,9 @@ impl Resource {
     }
 }
 
-impl std::fmt::Debug for Resource {
+impl std::fmt::Debug for ResourceInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Resource")
+        f.debug_struct("ResourceInner")
             .field("status", &self.status())
             .field("hash", &hex::encode(&self.hash[..8]))
             .field("size", &self.size)
@@ -1625,7 +1625,7 @@ mod tests {
         let data = b"Hello, Resource Transfer!";
 
         let resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
+            ResourceInner::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Total size is the uncompressed data length (not including random hash)
         assert_eq!(resource.total_size(), data.len());
@@ -1639,7 +1639,7 @@ mod tests {
         let data = b"Data with metadata";
         let metadata = b"filename.txt";
 
-        let resource = Resource::new(&mut rng, data, ResourceConfig::default(), Some(metadata), None)
+        let resource = ResourceInner::new(&mut rng, data, ResourceConfig::default(), Some(metadata), None)
             .expect("create resource");
 
         assert!(resource.flags.has_metadata);
@@ -1651,7 +1651,7 @@ mod tests {
         let data = vec![0x41u8; 1000]; // 1KB of 'A'
 
         let resource =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Verify parts were created
         assert!(resource.total_parts() > 0);
@@ -1676,12 +1676,12 @@ mod tests {
 
         // Create outgoing resource to get parts
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         // Create incoming resource from advertisement
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Verify initial state
         assert_eq!(incoming.received_count, 0);
@@ -1704,11 +1704,11 @@ mod tests {
         let data = vec![0x43u8; 2000]; // Large enough for multiple parts
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Receive parts in order (window-based reception requires parts to be
         // within the current window, which starts at consecutive_completed_height + 1)
@@ -1728,11 +1728,11 @@ mod tests {
         let data = vec![0x44u8; 1000];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Generate first request
         let request = incoming.request_next();
@@ -1749,7 +1749,7 @@ mod tests {
         let data = vec![0x45u8; 500];
 
         let mut resource =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Create a mock request with the first part hash
         let mut request_data = Vec::new();
@@ -1772,7 +1772,7 @@ mod tests {
         let data = b"Data for proof testing";
 
         let resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
+            ResourceInner::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Generate proof
         let proof = resource.generate_proof().unwrap();
@@ -1795,11 +1795,11 @@ mod tests {
         let data = vec![0x46u8; 500];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Get hashmap update from outgoing
         let hashmap_update = outgoing.get_hashmap_update(0);
@@ -1810,7 +1810,7 @@ mod tests {
         assert_eq!(&hashmap_update[..32], &outgoing.hash);
 
         // Parse the HMU payload and verify round-trip
-        let parsed = Resource::parse_hashmap_update(&hashmap_update);
+        let parsed = ResourceInner::parse_hashmap_update(&hashmap_update);
         assert!(parsed.is_some(), "Failed to parse HMU");
         let (truncated_hash, segment, hashmap_data) = parsed.unwrap();
         assert_eq!(segment, 0);
@@ -1827,11 +1827,11 @@ mod tests {
         let data = vec![0x47u8; 500];
 
         let outgoing =
-            Resource::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, &data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         let initial_window = incoming.window();
         assert_eq!(initial_window, WINDOW_INITIAL);
@@ -1860,7 +1860,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, data, config, None, None).expect("create resource");
+        let resource = ResourceInner::new(&mut rng, data, config, None, None).expect("create resource");
 
         // Small data might not compress well, could be either compressed or not
         // Just verify resource was created successfully
@@ -1878,7 +1878,7 @@ mod tests {
             ..ResourceConfig::default()
         };
 
-        let resource = Resource::new(&mut rng, &data, config, None, None).expect("create resource");
+        let resource = ResourceInner::new(&mut rng, &data, config, None, None).expect("create resource");
 
         // Verify it's marked as compressed
         assert!(resource.is_compressed());
@@ -1899,11 +1899,11 @@ mod tests {
         };
 
         let outgoing =
-            Resource::new(&mut rng, original_data, config, None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, original_data, config, None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Receive all parts
         for part in &outgoing.parts {
@@ -1932,11 +1932,11 @@ mod tests {
         };
 
         let outgoing =
-            Resource::new(&mut rng, data, config, None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, data, config, None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Before receiving parts, should return None
         assert!(incoming.get_raw_assembled_data().is_none());
@@ -1958,7 +1958,7 @@ mod tests {
         let data = b"Data to cancel";
 
         let mut resource =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
+            ResourceInner::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         assert_ne!(resource.status(), ResourceStatus::Failed);
 
@@ -1973,11 +1973,11 @@ mod tests {
         let data = b"RTT test";
 
         let outgoing =
-            Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create outgoing resource");
+            ResourceInner::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create outgoing resource");
 
         let adv = outgoing.create_advertisement();
         let mut incoming =
-            Resource::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
+            ResourceInner::from_advertisement(&adv, outgoing.sdu).expect("create incoming resource");
 
         // Initial RTT should be None
         assert!(incoming.rtt.is_none());

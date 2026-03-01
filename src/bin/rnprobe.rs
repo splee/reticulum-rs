@@ -5,7 +5,6 @@
 
 use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -21,7 +20,7 @@ use reticulum::iface::tcp_server::TcpServer;
 use reticulum::logging;
 use reticulum::packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, TransportType};
 use reticulum::receipt::ReceiptStatus;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{PacketReceipt, Transport, TransportConfig};
 
 /// Reticulum Network Probe
 #[derive(Parser, Debug)]
@@ -346,7 +345,7 @@ async fn wait_for_path(transport: &Transport, dest_hash: &AddressHash, timeout: 
 
 /// Wait for proof receipt with spinner animation
 async fn wait_for_proof(
-    receipt: Arc<tokio::sync::Mutex<reticulum::receipt::PacketReceipt>>,
+    receipt: PacketReceipt,
     timeout: Duration,
 ) -> Option<Duration> {
     let spinner = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
@@ -354,14 +353,11 @@ async fn wait_for_proof(
     let start = Instant::now();
 
     while start.elapsed() < timeout {
-        {
-            let r = receipt.lock().await;
-            if r.is_delivered() {
-                return r.rtt();
-            }
-            if r.status() == ReceiptStatus::Failed {
-                return None;
-            }
+        if receipt.is_delivered().await {
+            return receipt.rtt().await;
+        }
+        if receipt.status().await == ReceiptStatus::Failed {
+            return None;
         }
 
         print!("\r{} ", spinner[spinner_idx % spinner.len()]);
@@ -372,10 +368,7 @@ async fn wait_for_proof(
     }
 
     // Mark as timed out
-    {
-        let mut r = receipt.lock().await;
-        r.check_timeout();
-    }
+    receipt.check_timeout().await;
 
     None
 }

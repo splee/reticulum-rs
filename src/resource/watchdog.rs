@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::constants::*;
 use super::status::ResourceStatus;
-use super::Resource;
+use super::ResourceInner;
 use crate::hash::AddressHash;
 
 /// Messages sent from the resource watchdog to the transport layer.
@@ -80,7 +80,7 @@ impl Default for ResourceWatchdogConfig {
 /// * `msg_tx` - Channel to send watchdog messages
 /// * `config` - Watchdog configuration
 pub fn spawn_resource_watchdog(
-    resource: Arc<RwLock<Resource>>,
+    resource: Arc<RwLock<ResourceInner>>,
     link_id: AddressHash,
     link_rtt: Duration,
     link_establishment_cost: usize,
@@ -104,7 +104,7 @@ pub fn spawn_resource_watchdog(
 
 /// Main watchdog loop — mirrors Python `Resource.__watchdog_job()`.
 async fn resource_watchdog_loop(
-    resource: Arc<RwLock<Resource>>,
+    resource: Arc<RwLock<ResourceInner>>,
     link_id: AddressHash,
     link_rtt: Duration,
     link_establishment_cost: usize,
@@ -246,7 +246,7 @@ enum WatchdogAction {
 ///
 /// This mirrors the Python `Resource.__watchdog_job()` logic at Resource.py:561-666.
 fn determine_action(
-    res: &Resource,
+    res: &ResourceInner,
     status: ResourceStatus,
     link_rtt: Duration,
     link_establishment_cost: usize,
@@ -277,7 +277,7 @@ fn determine_action(
 /// Handle ADVERTISED state: wait for first request, retry advertisement on timeout.
 ///
 /// Python: sleep_time = (self.adv_sent + self.timeout + Resource.PROCESSING_GRACE) - time.time()
-fn determine_advertised_action(res: &Resource) -> WatchdogAction {
+fn determine_advertised_action(res: &ResourceInner) -> WatchdogAction {
     let adv_sent = match res.adv_sent() {
         Some(t) => t,
         None => return WatchdogAction::Sleep(Duration::from_millis(100)),
@@ -305,7 +305,7 @@ fn determine_advertised_action(res: &Resource) -> WatchdogAction {
 ///   sleep_time = last_activity + tolerance - now
 /// where negative means timed out. We compute the same way.
 fn determine_receiver_transferring_action(
-    res: &Resource,
+    res: &ResourceInner,
     link_rtt: Duration,
     _link_establishment_cost: usize,
 ) -> WatchdogAction {
@@ -353,7 +353,7 @@ fn determine_receiver_transferring_action(
 ///
 /// Python: Resource.py:626-633
 fn determine_sender_transferring_action(
-    res: &Resource,
+    res: &ResourceInner,
     link_rtt: Duration,
 ) -> WatchdogAction {
     let rtt_secs = res.rtt().unwrap_or(link_rtt).as_secs_f64().max(0.001);
@@ -380,7 +380,7 @@ fn determine_sender_transferring_action(
 ///
 /// Python: Resource.py:635-654
 fn determine_awaiting_proof_action(
-    res: &Resource,
+    res: &ResourceInner,
     link_rtt: Duration,
 ) -> WatchdogAction {
     let rtt = res.rtt().unwrap_or(link_rtt).as_secs_f64().max(0.001);
@@ -492,7 +492,7 @@ mod tests {
         // When adv_sent is None, should just sleep briefly
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = Resource::new(&mut OsRng, b"test data", config, None, None).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // adv_sent is None by default for outgoing resources
         let action = determine_advertised_action(&resource);
         matches!(action, WatchdogAction::Sleep(_));
@@ -502,7 +502,7 @@ mod tests {
     fn test_sender_transferring_within_timeout() {
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = Resource::new(&mut OsRng, b"test data", config, None, None).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // Resource was just created, so last_activity is recent — should sleep
         let link_rtt = Duration::from_millis(100);
         let action = determine_sender_transferring_action(&resource, link_rtt);
@@ -513,7 +513,7 @@ mod tests {
     fn test_awaiting_proof_no_last_part_sent() {
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = Resource::new(&mut OsRng, b"test data", config, None, None).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // last_part_sent is None — should just sleep
         let link_rtt = Duration::from_millis(100);
         let action = determine_awaiting_proof_action(&resource, link_rtt);

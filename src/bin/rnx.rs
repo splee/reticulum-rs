@@ -787,10 +787,10 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
         tokio::select! {
             Ok(event) = announce_rx.recv() => {
-                let announced_hash = event.destination.lock().await.desc.address_hash;
+                let announced_hash = event.destination.address_hash;
                 if announced_hash == dest_hash {
                     println!("OK");
-                    break event.destination.lock().await.desc;
+                    break event.destination;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -1040,10 +1040,10 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
         tokio::select! {
             Ok(event) = announce_rx.recv() => {
-                let announced_hash = event.destination.lock().await.desc.address_hash;
+                let announced_hash = event.destination.address_hash;
                 if announced_hash == dest_hash {
                     println!("Path found");
-                    break event.destination.lock().await.desc;
+                    break event.destination;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}

@@ -18,9 +18,9 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::resource::{Resource, ResourceAdvertisement};
+use reticulum::resource::ResourceAdvertisement;
 use reticulum::packet::RETICULUM_MDU;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{Resource, Transport, TransportConfig};
 use tokio::sync::RwLock;
 
 /// Test resource server for integration testing
@@ -302,7 +302,7 @@ async fn handle_link_event(
                     );
 
                     match Resource::from_advertisement(&adv, sdu) {
-                        Ok(mut resource) => {
+                        Ok(resource) => {
                             let truncated_hash = *resource.truncated_hash();
 
                             // Request the first batch of parts
@@ -406,7 +406,7 @@ async fn handle_link_event(
             // Handle completion
             if let Some(hash) = completed_hash {
                 if let Some(tracked) = resources.remove(&hash) {
-                    let mut resource = tracked.resource;
+                    let resource = tracked.resource;
 
                     // Get raw assembled data
                     if let Some(raw_data) = resource.get_raw_assembled_data() {
@@ -503,7 +503,7 @@ async fn handle_link_event(
 
             // Parse HMU: [full_hash (32 bytes)] + [msgpack([segment, hashmap_bytes])]
             if let Some((resource_hash, segment, hashmap_data)) =
-                reticulum::resource::Resource::parse_hashmap_update(payload.as_slice())
+                Resource::parse_hashmap_update(payload.as_slice())
             {
                 let mut resources = incoming_resources.write().await;
                 if let Some(tracked) = resources.get_mut(&resource_hash) {

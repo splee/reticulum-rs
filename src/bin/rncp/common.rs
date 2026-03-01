@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use reticulum::destination::link::LinkId;
-use reticulum::resource::Resource;
+use reticulum::transport::Resource;
 
 /// Tracked incoming resource with its link.
 ///

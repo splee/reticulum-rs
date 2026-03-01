@@ -1,6 +1,6 @@
 //! Packet Receipt implementation for delivery tracking
 //!
-//! This module provides PacketReceipt functionality for tracking packet delivery
+//! This module provides PacketReceiptInner functionality for tracking packet delivery
 //! and validating proofs, matching the Python implementation.
 
 use std::sync::Arc;
@@ -53,9 +53,9 @@ pub enum ReceiptStatus {
 #[allow(clippy::type_complexity)]
 pub struct ReceiptCallbacks {
     /// Called when delivery is confirmed
-    pub delivery: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
+    pub delivery: Option<Arc<dyn Fn(&PacketReceiptInner) + Send + Sync>>,
     /// Called when the receipt times out
-    pub timeout: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
+    pub timeout: Option<Arc<dyn Fn(&PacketReceiptInner) + Send + Sync>>,
 }
 
 
@@ -93,7 +93,7 @@ impl PhysicalMetrics {
 
 /// A receipt for a sent packet, used to track delivery
 #[derive(Debug)]
-pub struct PacketReceipt {
+pub(crate) struct PacketReceiptInner {
     /// Full SHA-256 hash of the packet
     hash: [u8; HASH_LENGTH],
     /// Truncated hash for addressing
@@ -121,7 +121,7 @@ pub struct PacketReceipt {
     proof_data: Option<Vec<u8>>,
 }
 
-impl PacketReceipt {
+impl PacketReceiptInner {
     /// Create a new packet receipt
     pub fn new(packet_hash: [u8; HASH_LENGTH], hops: u8, is_link: bool, rtt: Option<f64>) -> Self {
         let truncated_hash = {
@@ -219,7 +219,7 @@ impl PacketReceipt {
     /// Set the delivery callback
     pub fn set_delivery_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&PacketReceipt) + Send + Sync + 'static,
+        F: Fn(&PacketReceiptInner) + Send + Sync + 'static,
     {
         self.callbacks.delivery = Some(Arc::new(callback));
     }
@@ -227,7 +227,7 @@ impl PacketReceipt {
     /// Set the timeout callback
     pub fn set_timeout_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&PacketReceipt) + Send + Sync + 'static,
+        F: Fn(&PacketReceiptInner) + Send + Sync + 'static,
     {
         self.callbacks.timeout = Some(Arc::new(callback));
     }
@@ -405,7 +405,7 @@ pub fn generate_proof(
 #[derive(Debug)]
 pub struct ReceiptManager {
     /// Active receipts (truncated hash -> receipt)
-    receipts: tokio::sync::RwLock<std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceipt>>>>,
+    receipts: tokio::sync::RwLock<std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceiptInner>>>>,
     /// Maximum number of receipts to track
     max_receipts: usize,
 }
@@ -426,7 +426,7 @@ impl ReceiptManager {
     }
 
     /// Add a receipt to the manager
-    pub async fn add(&self, receipt: PacketReceipt) -> Arc<Mutex<PacketReceipt>> {
+    pub async fn add(&self, receipt: PacketReceiptInner) -> Arc<Mutex<PacketReceiptInner>> {
         let hash = *receipt.truncated_hash();
         let receipt = Arc::new(Mutex::new(receipt));
 
@@ -443,12 +443,12 @@ impl ReceiptManager {
     }
 
     /// Get a receipt by its truncated hash
-    pub async fn get(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
+    pub async fn get(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceiptInner>>> {
         self.receipts.read().await.get(truncated_hash).cloned()
     }
 
     /// Remove a receipt by its truncated hash
-    pub async fn remove(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceipt>>> {
+    pub async fn remove(&self, truncated_hash: &[u8; 16]) -> Option<Arc<Mutex<PacketReceiptInner>>> {
         self.receipts.write().await.remove(truncated_hash)
     }
 
@@ -464,7 +464,7 @@ impl ReceiptManager {
     /// Cull the oldest receipts to make room
     async fn cull_oldest(
         &self,
-        receipts: &mut std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceipt>>>,
+        receipts: &mut std::collections::HashMap<[u8; 16], Arc<Mutex<PacketReceiptInner>>>,
     ) {
         // Find concluded receipts to remove
         let mut to_remove = Vec::new();
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn test_receipt_creation() {
         let hash = [0u8; HASH_LENGTH];
-        let receipt = PacketReceipt::new(hash, 3, false, None);
+        let receipt = PacketReceiptInner::new(hash, 3, false, None);
 
         assert_eq!(receipt.status(), ReceiptStatus::Sent);
         assert!(!receipt.is_delivered());
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn test_receipt_timeout() {
         let hash = [0u8; HASH_LENGTH];
-        let mut receipt = PacketReceipt::new(hash, 0, false, None);
+        let mut receipt = PacketReceiptInner::new(hash, 0, false, None);
 
         // Override timeout for testing
         receipt.timeout = Duration::from_millis(1);
@@ -529,7 +529,7 @@ mod tests {
         let manager = ReceiptManager::new(100);
 
         let hash = [0u8; HASH_LENGTH];
-        let receipt = PacketReceipt::new(hash, 0, false, None);
+        let receipt = PacketReceiptInner::new(hash, 0, false, None);
         let truncated = *receipt.truncated_hash();
 
         manager.add(receipt).await;
@@ -561,7 +561,7 @@ mod tests {
         let hash = [42u8; HASH_LENGTH];
 
         // Create receipt and proof
-        let mut receipt = PacketReceipt::new(hash, 0, false, None);
+        let mut receipt = PacketReceiptInner::new(hash, 0, false, None);
         let proof = generate_proof(&hash, &identity, true);
 
         // Validate proof
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(proof_data.len(), IMPLICIT_PROOF_LENGTH);
 
         // Create a receipt and validate
-        let mut receipt = PacketReceipt::new(hash.to_bytes(), 0, false, None);
+        let mut receipt = PacketReceiptInner::new(hash.to_bytes(), 0, false, None);
         assert!(
             receipt.validate_proof(proof_data, identity.as_identity()),
             "Implicit proof generated by prove() should validate against receipt"
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(proof_data.len(), EXPLICIT_PROOF_LENGTH);
 
         // Create a receipt and validate
-        let mut receipt = PacketReceipt::new(hash.to_bytes(), 0, false, None);
+        let mut receipt = PacketReceiptInner::new(hash.to_bytes(), 0, false, None);
         assert!(
             receipt.validate_proof(proof_data, identity.as_identity()),
             "Explicit proof generated by prove() should validate against receipt"

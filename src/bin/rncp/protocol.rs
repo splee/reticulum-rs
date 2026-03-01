@@ -15,7 +15,7 @@ use reticulum::destination::DestinationDesc;
 use reticulum::hash::AddressHash;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::transport::link_handle::LinkHandle;
+use reticulum::transport::link::Link;
 use reticulum::transport::Transport;
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
@@ -110,10 +110,10 @@ pub async fn wait_for_announce(
     while tokio::time::Instant::now() < deadline && running.load(Ordering::SeqCst) {
         tokio::select! {
             Ok(event) = announce_rx.recv() => {
-                let announced_hash = event.destination.lock().await.desc.address_hash;
+                let announced_hash = event.destination.address_hash;
                 if announced_hash == *dest_hash {
                     log::info!("Received announce from target destination");
-                    return Ok(event.destination.lock().await.desc);
+                    return Ok(event.destination);
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -145,7 +145,7 @@ pub async fn wait_for_announce(
 /// # Returns
 /// Ok(()) on success, or an error
 pub async fn wait_for_link_activation(
-    link: &LinkHandle,
+    link: &Link,
     link_id: &reticulum::destination::link::LinkId,
     link_events: &mut BroadcastReceiver<LinkEventData>,
     timeout: Duration,

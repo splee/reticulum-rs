@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
-use crate::destination::link::{Link, LinkEventData, LinkId};
+use crate::destination::link::{LinkInner, LinkEventData, LinkId};
 use crate::hash::AddressHash;
 use crate::packet::Packet;
 
@@ -27,9 +27,9 @@ use super::link_table::LinkTable;
 /// - Distributing link events to subscribers
 pub struct LinkManager {
     /// Outgoing links (we initiated the connection)
-    out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
+    out_links: HashMap<AddressHash, Arc<Mutex<LinkInner>>>,
     /// Incoming links (they initiated to us)
-    in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
+    in_links: HashMap<AddressHash, Arc<Mutex<LinkInner>>>,
     /// Intermediate routing table for multi-hop links
     table: LinkTable,
     /// Event sender for incoming link notifications
@@ -52,17 +52,17 @@ impl LinkManager {
     // =========================================================================
 
     /// Get an outgoing link by destination hash.
-    pub fn get_out_link(&self, dest_hash: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+    pub(crate) fn get_out_link(&self, dest_hash: &AddressHash) -> Option<Arc<Mutex<LinkInner>>> {
         self.out_links.get(dest_hash).cloned()
     }
 
     /// Insert an outgoing link.
-    pub fn insert_out_link(&mut self, dest_hash: AddressHash, link: Arc<Mutex<Link>>) {
+    pub(crate) fn insert_out_link(&mut self, dest_hash: AddressHash, link: Arc<Mutex<LinkInner>>) {
         self.out_links.insert(dest_hash, link);
     }
 
     /// Remove an outgoing link.
-    pub fn remove_out_link(&mut self, dest_hash: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+    pub(crate) fn remove_out_link(&mut self, dest_hash: &AddressHash) -> Option<Arc<Mutex<LinkInner>>> {
         self.out_links.remove(dest_hash)
     }
 
@@ -72,12 +72,12 @@ impl LinkManager {
     }
 
     /// Get an iterator over all outgoing links.
-    pub fn out_links(&self) -> impl Iterator<Item = (&AddressHash, &Arc<Mutex<Link>>)> {
+    pub(crate) fn out_links(&self) -> impl Iterator<Item = (&AddressHash, &Arc<Mutex<LinkInner>>)> {
         self.out_links.iter()
     }
 
     /// Get all outgoing link values.
-    pub fn out_link_values(&self) -> impl Iterator<Item = &Arc<Mutex<Link>>> {
+    pub(crate) fn out_link_values(&self) -> impl Iterator<Item = &Arc<Mutex<LinkInner>>> {
         self.out_links.values()
     }
 
@@ -91,17 +91,17 @@ impl LinkManager {
     // =========================================================================
 
     /// Get an incoming link by link ID.
-    pub fn get_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+    pub(crate) fn get_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<LinkInner>>> {
         self.in_links.get(link_id).cloned()
     }
 
     /// Insert an incoming link.
-    pub fn insert_in_link(&mut self, link_id: AddressHash, link: Arc<Mutex<Link>>) {
+    pub(crate) fn insert_in_link(&mut self, link_id: AddressHash, link: Arc<Mutex<LinkInner>>) {
         self.in_links.insert(link_id, link);
     }
 
     /// Remove an incoming link.
-    pub fn remove_in_link(&mut self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+    pub(crate) fn remove_in_link(&mut self, link_id: &AddressHash) -> Option<Arc<Mutex<LinkInner>>> {
         self.in_links.remove(link_id)
     }
 
@@ -111,12 +111,12 @@ impl LinkManager {
     }
 
     /// Get an iterator over all incoming links.
-    pub fn in_links(&self) -> impl Iterator<Item = (&AddressHash, &Arc<Mutex<Link>>)> {
+    pub(crate) fn in_links(&self) -> impl Iterator<Item = (&AddressHash, &Arc<Mutex<LinkInner>>)> {
         self.in_links.iter()
     }
 
     /// Get all incoming link values.
-    pub fn in_link_values(&self) -> impl Iterator<Item = &Arc<Mutex<Link>>> {
+    pub(crate) fn in_link_values(&self) -> impl Iterator<Item = &Arc<Mutex<LinkInner>>> {
         self.in_links.values()
     }
 

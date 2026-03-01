@@ -15,9 +15,9 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 
-use crate::destination::link::Link;
+use crate::destination::link::LinkInner;
 use crate::destination::link::LinkEventData;
-use crate::destination::link::LinkHandleResult;
+use crate::destination::link::LinkResult;
 use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
 use crate::destination::plain::PlainDestination;
@@ -50,7 +50,7 @@ use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::packet::TransportType;
-use crate::receipt::{PacketReceipt, ReceiptManager, EXPLICIT_PROOF_LENGTH};
+use crate::receipt::{PacketReceiptInner, ReceiptManager, EXPLICIT_PROOF_LENGTH};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
 use crate::persistence::{KnownDestinations, RatchetManager};
 
@@ -68,13 +68,17 @@ pub mod path_table;
 // Phase 5: Transport enhancements
 pub mod blackhole;
 pub mod blackhole_info;
-pub mod link_handle;
+pub mod link;
 pub mod path_request;
+pub mod receipt;
 pub mod remote_management;
+pub mod resource;
 pub mod reverse_table;
 pub mod tunnel;
 
-pub use link_handle::LinkHandle;
+pub use link::Link;
+pub use receipt::PacketReceipt;
+pub use resource::Resource;
 
 use announce_handler::{AnnounceCallback, AnnounceHandlerConfig, AnnounceHandlerHandle, AnnounceHandlerRegistry};
 use announce_manager::AnnounceManager;
@@ -132,7 +136,7 @@ pub struct TransportConfig {
 
 #[derive(Clone)]
 pub struct AnnounceEvent {
-    pub destination: Arc<Mutex<SingleOutputDestination>>,
+    pub destination: DestinationDesc,
     pub app_data: PacketDataBuffer,
 }
 
@@ -439,12 +443,9 @@ impl Transport {
                     result = announce_rx.recv() => {
                         match result {
                             Ok(event) => {
-                                // Get destination info
-                                let dest = event.destination.lock().await;
-
                                 // Filter by aspect: only process announces for the discovery aspect
                                 // Compute expected destination hash for this identity + discovery aspect
-                                let identity_hash = dest.identity.address_hash.as_slice();
+                                let identity_hash = event.destination.identity.address_hash.as_slice();
                                 let expected_dest_hash = AddressHash::new_from_hash(&Hash::new(
                                     Hash::generator()
                                         .chain_update(discovery_name.as_name_hash_slice())
@@ -454,7 +455,7 @@ impl Transport {
                                 ));
 
                                 // Compare with actual destination hash from the announce
-                                let actual_dest_hash = dest.desc.address_hash;
+                                let actual_dest_hash = event.destination.address_hash;
                                 if expected_dest_hash.as_slice() != actual_dest_hash.as_slice() {
                                     // Not a discovery announce, skip it
                                     continue;
@@ -775,7 +776,7 @@ impl Transport {
         packet: Packet,
         destination_hash: AddressHash,
         hops: u8,
-    ) -> Arc<Mutex<PacketReceipt>> {
+    ) -> PacketReceipt {
         let hash = packet.hash().to_bytes();
         let dest_truncated: [u8; 16] = {
             let slice = destination_hash.as_slice();
@@ -784,11 +785,17 @@ impl Transport {
             arr
         };
 
-        let receipt = PacketReceipt::new_with_destination(hash, dest_truncated, hops, None);
-        let receipt = self.handler.lock().await.receipt_manager.add(receipt).await;
+        let truncated_hash = {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&hash[..16]);
+            arr
+        };
+
+        let receipt = PacketReceiptInner::new_with_destination(hash, dest_truncated, hops, None);
+        let inner = self.handler.lock().await.receipt_manager.add(receipt).await;
 
         self.send_packet(packet).await;
-        receipt
+        PacketReceipt::new(inner, hash, truncated_hash, Some(dest_truncated))
     }
 
     /// Send plaintext data to a single destination, encrypting it for the
@@ -804,7 +811,7 @@ impl Transport {
         destination_hash: &AddressHash,
         plaintext: &[u8],
         context: PacketContext,
-    ) -> Result<Arc<Mutex<PacketReceipt>>, RnsError> {
+    ) -> Result<PacketReceipt, RnsError> {
         // Try to encrypt via a cached SingleOutputDestination first, then
         // fall back to known_destinations for identity lookup. Both paths
         // consult the ratchet manager for forward secrecy.
@@ -1079,7 +1086,7 @@ impl Transport {
         false
     }
 
-    pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<LinkHandle> {
+    pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Link> {
         let handler_guard = self.handler.lock().await;
         let link_arc = handler_guard.link_manager.get_out_link(link_id)?;
         let link_guard = link_arc.lock().await;
@@ -1087,10 +1094,10 @@ impl Transport {
         let destination = *link_guard.destination();
         let initiator = link_guard.is_initiator();
         drop(link_guard);
-        Some(LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator))
+        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator))
     }
 
-    pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<LinkHandle> {
+    pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Link> {
         let handler_guard = self.handler.lock().await;
         let link_arc = handler_guard.link_manager.get_in_link(link_id)?;
         let link_guard = link_arc.lock().await;
@@ -1098,7 +1105,7 @@ impl Transport {
         let destination = *link_guard.destination();
         let initiator = link_guard.is_initiator();
         drop(link_guard);
-        Some(LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator))
+        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator))
     }
 
     /// Decrypt data using an incoming link's key.
@@ -1122,7 +1129,7 @@ impl Transport {
         }
     }
 
-    pub async fn link(&self, destination: DestinationDesc) -> LinkHandle {
+    pub async fn link(&self, destination: DestinationDesc) -> Link {
         let existing = self
             .handler
             .lock()
@@ -1137,13 +1144,13 @@ impl Transport {
                 let dest = *link_guard.destination();
                 let initiator = link_guard.is_initiator();
                 drop(link_guard);
-                return LinkHandle::new(link_arc, self.handler.clone(), id, dest, initiator);
+                return Link::new(link_arc, self.handler.clone(), id, dest, initiator);
             } else {
                 log::warn!("tp({}): link was closed", self.name);
             }
         }
 
-        let mut link = Link::new(destination, self.link_out_event_tx.clone());
+        let mut link = LinkInner::new(destination, self.link_out_event_tx.clone());
 
         let packet = link.request();
 
@@ -1166,7 +1173,7 @@ impl Transport {
             .link_manager
             .insert_out_link(destination.address_hash, link_arc.clone());
 
-        LinkHandle::new(link_arc, self.handler.clone(), id, destination, initiator)
+        Link::new(link_arc, self.handler.clone(), id, destination, initiator)
     }
 
     pub fn out_link_events(&self) -> broadcast::Receiver<LinkEventData> {
@@ -1654,7 +1661,7 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
     // Handle link proofs
     for link in handler.link_manager.out_link_values() {
         let mut link = link.lock().await;
-        if let LinkHandleResult::Activated = link.handle_packet(packet) {
+        if let LinkResult::Activated = link.handle_packet(packet) {
             match link.create_rtt() {
                 Ok(rtt_packet) => handler.send_packet(rtt_packet).await,
                 Err(e) => log::error!("link({}): failed to create RTT packet: {}", link.id(), e),
@@ -1687,7 +1694,7 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
                     let link_guard = link.lock().await;
                     peer_identity = Some(*link_guard.peer_identity());
                 } else {
-                    let out_links: Vec<Arc<Mutex<Link>>> =
+                    let out_links: Vec<Arc<Mutex<LinkInner>>> =
                         handler.link_manager.out_link_values().cloned().collect();
                     for link in out_links {
                         let link_guard = link.lock().await;
@@ -2010,13 +2017,13 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client:
                 (result, link.destination().address_hash, link.is_initiator())
             };
 
-            if let LinkHandleResult::KeepAlive = result {
+            if let LinkResult::KeepAlive = result {
                 let link = link_arc.lock().await;
                 let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
                 handler.send_packet(packet).await;
             }
 
-            if let LinkHandleResult::DataReceived = result {
+            if let LinkResult::DataReceived = result {
                 let should_prove = if initiator {
                     if let Some(dest) = handler.single_out_destinations.get(&dest_hash) {
                         let dest = dest.lock().await;
@@ -2039,7 +2046,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client:
             }
         }
 
-        let out_links: Vec<Arc<Mutex<Link>>> =
+        let out_links: Vec<Arc<Mutex<LinkInner>>> =
             handler.link_manager.out_link_values().cloned().collect();
         for link_arc in out_links {
             let (result, dest_hash, initiator) = {
@@ -2048,7 +2055,7 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client:
                 (result, link.destination().address_hash, link.is_initiator())
             };
 
-            if let LinkHandleResult::DataReceived = result {
+            if let LinkResult::DataReceived = result {
                 let should_prove = if initiator {
                     if let Some(dest) = handler.single_out_destinations.get(&dest_hash) {
                         let dest = dest.lock().await;
@@ -2232,8 +2239,9 @@ async fn handle_announce<'a>(
             }
         }
 
-        // Capture the announced identity before wrapping in Arc<Mutex<>>
+        // Capture the announced identity and desc before wrapping in Arc<Mutex<>>
         let announced_identity = destination.identity;
+        let dest_desc = destination.desc;
 
         let destination = Arc::new(Mutex::new(destination));
 
@@ -2397,7 +2405,7 @@ async fn handle_announce<'a>(
 
         // Emit announce event to subscribers
         let _ = handler.announce_manager.emit(AnnounceEvent {
-            destination,
+            destination: dest_desc,
             app_data: PacketDataBuffer::new_from_slice(app_data),
         });
     } else {
@@ -2424,7 +2432,7 @@ async fn handle_link_request_as_destination<'a>(
                     packet.destination
                 );
 
-                let link = Link::new_from_request(
+                let link = LinkInner::new_from_request(
                     packet,
                     destination.sign_key().clone(),
                     destination.desc,
@@ -3380,7 +3388,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_destination_via_single_out() {
         // When a destination is in single_out_destinations (learned from an announce),
-        // send_to_destination should encrypt and return a PacketReceipt.
+        // send_to_destination should encrypt and return a PacketReceiptInner.
         use crate::destination::{DestinationName, SingleOutputDestination};
 
         let config: TransportConfig = Default::default();
@@ -3408,9 +3416,8 @@ mod tests {
 
         assert!(result.is_ok(), "send_to_destination should succeed for a known destination");
         let receipt = result.unwrap();
-        let receipt_lock = receipt.lock().await;
         // Verify the receipt was created with the correct destination
-        let receipt_dest = receipt_lock.destination_hash()
+        let receipt_dest = receipt.destination_hash()
             .expect("receipt should have a destination hash");
         assert_eq!(
             &receipt_dest[..],
@@ -3817,7 +3824,7 @@ mod tests {
     /// Create an initiator link and a server link, complete the handshake, and
     /// return the (initiator_link, link_id). Both links will be in Active state
     /// with matching derived keys.
-    fn create_active_link_pair() -> (Link, Link, AddressHash) {
+    fn create_active_link_pair() -> (LinkInner, LinkInner, AddressHash) {
         use crate::destination::link::LinkEventData;
 
         // Server destination identity
@@ -3833,14 +3840,14 @@ mod tests {
         let (tx2, _) = tokio::sync::broadcast::channel::<LinkEventData>(16);
 
         // Initiator creates link and sends request
-        let mut initiator = Link::new(dest_desc.clone(), tx1);
+        let mut initiator = LinkInner::new(dest_desc.clone(), tx1);
         let request_packet = initiator.request();
         let link_id = *initiator.id();
 
         // Server creates link from request (using destination's signing key)
         let signing_key = server_priv.sign_key().clone();
         let mut server_link =
-            Link::new_from_request(&request_packet, signing_key, dest_desc.clone(), tx2)
+            LinkInner::new_from_request(&request_packet, signing_key, dest_desc.clone(), tx2)
                 .expect("new_from_request should succeed");
 
         // Server proves the link (also activates server side)
@@ -3851,7 +3858,7 @@ mod tests {
 
         // Initiator handles proof → completes handshake and activates
         let result = initiator.handle_packet(&proof_packet);
-        assert!(matches!(result, LinkHandleResult::Activated));
+        assert!(matches!(result, LinkResult::Activated));
         assert_eq!(initiator.status(), LinkStatus::Active);
         assert_eq!(server_link.status(), LinkStatus::Active);
 
@@ -4004,7 +4011,7 @@ mod tests {
         // Exercises the non-link proof path in handle_proof, which previously
         // used blocking_lock() and would panic inside the tokio runtime.
         use crate::destination::{DestinationName, SingleOutputDestination};
-        use crate::receipt::{generate_proof, PacketReceipt};
+        use crate::receipt::{generate_proof, PacketReceiptInner};
 
         let config: TransportConfig = Default::default();
         let transport = Transport::new(config);
@@ -4034,7 +4041,7 @@ mod tests {
         // Create receipt keyed by the packet's truncated hash, linked to the
         // destination so handle_proof can look up the identity for validation
         let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
-        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt = PacketReceiptInner::new_with_destination(packet_hash, dest_truncated, 0, None);
         let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
 
         // Generate an explicit proof (hash + signature) signed by the remote identity
@@ -4069,7 +4076,7 @@ mod tests {
         // so the proof packet's destination must equal the receipt's truncated
         // hash (first 16 bytes of the original packet hash).
         use crate::destination::{DestinationName, SingleOutputDestination};
-        use crate::receipt::{generate_proof, PacketReceipt};
+        use crate::receipt::{generate_proof, PacketReceiptInner};
 
         let config: TransportConfig = Default::default();
         let transport = Transport::new(config);
@@ -4096,7 +4103,7 @@ mod tests {
         // Receipt stored by truncated packet hash, but destination_hash points
         // to the real destination so handle_proof can look up the identity
         let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
-        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt = PacketReceiptInner::new_with_destination(packet_hash, dest_truncated, 0, None);
         let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
 
         // Implicit proof: signature only, no hash prefix
@@ -4126,7 +4133,7 @@ mod tests {
     async fn test_handle_proof_unknown_destination_does_not_panic() {
         // Receipt exists but destination is not in single_out_destinations.
         // Should not panic or crash — receipt stays undelivered.
-        use crate::receipt::{generate_proof, PacketReceipt};
+        use crate::receipt::{generate_proof, PacketReceiptInner};
 
         let config: TransportConfig = Default::default();
         let transport = Transport::new(config);
@@ -4142,7 +4149,7 @@ mod tests {
         let packet_hash = original_packet.hash().to_bytes();
 
         let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
-        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt = PacketReceiptInner::new_with_destination(packet_hash, dest_truncated, 0, None);
         let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
 
         let proof_data = generate_proof(&packet_hash, &remote_priv, true);
@@ -4169,7 +4176,7 @@ mod tests {
         // Proof is signed by a different identity than the destination's.
         // The proof should fail validation; receipt stays undelivered.
         use crate::destination::{DestinationName, SingleOutputDestination};
-        use crate::receipt::{generate_proof, PacketReceipt};
+        use crate::receipt::{generate_proof, PacketReceiptInner};
 
         let config: TransportConfig = Default::default();
         let transport = Transport::new(config);
@@ -4195,7 +4202,7 @@ mod tests {
         let packet_hash = original_packet.hash().to_bytes();
 
         let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
-        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt = PacketReceiptInner::new_with_destination(packet_hash, dest_truncated, 0, None);
         let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
 
         // Sign with a DIFFERENT identity than the destination's

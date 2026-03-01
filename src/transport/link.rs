@@ -1,9 +1,9 @@
-//! A cloneable, cacheable facade over a `Link` for higher-layer protocols.
+//! A cloneable, cacheable facade over a `LinkInner` for higher-layer protocols.
 //!
-//! `LinkHandle` snapshots immutable link fields (id, destination, initiator) at
+//! `Link` snapshots immutable link fields (id, destination, initiator) at
 //! construction time so consumers can read them without acquiring any lock.
-//! Mutable state reads (status, rtt, …) acquire only the inner `Link` mutex.
-//! Send operations acquire the `Link` mutex to build the packet, then the
+//! Mutable state reads (status, rtt, …) acquire only the inner `LinkInner` mutex.
+//! Send operations acquire the `LinkInner` mutex to build the packet, then the
 //! `TransportHandler` mutex to transmit it, keeping the locking dance internal.
 
 use std::sync::Arc;
@@ -13,12 +13,12 @@ use std::sync::RwLock;
 
 use tokio::sync::Mutex;
 
-use crate::destination::link::{Link, LinkId, LinkStatus, ResourceId};
+use crate::destination::link::{LinkInner, LinkId, LinkStatus, ResourceId};
 use crate::destination::request_receipt::SharedRequestReceipt;
 use crate::destination::DestinationDesc;
 use crate::error::RnsError;
 use crate::identity::{Identity, PrivateIdentity};
-use crate::resource::{Resource, ResourceAdvertisement};
+use crate::resource::{ResourceInner, ResourceAdvertisement};
 
 use super::TransportHandler;
 
@@ -26,29 +26,29 @@ use super::TransportHandler;
 /// and internalises the lock-then-send dance for mutable operations.
 ///
 /// Higher-layer protocols (LXMF, rncp, etc.) should cache this handle instead of
-/// holding `Arc<Mutex<Link>>` directly.
+/// holding `Arc<Mutex<LinkInner>>` directly.
 #[derive(Clone)]
-pub struct LinkHandle {
+pub struct Link {
     // Immutable after handshake — lock-free reads
     id: LinkId,
     destination: DestinationDesc,
     initiator: bool,
 
     // Interior mutable state — locked only when needed
-    inner: Arc<Mutex<Link>>,
+    inner: Arc<Mutex<LinkInner>>,
 
     // Transport send capability — locked to send packets
     handler: Arc<Mutex<TransportHandler>>,
 }
 
-impl LinkHandle {
-    /// Create a new `LinkHandle` by snapshotting the link's immutable fields.
+impl Link {
+    /// Create a new `Link` by snapshotting the link's immutable fields.
     ///
     /// This is crate-private; callers obtain handles from `Transport::link()`,
     /// `Transport::find_out_link()`, or `Transport::find_in_link()`.
     #[allow(private_interfaces)]
     pub(crate) fn new(
-        inner: Arc<Mutex<Link>>,
+        inner: Arc<Mutex<LinkInner>>,
         handler: Arc<Mutex<super::TransportHandler>>,
         id: LinkId,
         destination: DestinationDesc,
@@ -195,7 +195,7 @@ impl LinkHandle {
     /// Returns the resource ID if registered successfully.
     pub async fn register_outgoing_resource(
         &self,
-        resource: Arc<RwLock<Resource>>,
+        resource: Arc<RwLock<ResourceInner>>,
     ) -> Result<ResourceId, RnsError> {
         self.inner.lock().await.register_outgoing_resource(resource)
     }
@@ -208,7 +208,7 @@ impl LinkHandle {
     pub async fn get_outgoing_resource(
         &self,
         resource_id: &ResourceId,
-    ) -> Option<Arc<RwLock<Resource>>> {
+    ) -> Option<Arc<RwLock<ResourceInner>>> {
         self.inner
             .lock()
             .await
@@ -276,9 +276,9 @@ impl LinkHandle {
     }
 }
 
-impl std::fmt::Debug for LinkHandle {
+impl std::fmt::Debug for Link {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LinkHandle")
+        f.debug_struct("Link")
             .field("id", &self.id)
             .field("destination", &self.destination.address_hash)
             .field("initiator", &self.initiator)

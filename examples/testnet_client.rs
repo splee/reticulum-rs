@@ -36,8 +36,7 @@ async fn main() {
                         break;
                     },
                     Ok(announce) = announce.recv() => {
-                        let destination = announce.destination.lock().await;
-                        log::debug!("new announce {}", destination.desc.address_hash);
+                        log::debug!("new announce {}", announce.destination.address_hash);
                     },
                 }
             }

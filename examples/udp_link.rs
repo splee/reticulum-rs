@@ -41,17 +41,16 @@ async fn main() {
     let mut announce_recv = transport.recv_announces().await;
     let mut out_link_events = transport.out_link_events();
 
-    let mut links = HashMap::<AddressHash, reticulum::transport::LinkHandle>::new();
+    let mut links = HashMap::<AddressHash, reticulum::transport::Link>::new();
 
     loop {
         while let Ok(announce) = announce_recv.try_recv() {
-            let destination = announce.destination.lock().await;
-            //println!("ANNOUNCE: {}", destination.desc.address_hash);
-            let link = match links.get(&destination.desc.address_hash) {
+            //println!("ANNOUNCE: {}", announce.destination.address_hash);
+            let link = match links.get(&announce.destination.address_hash) {
                 Some(link) => link.clone(),
                 None => {
-                    let link = transport.link(destination.desc).await;
-                    links.insert(destination.desc.address_hash, link.clone());
+                    let link = transport.link(announce.destination).await;
+                    links.insert(announce.destination.address_hash, link.clone());
                     link
                 }
             };

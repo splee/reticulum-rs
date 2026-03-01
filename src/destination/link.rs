@@ -21,7 +21,7 @@ use crate::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
         RETICULUM_MTU,
     },
-    resource::{Resource, ResourceAdvertisement},
+    resource::{ResourceInner, ResourceAdvertisement},
 };
 
 use super::DestinationDesc;
@@ -187,7 +187,7 @@ impl From<&Packet> for LinkId {
     }
 }
 
-pub enum LinkHandleResult {
+pub enum LinkResult {
     None,
     Activated,
     KeepAlive,
@@ -239,7 +239,7 @@ pub type ResourceId = [u8; 16];
 /// Tracked outgoing resource with state
 pub struct TrackedResource {
     /// The resource being transferred
-    pub resource: Arc<StdRwLock<Resource>>,
+    pub resource: Arc<StdRwLock<ResourceInner>>,
     /// When the resource was registered
     pub registered_at: Instant,
 }
@@ -263,7 +263,7 @@ pub const KEEPALIVE_TIMEOUT_FACTOR: u32 = 4;
 /// Default request timeout
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct Link {
+pub(crate) struct LinkInner {
     id: LinkId,
     destination: DestinationDesc,
     priv_identity: PrivateIdentity,
@@ -328,7 +328,7 @@ pub struct Link {
     traffic_timeout_factor: f64,
 }
 
-impl Link {
+impl LinkInner {
     /// Create a new outgoing link (we are the initiator).
     pub fn new(
         destination: DestinationDesc,
@@ -536,7 +536,7 @@ impl Link {
         }
     }
 
-    fn handle_data_packet(&mut self, packet: &Packet) -> LinkHandleResult {
+    fn handle_data_packet(&mut self, packet: &Packet) -> LinkResult {
         if self.status != LinkStatus::Active {
             log::warn!("link({}): handling data packet in inactive state", self.id);
         }
@@ -548,7 +548,7 @@ impl Link {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
                     self.post_event(LinkEvent::Data(LinkPayload::new_from_slice(plain_text)));
-                    return LinkHandleResult::DataReceived;
+                    return LinkResult::DataReceived;
                 } else {
                     log::error!("link({}): can't decrypt packet", self.id);
                 }
@@ -557,12 +557,12 @@ impl Link {
                 if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFF {
                     self.request_time = Instant::now();
                     log::trace!("link({}): keep-alive request", self.id);
-                    return LinkHandleResult::KeepAlive;
+                    return LinkResult::KeepAlive;
                 }
                 if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFE {
                     log::trace!("link({}): keep-alive response", self.id);
                     self.request_time = Instant::now();
-                    return LinkHandleResult::None;
+                    return LinkResult::None;
                 }
             }
             // Resource packet types - decrypt and post event for higher-level handling
@@ -677,7 +677,7 @@ impl Link {
                 // Only the server (non-initiator) should receive this.
                 if self.initiator {
                     log::warn!("link({}): received LinkIdentify but we are the initiator", self.id);
-                    return LinkHandleResult::None;
+                    return LinkResult::None;
                 }
 
                 let mut buffer = [0u8; PACKET_MDU];
@@ -686,7 +686,7 @@ impl Link {
                     const EXPECTED_LEN: usize = PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH;
                     if plain_text.len() < EXPECTED_LEN {
                         log::warn!("link({}): LinkIdentify packet too short: {} bytes", self.id, plain_text.len());
-                        return LinkHandleResult::None;
+                        return LinkResult::None;
                     }
 
                     let public_key = &plain_text[..PUBLIC_KEY_LENGTH];
@@ -706,7 +706,7 @@ impl Link {
                         Ok(s) => s,
                         Err(_) => {
                             log::warn!("link({}): LinkIdentify invalid signature format", self.id);
-                            return LinkHandleResult::None;
+                            return LinkResult::None;
                         }
                     };
 
@@ -747,7 +747,7 @@ impl Link {
             }
         }
 
-        LinkHandleResult::None
+        LinkResult::None
     }
 
     /// Create a proof packet for a received link data packet.
@@ -776,9 +776,9 @@ impl Link {
         }
     }
 
-    pub fn handle_packet(&mut self, packet: &Packet) -> LinkHandleResult {
+    pub fn handle_packet(&mut self, packet: &Packet) -> LinkResult {
         if packet.destination != self.id {
-            return LinkHandleResult::None;
+            return LinkResult::None;
         }
 
         match packet.header.packet_type {
@@ -800,7 +800,7 @@ impl Link {
 
                         self.post_event(LinkEvent::Activated);
 
-                        return LinkHandleResult::Activated;
+                        return LinkResult::Activated;
                     } else {
                         log::warn!("link({}): proof is not valid", self.id);
                     }
@@ -822,7 +822,7 @@ impl Link {
             _ => {}
         }
 
-        LinkHandleResult::None
+        LinkResult::None
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
@@ -1256,7 +1256,7 @@ impl Link {
 
     /// Register an outgoing resource for tracking and transfer.
     /// Returns the resource ID if registered successfully, or error if limit reached.
-    pub fn register_outgoing_resource(&mut self, resource: Arc<StdRwLock<Resource>>) -> Result<ResourceId, RnsError> {
+    pub fn register_outgoing_resource(&mut self, resource: Arc<StdRwLock<ResourceInner>>) -> Result<ResourceId, RnsError> {
         if self.outgoing_resources.len() >= MAX_OUTGOING_RESOURCES {
             log::warn!("link({}): cannot register outgoing resource, limit reached", self.id);
             return Err(RnsError::InvalidArgument);
@@ -1286,7 +1286,7 @@ impl Link {
 
     /// Register an incoming resource for tracking during reception.
     /// Returns the resource ID if registered successfully.
-    pub fn register_incoming_resource(&mut self, resource: Arc<StdRwLock<Resource>>) -> Result<ResourceId, RnsError> {
+    pub fn register_incoming_resource(&mut self, resource: Arc<StdRwLock<ResourceInner>>) -> Result<ResourceId, RnsError> {
         let resource_id = {
             let resource_guard = resource.read().unwrap_or_else(|p| p.into_inner());
             *resource_guard.truncated_hash()
@@ -2363,7 +2363,7 @@ mod tests {
         fn test_link_new_initial_state() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest.clone(), tx);
+            let link = LinkInner::new(dest.clone(), tx);
 
             assert_eq!(link.status(), LinkStatus::Pending);
             assert!(link.is_initiator());
@@ -2376,7 +2376,7 @@ mod tests {
         fn test_link_request_creates_packet() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest.clone(), tx);
+            let mut link = LinkInner::new(dest.clone(), tx);
 
             let packet = link.request();
 
@@ -2391,7 +2391,7 @@ mod tests {
         fn test_link_request_sets_id() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest.clone(), tx);
+            let mut link = LinkInner::new(dest.clone(), tx);
 
             // ID is empty before request
             assert!(link.id().as_slice().iter().all(|&b| b == 0));
@@ -2408,7 +2408,7 @@ mod tests {
             // Closing a pending link should not produce a LINKCLOSE packet
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let packet = link.close();
 
@@ -2420,7 +2420,7 @@ mod tests {
         fn test_link_restart_sets_pending() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             link.close();
             assert_eq!(link.status(), LinkStatus::Closed);
@@ -2433,7 +2433,7 @@ mod tests {
         fn test_link_mdu() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let mdu = link.mdu();
             // MDU should match Python formula:
@@ -2454,7 +2454,7 @@ mod tests {
         fn test_link_ready_for_new_resource_inactive() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // Link is not active, should not be ready
             assert!(!link.ready_for_new_resource());
@@ -2464,7 +2464,7 @@ mod tests {
         fn test_link_keep_alive_packet() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let packet = link.keep_alive_packet(0xFF);
 
@@ -2479,7 +2479,7 @@ mod tests {
         fn test_link_elapsed() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let elapsed = link.elapsed();
             // Should be very small (just created)
@@ -2490,7 +2490,7 @@ mod tests {
         fn test_link_rtt_initial() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert_eq!(link.rtt(), Duration::from_secs(0));
         }
@@ -2500,7 +2500,7 @@ mod tests {
             let dest = create_test_destination();
             let expected_hash = dest.address_hash;
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert_eq!(link.destination().address_hash, expected_hash);
         }
@@ -2509,23 +2509,23 @@ mod tests {
         fn test_link_remote_identity_initial() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert!(link.remote_identity().is_none());
             assert!(link.remote_identity_hash().is_none());
         }
     }
 
-    /// Tests for Link handle result.
-    mod link_handle_result {
+    /// Tests for LinkResult.
+    mod link_result {
         use super::*;
 
         #[test]
         fn test_handle_result_variants_exist() {
             // Just verify the enum variants exist
-            let _none = LinkHandleResult::None;
-            let _activated = LinkHandleResult::Activated;
-            let _keepalive = LinkHandleResult::KeepAlive;
+            let _none = LinkResult::None;
+            let _activated = LinkResult::Activated;
+            let _keepalive = LinkResult::KeepAlive;
         }
     }
 
@@ -2542,7 +2542,7 @@ mod tests {
         fn test_link_resource_counts_initial() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert_eq!(link.outgoing_resource_count(), 0);
             assert_eq!(link.incoming_resource_count(), 0);
@@ -2552,7 +2552,7 @@ mod tests {
         fn test_link_has_no_resources_initially() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let resource_id: ResourceId = [0u8; 16];
             assert!(!link.has_outgoing_resource(&resource_id));
@@ -2563,7 +2563,7 @@ mod tests {
         fn test_link_get_nonexistent_resource() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let resource_id: ResourceId = [0u8; 16];
             assert!(link.get_outgoing_resource(&resource_id).is_none());
@@ -2574,7 +2574,7 @@ mod tests {
         fn test_link_get_last_resource_window() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // Initial window should be the default
             let window = link.get_last_resource_window();
@@ -2585,7 +2585,7 @@ mod tests {
         fn test_link_get_last_resource_eifr_initial() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert!(link.get_last_resource_eifr().is_none());
         }
@@ -2600,7 +2600,7 @@ mod tests {
         fn test_link_timing_fields_initial() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // All timing fields should be None initially
             assert!(link.last_inbound().is_none());
@@ -2614,7 +2614,7 @@ mod tests {
         fn test_link_record_inbound() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             assert!(link.last_inbound().is_none());
             assert!(link.last_data().is_none());
@@ -2631,7 +2631,7 @@ mod tests {
         fn test_link_record_outbound() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             assert!(link.last_outbound().is_none());
             assert!(link.last_data().is_none());
@@ -2646,7 +2646,7 @@ mod tests {
         fn test_link_record_keepalive() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             assert!(link.last_keepalive().is_none());
 
@@ -2659,7 +2659,7 @@ mod tests {
         fn test_link_mark_activated() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             assert!(link.activated_at().is_none());
 
@@ -2674,7 +2674,7 @@ mod tests {
         fn test_link_keepalive_interval_defaults() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // Default keepalive interval should be between min and max
             let interval = link.keepalive_interval();
@@ -2686,7 +2686,7 @@ mod tests {
         fn test_link_update_keepalive_from_rtt() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             // Set a specific RTT value
             link.rtt = Duration::from_millis(100);
@@ -2704,7 +2704,7 @@ mod tests {
         fn test_link_is_stale_before_activation() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // Without any data activity, is_stale should return false
             // (no last_data to compare against)
@@ -2715,7 +2715,7 @@ mod tests {
         fn test_link_is_stale_after_recent_activity() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             link.record_inbound();
 
@@ -2848,7 +2848,7 @@ mod tests {
             // Binary response data should be passed through directly
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xAAu8; 16];
             let receipt = new_shared_request_receipt(
@@ -2882,7 +2882,7 @@ mod tests {
             // Nil response should produce empty Vec
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xBBu8; 16];
             let receipt = new_shared_request_receipt(
@@ -2914,7 +2914,7 @@ mod tests {
             // Array response (e.g., Python list) should be re-encoded to msgpack bytes
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xCCu8; 16];
             let receipt = new_shared_request_receipt(
@@ -2954,7 +2954,7 @@ mod tests {
             // Integer response (e.g., Python returns an int) should be re-encoded
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xDDu8; 16];
             let receipt = new_shared_request_receipt(
@@ -2990,7 +2990,7 @@ mod tests {
             // String response should be re-encoded
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xEEu8; 16];
             let receipt = new_shared_request_receipt(
@@ -3025,7 +3025,7 @@ mod tests {
             // Response for a non-existent request should be silently ignored
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [0xFFu8; 16];
             let response_value = rmpv::Value::Array(vec![
@@ -3045,7 +3045,7 @@ mod tests {
             // Garbage data should be silently ignored
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             // Should not panic
             link.handle_response(&[0xFF, 0xFF, 0xFF]);
@@ -3056,7 +3056,7 @@ mod tests {
             // A non-array response should be silently ignored
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let value = rmpv::Value::Integer(42.into());
             let mut response_bytes = Vec::new();
@@ -3076,7 +3076,7 @@ mod tests {
         fn test_link_pending_requests_initial() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             assert!(link.pending_requests().is_empty());
         }
@@ -3085,7 +3085,7 @@ mod tests {
         fn test_link_add_pending_request() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [1u8; 16];
             let receipt = new_shared_request_receipt(request_id, std::time::Duration::from_secs(30), None);
@@ -3100,7 +3100,7 @@ mod tests {
         fn test_link_remove_pending_request() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [2u8; 16];
             let receipt = new_shared_request_receipt(request_id, std::time::Duration::from_secs(30), None);
@@ -3117,7 +3117,7 @@ mod tests {
         fn test_link_get_nonexistent_pending_request() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             let request_id: [u8; 16] = [99u8; 16];
             assert!(link.get_pending_request(&request_id).is_none());
@@ -3127,7 +3127,7 @@ mod tests {
         fn test_link_multiple_pending_requests() {
             let dest = super::link_lifecycle::create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
 
             let id1: [u8; 16] = [1u8; 16];
             let id2: [u8; 16] = [2u8; 16];
@@ -3266,10 +3266,10 @@ mod tests {
 
         /// Helper: create a link with Active status for testing packet builders
         /// that require an active link.
-        fn create_active_test_link() -> Link {
+        fn create_active_test_link() -> LinkInner {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
             link.status = LinkStatus::Active;
             link
         }
@@ -3355,7 +3355,7 @@ mod tests {
         fn test_resource_proof_packet_fails_when_not_active() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let link = Link::new(dest, tx);
+            let link = LinkInner::new(dest, tx);
 
             // Link starts in Pending state
             assert_eq!(link.status(), LinkStatus::Pending);
@@ -3371,7 +3371,7 @@ mod tests {
         fn test_resource_proof_packet_fails_when_closed() {
             let dest = create_test_destination();
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            let mut link = Link::new(dest, tx);
+            let mut link = LinkInner::new(dest, tx);
             link.status = LinkStatus::Closed;
 
             let result = link.resource_proof_packet(b"proof");

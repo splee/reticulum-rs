@@ -42,10 +42,10 @@ async fn main() {
             if let Ok(announce) = recv.recv().await {
                 log::debug!(
                     "destination announce {}",
-                    announce.destination.lock().await.desc.address_hash
+                    announce.destination.address_hash
                 );
 
-                let _link = transport.link(announce.destination.lock().await.desc).await;
+                let _link = transport.link(announce.destination).await;
             }
         }
     });

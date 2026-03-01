@@ -166,11 +166,11 @@ fn main() {
 
                 tokio::select! {
                     Ok(event) = announce_rx.recv() => {
-                        let announced_hash = event.destination.lock().await.desc.address_hash;
+                        let announced_hash = event.destination.address_hash;
                         if announced_hash == address_hash {
                             log::info!("Received announce from target destination");
                             println!("ANNOUNCE_RECEIVED={}", dest_hex);
-                            break event.destination.lock().await.desc;
+                            break event.destination;
                         } else {
                             log::debug!(
                                 "Received announce from different destination: {}",
@@ -204,17 +204,16 @@ fn main() {
 
                 tokio::select! {
                     Ok(event) = announce_rx.recv() => {
-                        let dest = event.destination.lock().await;
                         log::info!(
                             "Received announce from: {}",
-                            hex::encode(dest.desc.address_hash.as_slice())
+                            hex::encode(event.destination.address_hash.as_slice())
                         );
                         println!(
                             "ANNOUNCE_RECEIVED={}",
-                            hex::encode(dest.desc.address_hash.as_slice())
+                            hex::encode(event.destination.address_hash.as_slice())
                         );
                         // Accept first announce we see
-                        break dest.desc;
+                        break event.destination;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         // Continue waiting

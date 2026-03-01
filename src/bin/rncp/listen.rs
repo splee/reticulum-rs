@@ -18,8 +18,8 @@ use reticulum::cli::format::format_hash;
 use reticulum::destination::link::{LinkEvent, LinkEventData, LinkId};
 use reticulum::destination::DestinationName;
 use reticulum::packet::RETICULUM_MDU;
-use reticulum::resource::{Resource, ResourceAdvertisement, ResourceConfig};
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::resource::{ResourceAdvertisement, ResourceConfig};
+use reticulum::transport::{Resource, Transport, TransportConfig};
 use tokio::sync::RwLock;
 
 use crate::common::{TrackedIncomingResource, TrackedOutgoingResource, validate_fetch_path};
@@ -323,7 +323,7 @@ async fn handle_listen_link_event(
 
             // Parse HMU: [full_hash (32 bytes)] + [msgpack([segment, hashmap_bytes])]
             if let Some((resource_hash, segment, hashmap_data)) =
-                reticulum::resource::Resource::parse_hashmap_update(payload.as_slice())
+                Resource::parse_hashmap_update(payload.as_slice())
             {
                 let mut resources = incoming_resources.write().await;
                 if let Some(tracked) = resources.get_mut(&resource_hash) {
@@ -380,7 +380,7 @@ async fn handle_resource_advertisement(
             let has_metadata = adv.flags.has_metadata;
 
             match Resource::from_advertisement(&adv, sdu) {
-                Ok(mut resource) => {
+                Ok(resource) => {
                     let truncated_hash = *resource.truncated_hash();
 
                     // Request the first batch of parts
@@ -476,7 +476,7 @@ async fn finalize_received_resource(
     output_dir: &Path,
     allow_overwrite: bool,
 ) {
-    let mut resource = tracked.resource;
+    let resource = tracked.resource;
     let has_metadata = tracked.has_metadata;
 
     // Get raw assembled data

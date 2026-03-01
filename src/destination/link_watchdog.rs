@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::link::{Link, LinkStatus, KEEPALIVE_TIMEOUT_FACTOR, STALE_GRACE};
+use super::link::{LinkInner, LinkStatus, KEEPALIVE_TIMEOUT_FACTOR, STALE_GRACE};
 use crate::hash::AddressHash;
 use crate::packet::{Header, Packet, PacketContext, PacketDataBuffer, PacketType};
 
@@ -92,8 +92,8 @@ impl WatchdogConfig {
 /// # Returns
 ///
 /// A JoinHandle for the spawned task.
-pub fn spawn_link_watchdog(
-    link: Arc<RwLock<Link>>,
+pub(crate) fn spawn_link_watchdog(
+    link: Arc<RwLock<LinkInner>>,
     cancel: CancellationToken,
     msg_tx: broadcast::Sender<WatchdogMessage>,
     config: WatchdogConfig,
@@ -105,7 +105,7 @@ pub fn spawn_link_watchdog(
 
 /// Main watchdog loop.
 async fn link_watchdog_loop(
-    link: Arc<RwLock<Link>>,
+    link: Arc<RwLock<LinkInner>>,
     cancel: CancellationToken,
     msg_tx: broadcast::Sender<WatchdogMessage>,
     config: WatchdogConfig,
@@ -216,7 +216,7 @@ async fn link_watchdog_loop(
 }
 
 /// Create a keepalive packet for a link.
-async fn create_keepalive_packet(link: &Arc<RwLock<Link>>) -> Option<Packet> {
+async fn create_keepalive_packet(link: &Arc<RwLock<LinkInner>>) -> Option<Packet> {
     let link = link.read().await;
 
     if link.status() != LinkStatus::Active {
