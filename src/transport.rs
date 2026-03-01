@@ -1672,7 +1672,7 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
                     // Non-link proof: validate with destination identity
                     let dest_hash_arr = AddressHash::new(*dest_hash);
                     if let Some(dest) = handler.single_out_destinations.get(&dest_hash_arr) {
-                        let dest_lock = dest.blocking_lock();
+                        let dest_lock = dest.lock().await;
                         let identity = &dest_lock.identity;
 
                         if receipt_guard.validate_proof(proof_data, identity) {
@@ -3955,6 +3955,225 @@ mod tests {
             .await;
         assert!(result.is_err(), "should error when link does not exist");
         assert_eq!(result.unwrap_err(), RnsError::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_handle_proof_validates_explicit_proof() {
+        // Exercises the non-link proof path in handle_proof, which previously
+        // used blocking_lock() and would panic inside the tokio runtime.
+        use crate::destination::{DestinationName, SingleOutputDestination};
+        use crate::receipt::{generate_proof, PacketReceipt};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Create a remote identity and register its destination
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let remote_pub = *remote_priv.as_identity();
+        let name = DestinationName::new("test", "proof").unwrap();
+        let dest = SingleOutputDestination::new(remote_pub, name);
+        let address_hash = dest.desc.address_hash;
+
+        handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address_hash, Arc::new(Mutex::new(dest)));
+
+        // Build a packet whose hash we can sign as a proof
+        let mut original_packet: Packet = Default::default();
+        original_packet.header.destination_type = DestinationType::Single;
+        original_packet.header.packet_type = PacketType::Data;
+        original_packet.destination = address_hash;
+        original_packet.data = PacketDataBuffer::new_from_slice(b"test payload");
+        let packet_hash = original_packet.hash().to_bytes();
+
+        // Create receipt keyed by the packet's truncated hash, linked to the
+        // destination so handle_proof can look up the identity for validation
+        let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
+        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
+
+        // Generate an explicit proof (hash + signature) signed by the remote identity
+        let proof_data = generate_proof(&packet_hash, &remote_priv, true);
+
+        // Build a proof packet matching the non-link path:
+        // destination_type != Link, context != LinkRequestProof
+        let mut proof_packet: Packet = Default::default();
+        proof_packet.header.packet_type = PacketType::Proof;
+        proof_packet.header.destination_type = DestinationType::Single;
+        proof_packet.context = PacketContext::None;
+        proof_packet.destination = address_hash;
+        proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
+
+        // This would panic with "Cannot block the current thread from within
+        // a runtime" before the blocking_lock() -> lock().await fix.
+        handle_proof(&proof_packet, handler.lock().await).await;
+
+        // Receipt should now be delivered
+        let receipt_guard = receipt_arc.lock().await;
+        assert!(
+            receipt_guard.is_delivered(),
+            "receipt should be marked Delivered after valid explicit proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_proof_validates_implicit_proof() {
+        // Same code path as explicit, but with an implicit proof (signature only).
+        // For implicit proofs, handle_proof looks up the receipt by
+        // packet.destination (since the data doesn't contain the hash prefix),
+        // so the proof packet's destination must equal the receipt's truncated
+        // hash (first 16 bytes of the original packet hash).
+        use crate::destination::{DestinationName, SingleOutputDestination};
+        use crate::receipt::{generate_proof, PacketReceipt};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let remote_pub = *remote_priv.as_identity();
+        let name = DestinationName::new("test", "implproof").unwrap();
+        let dest = SingleOutputDestination::new(remote_pub, name);
+        let address_hash = dest.desc.address_hash;
+
+        handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address_hash, Arc::new(Mutex::new(dest)));
+
+        let mut original_packet: Packet = Default::default();
+        original_packet.header.destination_type = DestinationType::Single;
+        original_packet.destination = address_hash;
+        original_packet.data = PacketDataBuffer::new_from_slice(b"implicit test");
+        let packet_hash = original_packet.hash().to_bytes();
+
+        // Receipt stored by truncated packet hash, but destination_hash points
+        // to the real destination so handle_proof can look up the identity
+        let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
+        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
+
+        // Implicit proof: signature only, no hash prefix
+        let proof_data = generate_proof(&packet_hash, &remote_priv, false);
+
+        // For implicit proofs, handle_proof uses packet.destination as the
+        // receipt lookup key (since data.len() != EXPLICIT_PROOF_LENGTH).
+        // Set destination to the receipt's truncated hash so the lookup works.
+        let receipt_key: [u8; 16] = packet_hash[..16].try_into().unwrap();
+        let mut proof_packet: Packet = Default::default();
+        proof_packet.header.packet_type = PacketType::Proof;
+        proof_packet.header.destination_type = DestinationType::Single;
+        proof_packet.context = PacketContext::None;
+        proof_packet.destination = AddressHash::new(receipt_key);
+        proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
+
+        handle_proof(&proof_packet, handler.lock().await).await;
+
+        let receipt_guard = receipt_arc.lock().await;
+        assert!(
+            receipt_guard.is_delivered(),
+            "receipt should be marked Delivered after valid implicit proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_proof_unknown_destination_does_not_panic() {
+        // Receipt exists but destination is not in single_out_destinations.
+        // Should not panic or crash — receipt stays undelivered.
+        use crate::receipt::{generate_proof, PacketReceipt};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        let remote_priv = PrivateIdentity::new_from_rand(OsRng);
+        let address_hash = AddressHash::new_from_slice(&[0xAAu8; 32]);
+
+        let mut original_packet: Packet = Default::default();
+        original_packet.header.destination_type = DestinationType::Single;
+        original_packet.destination = address_hash;
+        original_packet.data = PacketDataBuffer::new_from_slice(b"no dest");
+        let packet_hash = original_packet.hash().to_bytes();
+
+        let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
+        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
+
+        let proof_data = generate_proof(&packet_hash, &remote_priv, true);
+
+        let mut proof_packet: Packet = Default::default();
+        proof_packet.header.packet_type = PacketType::Proof;
+        proof_packet.header.destination_type = DestinationType::Single;
+        proof_packet.context = PacketContext::None;
+        proof_packet.destination = address_hash;
+        proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
+
+        // No destination registered — should complete without panic
+        handle_proof(&proof_packet, handler.lock().await).await;
+
+        let receipt_guard = receipt_arc.lock().await;
+        assert!(
+            !receipt_guard.is_delivered(),
+            "receipt should remain undelivered when destination is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_proof_wrong_identity_rejects() {
+        // Proof is signed by a different identity than the destination's.
+        // The proof should fail validation; receipt stays undelivered.
+        use crate::destination::{DestinationName, SingleOutputDestination};
+        use crate::receipt::{generate_proof, PacketReceipt};
+
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+
+        // Register destination with one identity
+        let dest_priv = PrivateIdentity::new_from_rand(OsRng);
+        let dest_pub = *dest_priv.as_identity();
+        let name = DestinationName::new("test", "wrongid").unwrap();
+        let dest = SingleOutputDestination::new(dest_pub, name);
+        let address_hash = dest.desc.address_hash;
+
+        handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address_hash, Arc::new(Mutex::new(dest)));
+
+        let mut original_packet: Packet = Default::default();
+        original_packet.header.destination_type = DestinationType::Single;
+        original_packet.destination = address_hash;
+        original_packet.data = PacketDataBuffer::new_from_slice(b"wrong signer");
+        let packet_hash = original_packet.hash().to_bytes();
+
+        let dest_truncated: [u8; 16] = address_hash.as_slice()[..16].try_into().unwrap();
+        let receipt = PacketReceipt::new_with_destination(packet_hash, dest_truncated, 0, None);
+        let receipt_arc = handler.lock().await.receipt_manager.add(receipt).await;
+
+        // Sign with a DIFFERENT identity than the destination's
+        let attacker_priv = PrivateIdentity::new_from_rand(OsRng);
+        let proof_data = generate_proof(&packet_hash, &attacker_priv, true);
+
+        let mut proof_packet: Packet = Default::default();
+        proof_packet.header.packet_type = PacketType::Proof;
+        proof_packet.header.destination_type = DestinationType::Single;
+        proof_packet.context = PacketContext::None;
+        proof_packet.destination = address_hash;
+        proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
+
+        handle_proof(&proof_packet, handler.lock().await).await;
+
+        let receipt_guard = receipt_arc.lock().await;
+        assert!(
+            !receipt_guard.is_delivered(),
+            "receipt should not be delivered when proof is signed by wrong identity"
+        );
     }
 
 }
