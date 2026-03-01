@@ -1286,6 +1286,21 @@ impl Transport {
         destination_hash: &[u8; 16],
         identity: &Identity,
     ) {
+        self.register_known_identity_with_app_data(destination_hash, identity, None)
+            .await;
+    }
+
+    /// Register a known identity with optional app_data for a destination hash.
+    ///
+    /// Like `register_known_identity()`, but also stores app_data so that
+    /// `recall_app_data()` returns it. Useful for injecting announce-like
+    /// state (e.g. propagation node data) in tests.
+    pub async fn register_known_identity_with_app_data(
+        &self,
+        destination_hash: &[u8; 16],
+        identity: &Identity,
+        app_data: Option<&[u8]>,
+    ) {
         let handler = self.handler.lock().await;
         let mut public_key = Vec::with_capacity(64);
         public_key.extend_from_slice(identity.public_key_bytes());
@@ -1294,7 +1309,7 @@ impl Transport {
             destination_hash,
             &[],          // no packet_hash
             &public_key,
-            None,         // no app_data
+            app_data,
         );
     }
 
@@ -4197,6 +4212,153 @@ mod tests {
             !receipt_guard.is_delivered(),
             "receipt should not be delivered when proof is signed by wrong identity"
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_known_identity_makes_recall_work() {
+        // register_known_identity should populate known_destinations so
+        // that recall_identity returns the registered identity.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = identity.as_identity();
+        let dest_hash_bytes = [0xBBu8; 16];
+        let dest_hash = AddressHash::new(dest_hash_bytes);
+
+        // Before registration, recall should return None.
+        assert!(transport.recall_identity(&dest_hash).await.is_none());
+
+        // Register and verify recall succeeds.
+        transport
+            .register_known_identity(&dest_hash_bytes, &pub_id)
+            .await;
+
+        let recalled = transport
+            .recall_identity(&dest_hash)
+            .await
+            .expect("recall_identity should succeed after register_known_identity");
+
+        assert_eq!(
+            recalled.public_key.as_bytes(),
+            pub_id.public_key.as_bytes(),
+            "recalled public key should match"
+        );
+        assert_eq!(
+            recalled.verifying_key.as_bytes(),
+            pub_id.verifying_key.as_bytes(),
+            "recalled verifying key should match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_known_identity_no_app_data() {
+        // register_known_identity (no app_data variant) should not store
+        // any app_data — recall_app_data should return None.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = identity.as_identity();
+        let dest_hash_bytes = [0xCCu8; 16];
+        let dest_hash = AddressHash::new(dest_hash_bytes);
+
+        transport
+            .register_known_identity(&dest_hash_bytes, &pub_id)
+            .await;
+
+        assert!(
+            transport.recall_app_data(&dest_hash).await.is_none(),
+            "recall_app_data should return None when registered without app_data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_known_identity_with_app_data() {
+        // register_known_identity_with_app_data should store both the
+        // identity and the app_data, making both recallable.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id = identity.as_identity();
+        let dest_hash_bytes = [0xDDu8; 16];
+        let dest_hash = AddressHash::new(dest_hash_bytes);
+
+        let app_data = b"propagation_node_data";
+        transport
+            .register_known_identity_with_app_data(
+                &dest_hash_bytes,
+                &pub_id,
+                Some(app_data),
+            )
+            .await;
+
+        // Identity should be recallable.
+        let recalled = transport
+            .recall_identity(&dest_hash)
+            .await
+            .expect("recall_identity should succeed");
+        assert_eq!(
+            recalled.public_key.as_bytes(),
+            pub_id.public_key.as_bytes(),
+        );
+
+        // App data should be recallable.
+        let recalled_app_data = transport
+            .recall_app_data(&dest_hash)
+            .await
+            .expect("recall_app_data should return the stored app_data");
+        assert_eq!(recalled_app_data, app_data);
+    }
+
+    #[tokio::test]
+    async fn test_register_known_identity_overwrites_previous() {
+        // A second registration for the same destination hash should
+        // overwrite the previous identity and app_data.
+        let config: TransportConfig = Default::default();
+        let transport = Transport::new(config);
+
+        let identity1 = PrivateIdentity::new_from_rand(OsRng);
+        let identity2 = PrivateIdentity::new_from_rand(OsRng);
+        let pub_id1 = identity1.as_identity();
+        let pub_id2 = identity2.as_identity();
+        let dest_hash_bytes = [0xEEu8; 16];
+        let dest_hash = AddressHash::new(dest_hash_bytes);
+
+        // Register first identity with app_data.
+        transport
+            .register_known_identity_with_app_data(
+                &dest_hash_bytes,
+                &pub_id1,
+                Some(b"first"),
+            )
+            .await;
+
+        // Overwrite with second identity and different app_data.
+        transport
+            .register_known_identity_with_app_data(
+                &dest_hash_bytes,
+                &pub_id2,
+                Some(b"second"),
+            )
+            .await;
+
+        let recalled = transport
+            .recall_identity(&dest_hash)
+            .await
+            .expect("recall_identity should succeed");
+        assert_eq!(
+            recalled.public_key.as_bytes(),
+            pub_id2.public_key.as_bytes(),
+            "should recall the second (overwritten) identity"
+        );
+
+        let recalled_app_data = transport
+            .recall_app_data(&dest_hash)
+            .await
+            .expect("recall_app_data should return overwritten data");
+        assert_eq!(recalled_app_data, b"second");
     }
 
 }
