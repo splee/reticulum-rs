@@ -264,7 +264,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Decode hex string to bytes
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
+    if !s.is_ascii() || s.len() % 2 != 0 {
         return Err(());
     }
 
@@ -316,5 +316,15 @@ mod tests {
 
         let decoded = hex_decode(&encoded).unwrap();
         assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn test_hex_decode_non_ascii_returns_error() {
+        assert!(hex_decode("ñabc").is_err());
+    }
+
+    #[test]
+    fn test_hex_decode_odd_length_returns_error() {
+        assert!(hex_decode("abc").is_err());
     }
 }

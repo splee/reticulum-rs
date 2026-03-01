@@ -98,8 +98,14 @@ impl AddressHash {
 
         let mut bytes = [0u8; ADDRESS_HASH_SIZE];
 
+        // Reject non-ASCII input to prevent panics on UTF-8 boundary slicing
+        if !hex_string.is_ascii() {
+            return Err(RnsError::IncorrectHash);
+        }
+
         for i in 0..ADDRESS_HASH_SIZE {
-            bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
+            bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16)
+                .map_err(|_| RnsError::IncorrectHash)?;
         }
 
         Ok(Self(bytes))
@@ -185,5 +191,24 @@ mod tests {
             actual_address_hash.as_slice(),
             original_address_hash.as_slice()
         );
+    }
+
+    #[test]
+    fn address_hex_string_invalid_chars_returns_error() {
+        // 32 hex chars but with invalid 'zz' — should return Err, not panic
+        let bad_hex = "zz112233445566778899aabbccddeeff";
+        assert!(AddressHash::new_from_hex_string(bad_hex).is_err());
+    }
+
+    #[test]
+    fn address_hex_string_non_ascii_returns_error() {
+        // Non-ASCII multi-byte characters that happen to be long enough
+        let non_ascii = "ñ".repeat(16);
+        assert!(AddressHash::new_from_hex_string(&non_ascii).is_err());
+    }
+
+    #[test]
+    fn address_hex_string_too_short_returns_error() {
+        assert!(AddressHash::new_from_hex_string("abcd").is_err());
     }
 }

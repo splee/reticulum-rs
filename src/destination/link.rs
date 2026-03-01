@@ -8,7 +8,7 @@ use std::{
 use ed25519_dalek::{Signature, SigningKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use sha2::Digest;
-use tokio::sync::RwLock;
+use std::sync::RwLock as StdRwLock;
 use x25519_dalek::StaticSecret;
 
 use crate::{
@@ -239,7 +239,7 @@ pub type ResourceId = [u8; 16];
 /// Tracked outgoing resource with state
 pub struct TrackedResource {
     /// The resource being transferred
-    pub resource: Arc<RwLock<Resource>>,
+    pub resource: Arc<StdRwLock<Resource>>,
     /// When the resource was registered
     pub registered_at: Instant,
 }
@@ -985,7 +985,7 @@ impl Link {
         &self.destination
     }
 
-    pub fn create_rtt(&self) -> Packet {
+    pub fn create_rtt(&self) -> Result<Packet, RnsError> {
         let rtt = self.rtt.as_secs_f32();
         let mut buf = Vec::new();
         {
@@ -997,8 +997,7 @@ impl Link {
 
         let token_len = {
             let token = self
-                .encrypt(buf.as_slice(), packet_data.accuire_buf_max())
-                .expect("encrypted data");
+                .encrypt(buf.as_slice(), packet_data.accuire_buf_max())?;
             token.len()
         };
 
@@ -1006,7 +1005,7 @@ impl Link {
 
         log::trace!("link: {} create rtt packet = {} sec", self.id, rtt);
 
-        Packet {
+        Ok(Packet {
             header: Header {
                 destination_type: DestinationType::Link,
                 ..Default::default()
@@ -1017,7 +1016,7 @@ impl Link {
             context: PacketContext::LinkRTT,
             data: packet_data,
             ratchet_id: None,
-        }
+        })
     }
 
     fn handshake(&mut self, peer_identity: Identity) {
@@ -1257,16 +1256,14 @@ impl Link {
 
     /// Register an outgoing resource for tracking and transfer.
     /// Returns the resource ID if registered successfully, or error if limit reached.
-    pub fn register_outgoing_resource(&mut self, resource: Arc<RwLock<Resource>>) -> Result<ResourceId, RnsError> {
+    pub fn register_outgoing_resource(&mut self, resource: Arc<StdRwLock<Resource>>) -> Result<ResourceId, RnsError> {
         if self.outgoing_resources.len() >= MAX_OUTGOING_RESOURCES {
             log::warn!("link({}): cannot register outgoing resource, limit reached", self.id);
             return Err(RnsError::InvalidArgument);
         }
 
-        // Get the truncated hash synchronously by blocking briefly
-        // In production, this should be refactored to be fully async
         let resource_id = {
-            let resource_guard = futures::executor::block_on(resource.read());
+            let resource_guard = resource.read().unwrap_or_else(|p| p.into_inner());
             *resource_guard.truncated_hash()
         };
 
@@ -1289,9 +1286,9 @@ impl Link {
 
     /// Register an incoming resource for tracking during reception.
     /// Returns the resource ID if registered successfully.
-    pub fn register_incoming_resource(&mut self, resource: Arc<RwLock<Resource>>) -> Result<ResourceId, RnsError> {
+    pub fn register_incoming_resource(&mut self, resource: Arc<StdRwLock<Resource>>) -> Result<ResourceId, RnsError> {
         let resource_id = {
-            let resource_guard = futures::executor::block_on(resource.read());
+            let resource_guard = resource.read().unwrap_or_else(|p| p.into_inner());
             *resource_guard.truncated_hash()
         };
 
@@ -1341,7 +1338,7 @@ impl Link {
                 hex::encode(resource_id)
             );
             // Cancel the resource itself
-            let mut resource = futures::executor::block_on(tracked.resource.write());
+            let mut resource = tracked.resource.write().unwrap_or_else(|p| p.into_inner());
             resource.cancel();
             true
         } else {
@@ -1357,7 +1354,7 @@ impl Link {
                 self.id,
                 hex::encode(resource_id)
             );
-            let mut resource = futures::executor::block_on(tracked.resource.write());
+            let mut resource = tracked.resource.write().unwrap_or_else(|p| p.into_inner());
             resource.cancel();
             true
         } else {
@@ -1391,7 +1388,7 @@ impl Link {
     pub fn resource_concluded(&mut self, resource_id: &ResourceId, success: bool) {
         // Check outgoing first
         if let Some(tracked) = self.outgoing_resources.remove(resource_id) {
-            let resource = futures::executor::block_on(tracked.resource.read());
+            let resource = tracked.resource.read().unwrap_or_else(|p| p.into_inner());
             let progress = resource.progress();
 
             if success {
@@ -1413,7 +1410,7 @@ impl Link {
 
         // Check incoming
         if let Some(tracked) = self.incoming_resources.remove(resource_id) {
-            let resource = futures::executor::block_on(tracked.resource.read());
+            let resource = tracked.resource.read().unwrap_or_else(|p| p.into_inner());
             let progress = resource.progress();
 
             if success {
@@ -1910,13 +1907,24 @@ impl Link {
 
         // Look up and resolve the pending request
         if let Some(receipt) = self.pending_requests.remove(&request_id_bytes) {
-            let mut receipt = futures::executor::block_on(receipt.lock());
-            receipt.set_ready(response_data, None);
-            log::debug!(
-                "link({}): resolved request {}",
-                self.id,
-                hex::encode(request_id_bytes)
-            );
+            let locked = receipt.try_lock();
+            if let Ok(mut guard) = locked {
+                guard.set_ready(response_data, None);
+                log::debug!(
+                    "link({}): resolved request {}",
+                    self.id,
+                    hex::encode(request_id_bytes)
+                );
+            } else {
+                // Lock was contended; drop the failed result before re-inserting
+                drop(locked);
+                log::warn!(
+                    "link({}): could not lock receipt for request {}, re-queuing",
+                    self.id,
+                    hex::encode(request_id_bytes)
+                );
+                self.pending_requests.insert(request_id_bytes, receipt);
+            }
         } else {
             log::warn!(
                 "link({}): no pending request for id {}",

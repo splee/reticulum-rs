@@ -11,10 +11,10 @@
 //!   - Sender: cancel if no part requests received within max wait time
 //! - **AwaitingProof**: Query network cache for proof, cancel if retries exhausted
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::constants::*;
@@ -119,7 +119,7 @@ async fn resource_watchdog_loop(
 
         // Read resource state and determine what action to take
         let action = {
-            let res = resource.read().await;
+            let res = resource.read().unwrap_or_else(|p| p.into_inner());
             let status = res.status();
 
             // Exit if resource is past the active transfer states
@@ -140,9 +140,9 @@ async fn resource_watchdog_loop(
                 }
             }
             WatchdogAction::RetryAdvertisement => {
-                let resource_hash = *resource.read().await.hash();
+                let resource_hash = *resource.read().unwrap_or_else(|p| p.into_inner()).hash();
                 {
-                    let mut res = resource.write().await;
+                    let mut res = resource.write().unwrap_or_else(|p| p.into_inner());
                     res.decrement_retries();
                     res.touch_activity();
                     res.mark_adv_sent();
@@ -158,7 +158,7 @@ async fn resource_watchdog_loop(
             }
             WatchdogAction::RequestNextParts => {
                 let (resource_hash, request_data) = {
-                    let mut res = resource.write().await;
+                    let mut res = resource.write().unwrap_or_else(|p| p.into_inner());
                     // Decrease window on timeout (matching Python behavior)
                     res.decrease_window();
                     res.decrement_retries();
@@ -184,7 +184,7 @@ async fn resource_watchdog_loop(
             }
             WatchdogAction::QueryProof => {
                 let (resource_hash, expected_proof) = {
-                    let mut res = resource.write().await;
+                    let mut res = resource.write().unwrap_or_else(|p| p.into_inner());
                     res.decrement_retries();
                     // Reset last_part_sent to now to give more time
                     res.reset_last_part_sent();
@@ -202,7 +202,7 @@ async fn resource_watchdog_loop(
             }
             WatchdogAction::Cancel => {
                 let resource_hash = {
-                    let mut res = resource.write().await;
+                    let mut res = resource.write().unwrap_or_else(|p| p.into_inner());
                     let hash = *res.hash();
                     res.cancel();
                     hash

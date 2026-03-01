@@ -315,8 +315,12 @@ impl TcpClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            if let Err(e) = tx_task.await {
+                log::error!("tcp_client: tx task panicked: {:?}", e);
+            }
+            if let Err(e) = rx_task.await {
+                log::error!("tcp_client: rx task panicked: {:?}", e);
+            }
 
             // Mark interface as offline when disconnected
             metadata.set_online(false);

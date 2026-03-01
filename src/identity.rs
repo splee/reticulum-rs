@@ -157,13 +157,19 @@ impl Identity {
         let mut public_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
         let mut verifying_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
 
+        // Reject non-ASCII input to prevent panics on UTF-8 boundary slicing
+        if !hex_string.is_ascii() {
+            return Err(RnsError::IncorrectHash);
+        }
+
         for i in 0..PUBLIC_KEY_LENGTH {
-            public_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
+            public_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16)
+                .map_err(|_| RnsError::IncorrectHash)?;
             verifying_key_bytes[i] = u8::from_str_radix(
                 &hex_string[PUBLIC_KEY_LENGTH * 2 + (i * 2)..PUBLIC_KEY_LENGTH * 2 + (i * 2) + 2],
                 16,
             )
-            .unwrap();
+            .map_err(|_| RnsError::IncorrectHash)?;
         }
 
         Ok(Self::new_from_slices(
@@ -401,13 +407,19 @@ impl PrivateIdentity {
         let mut private_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
         let mut sign_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
 
+        // Reject non-ASCII input to prevent panics on UTF-8 boundary slicing
+        if !hex_string.is_ascii() {
+            return Err(RnsError::IncorrectHash);
+        }
+
         for i in 0..PUBLIC_KEY_LENGTH {
-            private_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
+            private_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16)
+                .map_err(|_| RnsError::IncorrectHash)?;
             sign_key_bytes[i] = u8::from_str_radix(
                 &hex_string[PUBLIC_KEY_LENGTH * 2 + (i * 2)..PUBLIC_KEY_LENGTH * 2 + (i * 2) + 2],
                 16,
             )
-            .unwrap();
+            .map_err(|_| RnsError::IncorrectHash)?;
         }
 
         Ok(Self::new(
@@ -1053,5 +1065,34 @@ mod tests {
         let decrypted = private_id.decrypt(OsRng, encrypted, &derived_key, &mut dec_buf).unwrap();
 
         assert_eq!(plaintext.as_slice(), decrypted);
+    }
+
+    // =========================================================================
+    // Hex parsing error handling (panic prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_identity_hex_string_invalid_chars_returns_error() {
+        // 128 hex chars but with invalid characters — should return Err, not panic
+        let bad_hex = "zz".repeat(64);
+        assert!(Identity::new_from_hex_string(&bad_hex).is_err());
+    }
+
+    #[test]
+    fn test_identity_hex_string_non_ascii_returns_error() {
+        let non_ascii = "ñ".repeat(64);
+        assert!(Identity::new_from_hex_string(&non_ascii).is_err());
+    }
+
+    #[test]
+    fn test_private_identity_hex_string_invalid_chars_returns_error() {
+        let bad_hex = "gg".repeat(64);
+        assert!(PrivateIdentity::new_from_hex_string(&bad_hex).is_err());
+    }
+
+    #[test]
+    fn test_private_identity_hex_string_non_ascii_returns_error() {
+        let non_ascii = "ö".repeat(64);
+        assert!(PrivateIdentity::new_from_hex_string(&non_ascii).is_err());
     }
 }

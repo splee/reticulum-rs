@@ -574,11 +574,18 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Convert hexadecimal string to bytes
-fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
+/// Convert hexadecimal string to bytes.
+///
+/// Returns an error if the string is not valid ASCII, has odd length,
+/// or contains non-hex characters.
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !hex.is_ascii() || hex.len() % 2 != 0 {
+        return Err("invalid hex string".into());
+    }
+
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.into()))
         .collect()
 }
 
@@ -685,6 +692,22 @@ mod tests {
 
         let converted = hex_to_bytes(&hex).unwrap();
         assert_eq!(converted, bytes);
+    }
+
+    #[test]
+    fn test_hex_to_bytes_odd_length_returns_error() {
+        assert!(hex_to_bytes("abc").is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes_non_ascii_returns_error() {
+        // Non-ASCII would cause a panic on string slicing without the guard
+        assert!(hex_to_bytes("ñabc").is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes_invalid_chars_returns_error() {
+        assert!(hex_to_bytes("zzzz").is_err());
     }
 
     #[test]

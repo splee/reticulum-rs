@@ -176,10 +176,14 @@ impl UdpInterface {
                         }
                     })
                 };
-                tx_task.await.unwrap();
+                if let Err(e) = tx_task.await {
+                    log::error!("udp_interface: tx task panicked: {:?}", e);
+                }
             }
 
-            rx_task.await.unwrap();
+            if let Err(e) = rx_task.await {
+                log::error!("udp_interface: rx task panicked: {:?}", e);
+            }
 
             // Mark interface as offline when closed
             metadata.set_online(false);

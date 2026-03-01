@@ -1445,7 +1445,7 @@ impl Resource {
                     break;
                 }
             }
-        } else if !requested_hashes.is_empty() {
+        } else if requested_hashes.len() >= MAPHASH_LEN {
             // Find the first requested hash in our hashmap
             let first_hash = &requested_hashes[..MAPHASH_LEN];
             for i in 0..self.total_parts {
@@ -1507,12 +1507,12 @@ impl Resource {
     ///
     /// Note: This requires original_data to be available. For incoming resources,
     /// use generate_proof_with_data() after reconstructing the data from parts.
-    pub fn generate_proof(&self) -> Vec<u8> {
+    pub fn generate_proof(&self) -> Result<Vec<u8>, RnsError> {
         let data = self
             .original_data
             .as_ref()
-            .expect("generate_proof requires original_data");
-        self.generate_proof_with_data(data)
+            .ok_or(RnsError::InvalidArgument)?;
+        Ok(self.generate_proof_with_data(data))
     }
 
     /// Generate proof data using the provided data.
@@ -1775,7 +1775,7 @@ mod tests {
             Resource::new(&mut rng, data, ResourceConfig::default(), None, None).expect("create resource");
 
         // Generate proof
-        let proof = resource.generate_proof();
+        let proof = resource.generate_proof().unwrap();
 
         // Verify proof length (32 byte hash + 32 byte proof hash)
         assert_eq!(proof.len(), 64);

@@ -875,11 +875,13 @@ impl Transport {
             .lock()
             .await
             .send_packet(
-                destination
-                    .lock()
-                    .await
-                    .announce(OsRng, app_data)
-                    .expect("valid announce packet"),
+                match destination.lock().await.announce(OsRng, app_data) {
+                    Ok(packet) => packet,
+                    Err(e) => {
+                        log::error!("send_announce: failed to create announce packet: {}", e);
+                        return;
+                    }
+                },
             )
             .await;
     }
@@ -1653,8 +1655,10 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
     for link in handler.link_manager.out_link_values() {
         let mut link = link.lock().await;
         if let LinkHandleResult::Activated = link.handle_packet(packet) {
-            let rtt_packet = link.create_rtt();
-            handler.send_packet(rtt_packet).await;
+            match link.create_rtt() {
+                Ok(rtt_packet) => handler.send_packet(rtt_packet).await,
+                Err(e) => log::error!("link({}): failed to create RTT packet: {}", link.id(), e),
+            }
         }
     }
 

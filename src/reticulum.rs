@@ -745,10 +745,14 @@ impl Reticulum {
     /// - SharedInstance/Standalone: Full transport with network interfaces
     /// - ConnectedToSharedInstance: Client-mode transport with LocalClientInterface
     ///   that relays packets to/from the daemon
+    /// # Panics
+    ///
+    /// Panics if called before transport initialization completes.
+    /// Use `transport_opt()` for a non-panicking alternative.
     pub fn transport(&self) -> &Transport {
         self.transport
             .as_ref()
-            .expect("Transport should always be available")
+            .expect("transport() called before initialization")
     }
 
     /// Returns the transport if available.
@@ -809,7 +813,8 @@ impl Reticulum {
     pub async fn get_interface_stats(&self) -> Result<Vec<InterfaceStats>, ReticulumError> {
         match self.instance_mode {
             InstanceMode::ConnectedToSharedInstance => {
-                let client = self.rpc_client.as_ref().unwrap();
+                let client = self.rpc_client.as_ref()
+                    .ok_or(ReticulumError::InvalidState("RPC client not available"))?;
                 client.get_interface_stats().await.map_err(ReticulumError::Rpc)
             }
             _ => {
@@ -843,7 +848,8 @@ impl Reticulum {
     ) -> Result<Vec<PathEntry>, ReticulumError> {
         match self.instance_mode {
             InstanceMode::ConnectedToSharedInstance => {
-                let client = self.rpc_client.as_ref().unwrap();
+                let client = self.rpc_client.as_ref()
+                    .ok_or(ReticulumError::InvalidState("RPC client not available"))?;
                 client
                     .get_path_table(max_hops.map(|h| h as u32))
                     .await
@@ -874,7 +880,8 @@ impl Reticulum {
     pub async fn get_link_count(&self) -> Result<u64, ReticulumError> {
         match self.instance_mode {
             InstanceMode::ConnectedToSharedInstance => {
-                let client = self.rpc_client.as_ref().unwrap();
+                let client = self.rpc_client.as_ref()
+                    .ok_or(ReticulumError::InvalidState("RPC client not available"))?;
                 client.get_link_count().await.map_err(ReticulumError::Rpc)
             }
             _ => {
@@ -921,6 +928,9 @@ pub enum ReticulumError {
 
     /// Transport error.
     Transport(String),
+
+    /// Invalid internal state (e.g., missing expected resource).
+    InvalidState(&'static str),
 }
 
 impl std::fmt::Display for ReticulumError {
@@ -934,6 +944,7 @@ impl std::fmt::Display for ReticulumError {
             Self::Rpc(e) => write!(f, "RPC error: {}", e),
             Self::Identity(msg) => write!(f, "Identity error: {}", msg),
             Self::Transport(msg) => write!(f, "Transport error: {}", msg),
+            Self::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
         }
     }
 }

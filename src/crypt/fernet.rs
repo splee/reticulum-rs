@@ -138,7 +138,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let chiper_len = AesCbcEnc::new(&self.enc_key, &iv)
             .encrypt_padded_b2b_mut::<Pkcs7>(text.0, &mut out_buf[out_len..])
-            .unwrap()
+            .map_err(|_| RnsError::InvalidArgument)?
             .len();
 
         out_len += chiper_len;
@@ -150,6 +150,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let tag = hmac.finalize().into_bytes();
 
+        if out_len + tag.len() > out_buf.len() {
+            return Err(RnsError::InvalidArgument);
+        }
         out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
         out_len += tag.len();
 
@@ -251,5 +254,19 @@ mod tests {
 
         let mut out_buf = [0u8; 12];
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
+    }
+
+    #[test]
+    fn encrypt_buffer_too_small_for_padding_returns_error() {
+        // Buffer just barely larger than overhead, but too small for AES padding
+        let fernet = Fernet::new_rand(OsRng);
+        let msg = "a]".repeat(32); // 64 bytes of plaintext
+        // Overhead is IV (16) + HMAC (32) = 48, plus padding needs at least 1 block (16)
+        // So 48 + 64 = 112 minimum, but AES padding adds up to 16 bytes.
+        // Provide exactly overhead + plaintext len (no room for padding).
+        let mut out_buf = vec![0u8; 48 + msg.len()];
+        // Should return Err, not panic
+        let result = fernet.encrypt(msg.as_str().into(), &mut out_buf[..]);
+        assert!(result.is_err());
     }
 }

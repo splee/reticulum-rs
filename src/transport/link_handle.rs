@@ -9,7 +9,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, RwLock};
+use std::sync::RwLock;
+
+use tokio::sync::Mutex;
 
 use crate::destination::link::{Link, LinkId, LinkStatus, ResourceId};
 use crate::destination::request_receipt::SharedRequestReceipt;
