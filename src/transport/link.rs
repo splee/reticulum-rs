@@ -9,8 +9,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::sync::RwLock;
-
 use tokio::sync::Mutex;
 
 use crate::destination::link::{LinkInner, LinkId, LinkStatus, ResourceId};
@@ -18,9 +16,9 @@ use crate::destination::request_receipt::SharedRequestReceipt;
 use crate::destination::DestinationDesc;
 use crate::error::RnsError;
 use crate::identity::{Identity, PrivateIdentity};
-use crate::resource::{ResourceInner, ResourceAdvertisement};
+use crate::resource::ResourceAdvertisement;
 
-use super::TransportHandler;
+use super::{Resource, TransportHandler};
 
 /// A cloneable handle to a link that caches immutable fields for lock-free reads
 /// and internalises the lock-then-send dance for mutable operations.
@@ -195,25 +193,26 @@ impl Link {
     /// Returns the resource ID if registered successfully.
     pub async fn register_outgoing_resource(
         &self,
-        resource: Arc<RwLock<ResourceInner>>,
+        resource: &Resource,
     ) -> Result<ResourceId, RnsError> {
-        self.inner.lock().await.register_outgoing_resource(resource)
+        self.inner
+            .lock()
+            .await
+            .register_outgoing_resource(resource.inner_arc().clone())
     }
 
-    /// Get a clone of an outgoing resource's Arc by resource ID.
+    /// Get an outgoing resource by resource ID.
     ///
     /// Returns `None` if no resource with that ID is tracked.
-    /// Note: returns a cloned `Arc`, not a reference, since we can't return
-    /// a borrow through a `MutexGuard`.
     pub async fn get_outgoing_resource(
         &self,
         resource_id: &ResourceId,
-    ) -> Option<Arc<RwLock<ResourceInner>>> {
+    ) -> Option<Resource> {
         self.inner
             .lock()
             .await
             .get_outgoing_resource(resource_id)
-            .map(|tracked| tracked.resource.clone())
+            .map(|tracked| Resource::from_inner(tracked.resource.clone()))
     }
 
     /// Notify the link that a resource transfer has concluded.

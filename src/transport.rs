@@ -912,19 +912,14 @@ impl Transport {
         destination: &RegisteredDestination,
         app_data: Option<&[u8]>,
     ) {
-        self.handler
-            .lock()
-            .await
-            .send_packet(
-                match destination.inner_arc().lock().await.announce(OsRng, app_data) {
-                    Ok(packet) => packet,
-                    Err(e) => {
-                        log::error!("send_announce: failed to create announce packet: {}", e);
-                        return;
-                    }
-                },
-            )
-            .await;
+        let packet = match destination.announce(app_data).await {
+            Ok(packet) => packet,
+            Err(e) => {
+                log::error!("send_announce: failed to create announce packet: {}", e);
+                return;
+            }
+        };
+        self.handler.lock().await.send_packet(packet).await;
     }
 
     pub async fn send_broadcast(&self, packet: Packet, from_iface: Option<AddressHash>) {
