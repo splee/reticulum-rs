@@ -252,6 +252,41 @@ impl Link {
     }
 
     // ========================================================================
+    // Physical layer stats (lock inner only)
+    // ========================================================================
+
+    /// Enable or disable physical layer stats tracking on this link.
+    pub async fn set_track_phy_stats(&self, track: bool) {
+        self.inner.lock().await.set_track_phy_stats(track);
+    }
+
+    /// Whether physical layer stats tracking is enabled.
+    pub async fn track_phy_stats(&self) -> bool {
+        self.inner.lock().await.track_phy_stats()
+    }
+
+    /// Get the last known RSSI value (dBm).
+    pub async fn get_rssi(&self) -> Option<i16> {
+        self.inner.lock().await.get_rssi()
+    }
+
+    /// Get the last known signal-to-noise ratio (dB).
+    pub async fn get_snr(&self) -> Option<f32> {
+        self.inner.lock().await.get_snr()
+    }
+
+    /// Get the last known link quality metric.
+    pub async fn get_q(&self) -> Option<f32> {
+        self.inner.lock().await.get_q()
+    }
+
+    /// Get current physical layer stats (RSSI, SNR, Q) in one lock acquisition.
+    pub async fn get_phy_stats(&self) -> (Option<i16>, Option<f32>, Option<f32>) {
+        let inner = self.inner.lock().await;
+        (inner.get_rssi(), inner.get_snr(), inner.get_q())
+    }
+
+    // ========================================================================
     // High-level request/response (lock inner → build + register → send)
     // ========================================================================
 
