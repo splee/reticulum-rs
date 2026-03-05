@@ -11,13 +11,13 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
-use reticulum::packet::{HeaderType, Packet, PacketDataBuffer, PropagationType};
+use reticulum::packet::{HeaderType, Packet, PacketDataBuffer, TransportType};
 use reticulum::transport::{Transport, TransportConfig};
 
 fn create_data_packet(message: &String, destination: AddressHash) -> Packet {
     let mut packet: Packet = Default::default();
 
-    packet.header.propagation_type = PropagationType::Transport;
+    packet.header.transport_type = TransportType::Transport;
     packet.destination = destination;
     packet.data = PacketDataBuffer::new_from_slice(message.as_bytes());
 
@@ -42,7 +42,7 @@ async fn main() {
     let transport_id = identity.address_hash().clone();
 
     let last_hop_id = PrivateIdentity::new_from_name("last_hop");
-    let last_hop_name = DestinationName::new("last_hop", "app");
+    let last_hop_name = DestinationName::new("last_hop", "app").unwrap();
 
     let last_hop_destination = SingleInputDestination::new(
         last_hop_id.clone(),
@@ -58,17 +58,17 @@ async fn main() {
 
     let our_address = format!("0.0.0.0:{}", our_hop + 5101);
 
-    let _ = transport.iface_manager().lock().await.spawn(
+    let _ = transport.spawn_interface(
         TcpServer::new(our_address, transport.iface_manager()),
         TcpServer::spawn,
-    );
+    ).await;
 
     if our_hop > 0 {
         let connect_to = format!("127.0.0.1:{}", our_hop + 5100);
-        let client_addr = transport.iface_manager().lock().await.spawn(
+        let client_addr = transport.spawn_interface(
             TcpClient::new(connect_to),
             TcpClient::spawn,
-        );
+        ).await;
 
         let destination;
         if our_hop == last_hop {
@@ -78,16 +78,15 @@ async fn main() {
             ).await;
         } else {
             let id = PrivateIdentity::new_from_rand(OsRng);
-            let name = DestinationName::new(&format!("hop-{}", our_hop), "app");
+            let name = DestinationName::new(&format!("hop-{}", our_hop), "app").unwrap();
             destination = transport.add_destination(id, name).await;
         }
 
-        log::info!("Created destination {}", destination.lock().await.desc);
+        log::info!("Created destination {}", destination.desc());
 
         let mut announce = destination
-            .lock()
+            .announce(None)
             .await
-            .announce(OsRng, None)
             .unwrap();
 
         announce.transport = Some(transport_id);
@@ -130,7 +129,19 @@ async fn main() {
                             },
                             LinkEvent::Closed => {
                                 log::info!("Link closed");
-                            }
+                            },
+                            // Resource, channel, identity, and request/response events not handled in this example
+                            LinkEvent::ResourceAdvertisement(_) |
+                            LinkEvent::ResourceData(_) |
+                            LinkEvent::ResourceRequest(_) |
+                            LinkEvent::ResourceHashmapUpdate(_) |
+                            LinkEvent::ResourceProof(_) |
+                            LinkEvent::ResourceInitiatorCancel(_) |
+                            LinkEvent::ResourceReceiverCancel(_) |
+                            LinkEvent::Channel(_) |
+                            LinkEvent::Request(..) |
+                            LinkEvent::Response(_) |
+                            LinkEvent::Identified(_) => {}
                         },
                         Err(error) => {
                             log::info!("Link error: {}", error);
@@ -166,13 +177,9 @@ async fn main() {
                     }
 
                     if let Some(ref link) = link {
-                        let link = link.lock().await;
-
-                        if link.status() == LinkStatus::Active {
+                        if link.status().await == LinkStatus::Active {
                             log::info!("Sending message over link: {}", &message);
-
-                            let packet = link.data_packet(message.as_bytes()).unwrap();
-                            transport.send_packet(packet).await;
+                            link.send_data(message.as_bytes()).await.unwrap();
                             continue;
                         }
                     }

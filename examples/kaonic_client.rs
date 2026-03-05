@@ -2,7 +2,6 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand_core::OsRng;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::kaonic::kaonic_grpc::KaonicGrpc;
@@ -27,14 +26,14 @@ async fn main() {
 
     log::info!("start kaonic client");
 
-    let _ = transport.lock().await.iface_manager().lock().await.spawn(
+    let _ = transport.lock().await.spawn_interface(
         KaonicGrpc::new(
             format!("http://{}", grpc_addr),
             RadioConfig::new_for_module(RadioModule::RadioA),
             None,
         ),
         KaonicGrpc::spawn,
-    );
+    ).await;
 
     let identity = PrivateIdentity::new_from_name("kaonic-example");
 
@@ -43,7 +42,7 @@ async fn main() {
         .await
         .add_destination(
             identity,
-            DestinationName::new("example_utilities", "linkexample"),
+            DestinationName::new("example_utilities", "linkexample").unwrap(),
         )
         .await;
 
@@ -54,10 +53,10 @@ async fn main() {
             loop {
                 log::trace!("announce");
 
-                let _ = transport
+                transport
                     .lock()
                     .await
-                    .send_packet(in_destination.lock().await.announce(OsRng, None).unwrap())
+                    .send_announce(&in_destination, None)
                     .await;
 
                 tokio::time::sleep(Duration::from_secs(3)).await;

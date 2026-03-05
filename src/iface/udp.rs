@@ -6,13 +6,14 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::RxMessage;
+use crate::iface::stats::InterfaceMetadata;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
 use super::{Interface, InterfaceContext};
 
 // TODO: Configure via features
-const PACKET_TRACE: bool = true;
+const PACKET_TRACE: bool = false;
 
 pub struct UdpInterface {
     bind_addr: String,
@@ -31,9 +32,23 @@ impl UdpInterface {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let bind_addr = { context.inner.lock().unwrap().bind_addr.clone() };
-        let forward_addr = { context.inner.lock().unwrap().forward_addr.clone() };
+        let bind_addr = { context.inner.lock().await.bind_addr.clone() };
+        let forward_addr = { context.inner.lock().await.forward_addr.clone() };
         let iface_address = context.channel.address;
+
+        // Create interface metadata for stats tracking
+        let metadata = Arc::new(InterfaceMetadata::new(
+            format!("UDPInterface[{}]", bind_addr),
+            "UDP",
+            "UDPInterface",
+            bind_addr.clone(),
+        ));
+
+        // Register with interface registry if available
+        let registry = context.interface_registry.clone();
+        if let Some(ref reg) = registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -47,8 +62,9 @@ impl UdpInterface {
                 .await
                 .map_err(|_| RnsError::ConnectionError);
 
-            if let Err(_) = socket {
+            if socket.is_err() {
                 log::info!("udp_interface: couldn't bind to <{}>", bind_addr);
+                metadata.set_online(false);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -60,6 +76,8 @@ impl UdpInterface {
             let read_socket = Arc::new(socket);
             let write_socket = read_socket.clone();
 
+            // Mark interface as online
+            metadata.set_online(true);
             log::info!("udp_interface bound to <{}>", bind_addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 3;
@@ -70,6 +88,7 @@ impl UdpInterface {
                 let stop = stop.clone();
                 let socket = read_socket;
                 let rx_channel = rx_channel.clone();
+                let metadata = metadata.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -90,6 +109,9 @@ impl UdpInterface {
                                         break;
                                     }
                                     Ok((n, _in_addr)) => {
+                                        // Track received bytes for stats
+                                        metadata.add_rx_bytes(n as u64);
+
                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&rx_buffer[..n])) {
                                             if PACKET_TRACE {
                                                 log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
@@ -116,6 +138,7 @@ impl UdpInterface {
                     let cancel = cancel.clone();
                     let tx_channel = tx_channel.clone();
                     let socket = write_socket;
+                    let metadata = metadata.clone();
 
                     tokio::spawn(async move {
                         loop {
@@ -140,26 +163,54 @@ impl UdpInterface {
                                         log::trace!("udp_interface: tx >> ({}) {}", iface_address, packet);
                                     }
                                     let mut output = OutputBuffer::new(&mut tx_buffer);
-                                    if let Ok(_) = packet.serialize(&mut output) {
-                                        let _ = socket.send_to(output.as_slice(), &forward_addr).await;
+                                    if packet.serialize(&mut output).is_ok() {
+                                        let output_slice = output.as_slice();
+
+                                        // Track transmitted bytes for stats
+                                        metadata.add_tx_bytes(output_slice.len() as u64);
+
+                                        let _ = socket.send_to(output_slice, &forward_addr).await;
                                     }
                                 }
                             };
                         }
                     })
                 };
-                tx_task.await.unwrap();
+                if let Err(e) = tx_task.await {
+                    log::error!("udp_interface: tx task panicked: {:?}", e);
+                }
             }
 
-            rx_task.await.unwrap();
+            if let Err(e) = rx_task.await {
+                log::error!("udp_interface: rx task panicked: {:?}", e);
+            }
 
+            // Mark interface as offline when closed
+            metadata.set_online(false);
             log::info!("udp_interface <{}>: closed", bind_addr);
+        }
+
+        // Unregister from interface registry on exit
+        if let Some(ref reg) = registry {
+            reg.unregister(&iface_address).await;
         }
     }
 }
 
 impl Interface for UdpInterface {
     fn mtu() -> usize {
-        2048
+        1064 // Reticulum UDP MTU (matches Python implementation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_udp_mtu_1064() {
+        // Verify UDP MTU matches Python implementation (1064 bytes)
+        // Python: RNS/Interfaces/UDPInterface.py UDP_MTU = 1064
+        assert_eq!(UdpInterface::mtu(), 1064);
     }
 }

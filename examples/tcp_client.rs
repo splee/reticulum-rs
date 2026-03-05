@@ -15,14 +15,12 @@ async fn main() {
     let transport = Transport::new(TransportConfig::default());
 
     let client_addr = transport
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn);
+        .spawn_interface(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn)
+        .await;
 
     let id = PrivateIdentity::new_from_rand(OsRng);
 
-    let destination = SingleInputDestination::new(id, DestinationName::new("example", "app"));
+    let mut destination = SingleInputDestination::new(id, DestinationName::new("example", "app").unwrap());
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 

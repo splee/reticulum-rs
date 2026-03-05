@@ -15,10 +15,10 @@ async fn main() {
     let transport = Transport::new(TransportConfig::default());
 
     // https://reticulum.network/manual/gettingstartedfast.html#connect-to-the-public-testnet
-    transport.iface_manager().lock().await.spawn(
+    transport.spawn_interface(
         TcpClient::new("amsterdam.connect.reticulum.network:4965"),
         TcpClient::spawn,
-    );
+    ).await;
 
     let transport = Arc::new(Mutex::new(transport));
     let cancel = CancellationToken::new();
@@ -36,8 +36,7 @@ async fn main() {
                         break;
                     },
                     Ok(announce) = announce.recv() => {
-                        let destination = announce.destination.lock().await;
-                        log::debug!("new announce {}", destination.desc.address_hash);
+                        log::debug!("new announce {}", announce.destination.address_hash);
                     },
                 }
             }

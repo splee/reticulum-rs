@@ -1,0 +1,88 @@
+# Docker Compose for Multi-hop Reticulum Testing
+#
+# Topology:
+#   python-hub <--TCP--> rust-relay <--TCP--> rust-endpoint
+#
+# The rust-endpoint can only reach python-hub via rust-relay,
+# enabling multi-hop routing tests.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.multihop.yml up --build
+
+services:
+  python-hub:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.python
+    container_name: reticulum-python-hub
+    hostname: python-hub
+    networks:
+      - hub-relay-net
+    ports:
+      - "14242:14242"
+    volumes:
+      - python-data:/root/.reticulum
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.connect(('127.0.0.1', 14242)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rust-relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust
+    container_name: reticulum-rust-relay
+    hostname: rust-relay
+    networks:
+      - hub-relay-net
+      - relay-endpoint-net
+    ports:
+      - "14243:14243"
+    volumes:
+      - relay-data:/root/.reticulum
+      - ./configs/rust-relay.conf:/root/.reticulum/config:ro
+    depends_on:
+      python-hub:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 14243 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rust-endpoint:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust
+    container_name: reticulum-rust-endpoint
+    hostname: rust-endpoint
+    networks:
+      - relay-endpoint-net  # Only connected to relay, not hub
+    ports:
+      - "14244:14244"
+    volumes:
+      - endpoint-data:/root/.reticulum
+      - ./configs/rust-endpoint.conf:/root/.reticulum/config:ro
+    depends_on:
+      rust-relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 14244 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+networks:
+  hub-relay-net:
+    driver: bridge
+  relay-endpoint-net:
+    driver: bridge
+
+volumes:
+  python-data:
+  relay-data:
+  endpoint-data:

@@ -14,6 +14,14 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
 - 🔌 Easily embeddable in embedded devices and tactical radios
 - 🧪 Example clients for testnets and real deployments
 
+### Experimental (Non-Python-Compatible)
+
+The following Rust-specific features are kept for experimentation only and are **not**
+wire-compatible with the Python reference implementation:
+
+- Kaonic/gRPC transport and related examples
+- Current discovery subsystem (will be replaced with Python-compatible discovery)
+
 ## Structure
 
 

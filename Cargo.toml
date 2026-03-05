@@ -34,21 +34,63 @@ hkdf = "0.12.4"
 # Hash
 hmac = "0.12.1"
 sha2 = "0.10.8"
+md-5 = "0.10"  # For legacy Python RPC auth (MD5-only clients)
 
 # Random Number generator
+rand = "0.8"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+# Parallel processing
+rayon = "1.10"
 
 # Async IO
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.15"
+futures = "0.3"
 
+# Low-level socket access (for TCP keepalive options)
+socket2 = "0.5"
+
+# Serialization
 rmp = "0.8.14"
+rmpv = "1.0"
 serde = { version = "1.0.219", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+serde-pickle = "1.2"  # Python pickle protocol for RPC compatibility
 
 # Logging
 log = "0.4.27"
 env_logger = "0.10"
+
+# Configuration and paths
+dirs = "5.0"
+lazy_static = "1.4"
+
+# Date/Time
+chrono = "0.4"
+
+# Serialization for persistence
+rmp-serde = "1.1"
+
+# Compression
+flate2 = "1.0"
+bzip2 = "0.4"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
+
+# Hex encoding (for test binaries)
+hex = "0.4"
+
+# Base32/Base64 encoding
+data-encoding = "2.6"
+
+# libc for Linux-specific TCP socket options (TCP_USER_TIMEOUT)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["alloc"]
@@ -57,6 +99,15 @@ fernet-aes128 = []
 
 [build-dependencies]
 tonic-build = "0.13.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+libc = "0.2"  # Also needed in dev for SIGTERM handling in integration tests
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+harness = true
 
 [[example]]
 name = "tcp_server"
@@ -93,3 +144,81 @@ path = "examples/kaonic_mesh.rs"
 [[example]]
 name = "multihop"
 path = "examples/multihop.rs"
+
+[[bin]]
+name = "rnsd"
+path = "src/bin/rnsd.rs"
+test = false
+
+[[bin]]
+name = "rnstatus"
+path = "src/bin/rnstatus.rs"
+test = false
+
+[[bin]]
+name = "rnpath"
+path = "src/bin/rnpath.rs"
+test = false
+
+[[bin]]
+name = "rnid"
+path = "src/bin/rnid.rs"
+
+[[bin]]
+name = "rnprobe"
+path = "src/bin/rnprobe.rs"
+test = false
+
+[[bin]]
+name = "test_destination"
+path = "src/bin/test_destination.rs"
+test = false
+
+[[bin]]
+name = "test_link_server"
+path = "src/bin/test_link_server.rs"
+test = false
+
+[[bin]]
+name = "test_link_client"
+path = "src/bin/test_link_client.rs"
+test = false
+
+[[bin]]
+name = "test_resource_server"
+path = "src/bin/test_resource_server.rs"
+test = false
+
+[[bin]]
+name = "test_resource_client"
+path = "src/bin/test_resource_client.rs"
+test = false
+
+[[bin]]
+name = "rnx"
+path = "src/bin/rnx.rs"
+test = false
+
+[[bin]]
+name = "rncp"
+path = "src/bin/rncp/main.rs"
+
+[[bin]]
+name = "test_packet_codec"
+path = "src/bin/test_packet_codec.rs"
+test = false
+
+[[bin]]
+name = "test_plain_hash"
+path = "src/bin/test_plain_hash.rs"
+test = false
+
+[[bin]]
+name = "test_group_crypto"
+path = "src/bin/test_group_crypto.rs"
+test = false
+
+[[bin]]
+name = "test_crypto_primitives"
+path = "src/bin/test_crypto_primitives.rs"
+test = false

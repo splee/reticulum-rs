@@ -57,7 +57,7 @@ impl AddressHash {
     pub fn deserialize(buffer: &mut InputBuffer) -> Result<AddressHash, RnsError> {
         let mut address = AddressHash::new_empty();
 
-        buffer.read(&mut address.as_mut_slice())?;
+        buffer.read(address.as_mut_slice())?;
 
         Ok(address)
     }
@@ -89,9 +89,10 @@ impl Packet {
             transport,
             context,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
-        buffer.read(&mut packet.data.accuire_buf(buffer.bytes_left()))?;
+        buffer.read(packet.data.accuire_buf(buffer.bytes_left()))?;
 
         Ok(packet)
     }
@@ -106,7 +107,7 @@ mod tests {
         hash::AddressHash,
         packet::{
             DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketType,
-            PropagationType,
+            TransportType,
         },
     };
 
@@ -122,7 +123,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
                 hops: 0,
@@ -132,6 +134,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
         packet.serialize(&mut buffer).expect("serialized packet");
@@ -149,7 +152,8 @@ mod tests {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                propagation_type: PropagationType::Broadcast,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
                 hops: 0,
@@ -159,6 +163,7 @@ mod tests {
             transport: None,
             context: PacketContext::None,
             data: StaticBuffer::new(),
+            ratchet_id: None,
         };
 
         packet.data.safe_write(b"Hello, world!");

@@ -11,12 +11,11 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::destination::link::{Link, LinkEvent, LinkStatus};
+use reticulum::destination::DestinationName;
+use reticulum::destination::link::{LinkEvent, LinkStatus};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
@@ -29,37 +28,33 @@ async fn main() {
     log::info!(">>> UDP LINK APP <<<");
 
     let id = PrivateIdentity::new_from_rand(OsRng);
-    let destination = SingleInputDestination::new(id.clone(), DestinationName::new("example", "app"));
     let transport = Transport::new(TransportConfig::new("server", &id, true));
 
-    let _ = transport.iface_manager().lock().await.spawn(
+    let _ = transport.spawn_interface(
         UdpInterface::new("0.0.0.0:4243", Some("127.0.0.1:4242")),
-        UdpInterface::spawn);
+        UdpInterface::spawn).await;
 
-    let dest = Arc::new(tokio::sync::Mutex::new (destination));
+    let dest = transport.add_destination(id, DestinationName::new("example", "app").unwrap()).await;
 
     let mut announce_recv = transport.recv_announces().await;
     let mut out_link_events = transport.out_link_events();
 
-    let mut links = HashMap::<AddressHash, Arc<tokio::sync::Mutex<Link>>>::new();
+    let mut links = HashMap::<AddressHash, reticulum::transport::Link>::new();
 
     loop {
         while let Ok(announce) = announce_recv.try_recv() {
-            let destination = announce.destination.lock().await;
-            //println!("ANNOUNCE: {}", destination.desc.address_hash);
-            let link = match links.get(&destination.desc.address_hash) {
+            //println!("ANNOUNCE: {}", announce.destination.address_hash);
+            let link = match links.get(&announce.destination.address_hash) {
                 Some(link) => link.clone(),
                 None => {
-                    let link = transport.link(destination.desc).await;
-                    links.insert(destination.desc.address_hash, link.clone());
+                    let link = transport.link(announce.destination).await;
+                    links.insert(announce.destination.address_hash, link.clone());
                     link
                 }
             };
-            let link = link.lock().await;
-            log::info!("link {}: {:?}", link.id(), link.status());
-            if link.status() == LinkStatus::Active {
-                let packet = link.data_packet (b"foo").unwrap();
-                transport.send_packet(packet).await;
+            log::info!("link {}: {:?}", link.id(), link.status().await);
+            if link.status().await == LinkStatus::Active {
+                link.send_data(b"foo").await.unwrap();
             }
         }
         while let Ok(link_event) = out_link_events.try_recv() {
@@ -70,6 +65,18 @@ async fn main() {
                     std::str::from_utf8(payload.as_slice())
                         .map(str::to_string)
                         .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))),
+                // Resource, channel, identity, and request/response events not handled in this example
+                LinkEvent::ResourceAdvertisement(_) |
+                LinkEvent::ResourceData(_) |
+                LinkEvent::ResourceRequest(_) |
+                LinkEvent::ResourceHashmapUpdate(_) |
+                LinkEvent::ResourceProof(_) |
+                LinkEvent::ResourceInitiatorCancel(_) |
+                LinkEvent::ResourceReceiverCancel(_) |
+                LinkEvent::Channel(_) |
+                LinkEvent::Request(..) |
+                LinkEvent::Response(_) |
+                LinkEvent::Identified(_) => {}
             }
         }
         transport

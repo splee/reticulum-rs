@@ -30,19 +30,17 @@ impl Hash {
     }
 
     pub const fn new(hash: [u8; HASH_SIZE]) -> Self {
-        Self { 0: hash }
+        Self(hash)
     }
 
     pub const fn new_empty() -> Self {
-        Self {
-            0: [0u8; HASH_SIZE],
-        }
+        Self([0u8; HASH_SIZE])
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
         let mut hash = [0u8; HASH_SIZE];
         create_hash(data, &mut hash);
-        Self { 0: hash }
+        Self(hash)
     }
 
     pub fn new_from_rand<R: CryptoRngCore>(mut rng: R) -> Self {
@@ -52,7 +50,7 @@ impl Hash {
         rng.fill_bytes(&mut data[..]);
 
         create_hash(&data, &mut hash);
-        Self { 0: hash }
+        Self(hash)
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -74,19 +72,19 @@ impl Hash {
 
 impl AddressHash {
     pub const fn new(hash: [u8; ADDRESS_HASH_SIZE]) -> Self {
-        Self { 0: hash }
+        Self(hash)
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
         let mut hash = [0u8; ADDRESS_HASH_SIZE];
         create_hash(data, &mut hash);
-        Self { 0: hash }
+        Self(hash)
     }
 
     pub fn new_from_hash(hash: &Hash) -> Self {
         let mut address_hash = [0u8; ADDRESS_HASH_SIZE];
         address_hash.copy_from_slice(&hash.0[0..ADDRESS_HASH_SIZE]);
-        Self { 0: address_hash }
+        Self(address_hash)
     }
 
     pub fn new_from_rand<R: CryptoRngCore>(rng: R) -> Self {
@@ -100,17 +98,21 @@ impl AddressHash {
 
         let mut bytes = [0u8; ADDRESS_HASH_SIZE];
 
-        for i in 0..ADDRESS_HASH_SIZE {
-            bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
+        // Reject non-ASCII input to prevent panics on UTF-8 boundary slicing
+        if !hex_string.is_ascii() {
+            return Err(RnsError::IncorrectHash);
         }
 
-        Ok(Self { 0: bytes })
+        for i in 0..ADDRESS_HASH_SIZE {
+            bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16)
+                .map_err(|_| RnsError::IncorrectHash)?;
+        }
+
+        Ok(Self(bytes))
     }
 
     pub const fn new_empty() -> Self {
-        Self {
-            0: [0u8; ADDRESS_HASH_SIZE],
-        }
+        Self([0u8; ADDRESS_HASH_SIZE])
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -123,6 +125,11 @@ impl AddressHash {
 
     pub const fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// AddressHash is a fixed-size type, so it's never empty.
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 
     pub fn to_hex_string(&self) -> String {
@@ -184,5 +191,24 @@ mod tests {
             actual_address_hash.as_slice(),
             original_address_hash.as_slice()
         );
+    }
+
+    #[test]
+    fn address_hex_string_invalid_chars_returns_error() {
+        // 32 hex chars but with invalid 'zz' — should return Err, not panic
+        let bad_hex = "zz112233445566778899aabbccddeeff";
+        assert!(AddressHash::new_from_hex_string(bad_hex).is_err());
+    }
+
+    #[test]
+    fn address_hex_string_non_ascii_returns_error() {
+        // Non-ASCII multi-byte characters that happen to be long enough
+        let non_ascii = "ñ".repeat(16);
+        assert!(AddressHash::new_from_hex_string(&non_ascii).is_err());
+    }
+
+    #[test]
+    fn address_hex_string_too_short_returns_error() {
+        assert!(AddressHash::new_from_hex_string("abcd").is_err());
     }
 }

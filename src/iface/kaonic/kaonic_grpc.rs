@@ -46,8 +46,8 @@ impl KaonicGrpc {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
-        let current_config = { context.inner.lock().unwrap().config.clone() };
+        let addr = { context.inner.lock().await.addr.clone() };
+        let current_config = { context.inner.lock().await.config.clone() };
 
         let iface_address = context.channel.address;
 
@@ -55,7 +55,7 @@ impl KaonicGrpc {
 
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
-        let config_channel = context.inner.lock().unwrap().config_channel.clone();
+        let config_channel = context.inner.lock().await.config_channel.clone();
 
         loop {
             if context.cancel.is_cancelled() {
@@ -158,7 +158,7 @@ impl KaonicGrpc {
                                 },
                                 Some(config) = config_channel.as_mut().unwrap().recv() => {
                                     log::warn!("kaonic_grpc: change config");
-                                    if let Ok(_) = radio_client.configure(config).await {
+                                    if radio_client.configure(config).await.is_ok() {
                                         let mut current_config = current_config.lock().await;
                                         *current_config = config;
                                         log::info!("kaonic_grpc: config has been changed");
@@ -194,14 +194,14 @@ impl KaonicGrpc {
                             Some(message) = tx_channel.recv() => {
                                 let packet = message.packet;
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
-                                if let Ok(_) = packet.serialize(&mut output) {
+                                if packet.serialize(&mut output).is_ok() {
 
                                     let frame = encode_buffer_to_frame(output.as_mut_slice());
 
                                     let module = current_config.lock().await.module;
 
                                     let result = radio_client.transmit(proto::TransmitRequest{
-                                        module: module,
+                                        module,
                                         frame: Some(frame),
                                     }).await;
 
@@ -235,10 +235,9 @@ fn encode_buffer_to_frame(buffer: &mut [u8]) -> RadioFrame {
         .chunks(4)
         .map(|chunk| {
             let mut work = 0u32;
-            let chunk = chunk.iter().as_slice();
 
-            for i in 0..chunk.len() {
-                work |= (chunk[i] as u32) << (i * 8);
+            for (i, &byte) in chunk.iter().enumerate() {
+                work |= (byte as u32) << (i * 8);
             }
 
             work
@@ -263,7 +262,7 @@ fn decode_frame_to_buffer<'a>(
     let mut index = 0usize;
     for word in &frame.data {
         for i in 0..4 {
-            buffer[index] = ((word >> i * 8) & 0xFF) as u8;
+            buffer[index] = ((word >> (i * 8)) & 0xFF) as u8;
 
             index += 1;
 

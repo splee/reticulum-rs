@@ -15,10 +15,10 @@ async fn main() {
         true,
     ));
 
-    let _ = transport.iface_manager().lock().await.spawn(
+    let _ = transport.spawn_interface(
         TcpServer::new("0.0.0.0:4242", transport.iface_manager()),
         TcpServer::spawn,
-    );
+    ).await;
 
     let _ = tokio::signal::ctrl_c().await;
 

@@ -1,0 +1,33 @@
+# Python Reticulum Docker Image
+# For integration testing with Rust implementation
+#
+# Build context should be the reticulum-rust/ directory
+
+FROM python:3.11-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Reticulum from PyPI
+WORKDIR /app
+
+# Install Reticulum from PyPI (uses latest version)
+RUN pip install --no-cache-dir rns
+
+# Create config directory
+RUN mkdir -p /root/.reticulum
+
+# Copy configuration (from docker/configs/)
+COPY docker/configs/python-hub.conf /root/.reticulum/config
+
+# Copy test helper scripts
+COPY tests/integration/helpers /app/helpers
+
+# Expose TCP interface port
+EXPOSE 14242
+
+# Default command - run the daemon with verbose logging
+CMD ["rnsd", "-vvv"]

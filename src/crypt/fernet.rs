@@ -55,13 +55,13 @@ impl<'a> PlainText<'a> {
 
 impl<'a> From<&'a str> for PlainText<'a> {
     fn from(item: &'a str) -> Self {
-        Self { 0: item.as_bytes() }
+        Self(item.as_bytes())
     }
 }
 
 impl<'a> From<&'a [u8]> for PlainText<'a> {
     fn from(item: &'a [u8]) -> Self {
-        Self { 0: item }
+        Self(item)
     }
 }
 
@@ -72,11 +72,15 @@ impl<'a> Token<'a> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+    /// Returns true if the token contains no data.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl<'a> From<&'a [u8]> for Token<'a> {
     fn from(item: &'a [u8]) -> Self {
-        Self { 0: item }
+        Self(item)
     }
 }
 
@@ -98,7 +102,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         Self {
             rng,
-            sign_key: sign_key_bytes.into(),
+            sign_key: sign_key_bytes,
             enc_key: enc_key_bytes.into(),
         }
     }
@@ -134,7 +138,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let chiper_len = AesCbcEnc::new(&self.enc_key, &iv)
             .encrypt_padded_b2b_mut::<Pkcs7>(text.0, &mut out_buf[out_len..])
-            .unwrap()
+            .map_err(|_| RnsError::InvalidArgument)?
             .len();
 
         out_len += chiper_len;
@@ -146,12 +150,13 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let tag = hmac.finalize().into_bytes();
 
+        if out_len + tag.len() > out_buf.len() {
+            return Err(RnsError::InvalidArgument);
+        }
         out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
         out_len += tag.len();
 
-        Ok(Token {
-            0: &out_buf[..out_len],
-        })
+        Ok(Token(&out_buf[..out_len]))
     }
 
     pub fn verify<'a>(&self, token: Token<'a>) -> Result<VerifiedToken<'a>, RnsError> {
@@ -179,7 +184,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
             == cmp::Ordering::Equal;
 
         if valid {
-            Ok(VerifiedToken { 0: token_data })
+            Ok(VerifiedToken(token_data))
         } else {
             Err(RnsError::IncorrectSignature)
         }
@@ -198,7 +203,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let tag_start_index = token_data.len() - HMAC_OUT_SIZE;
 
-        let iv: [u8; IV_KEY_SIZE] = token_data[..IV_KEY_SIZE].try_into().unwrap();
+        let iv: [u8; IV_KEY_SIZE] = token_data[..IV_KEY_SIZE]
+            .try_into()
+            .expect("bounds checked above");
 
         let ciphertext = &token_data[IV_KEY_SIZE..tag_start_index];
 
@@ -206,7 +213,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
             .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
             .map_err(|_| RnsError::CryptoError)?;
 
-        return Ok(PlainText { 0: msg });
+        Ok(PlainText(msg))
     }
 }
 
@@ -247,5 +254,19 @@ mod tests {
 
         let mut out_buf = [0u8; 12];
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
+    }
+
+    #[test]
+    fn encrypt_buffer_too_small_for_padding_returns_error() {
+        // Buffer just barely larger than overhead, but too small for AES padding
+        let fernet = Fernet::new_rand(OsRng);
+        let msg = "a]".repeat(32); // 64 bytes of plaintext
+        // Overhead is IV (16) + HMAC (32) = 48, plus padding needs at least 1 block (16)
+        // So 48 + 64 = 112 minimum, but AES padding adds up to 16 bytes.
+        // Provide exactly overhead + plaintext len (no room for padding).
+        let mut out_buf = vec![0u8; 48 + msg.len()];
+        // Should return Err, not panic
+        let result = fernet.encrypt(msg.as_str().into(), &mut out_buf[..]);
+        assert!(result.is_err());
     }
 }

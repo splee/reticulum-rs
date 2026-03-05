@@ -16,17 +16,15 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
         true,
     ));
 
-    transport.iface_manager().lock().await.spawn(
+    transport.spawn_interface(
         TcpServer::new(server_addr, transport.iface_manager()),
         TcpServer::spawn,
-    );
+    ).await;
 
     for &addr in client_addr {
         transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(TcpClient::new(addr), TcpClient::spawn);
+            .spawn_interface(TcpClient::new(addr), TcpClient::spawn)
+            .await;
     }
 
     log::info!("test: transport {} created", name);
@@ -36,7 +34,7 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 
 #[tokio::test]
 async fn calculate_hop_distance() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
     let mut transport_b = build_transport("b", "127.0.0.1:8082", &["127.0.0.1:8081"]).await;
@@ -48,15 +46,15 @@ async fn calculate_hop_distance() {
     let id_c = PrivateIdentity::new_from_name("c");
 
     let dest_a = transport_a
-        .add_destination(id_a, DestinationName::new("test", "hop"))
+        .add_destination(id_a, DestinationName::new("test", "hop").unwrap())
         .await;
 
     let dest_b = transport_b
-        .add_destination(id_b, DestinationName::new("test", "hop"))
+        .add_destination(id_b, DestinationName::new("test", "hop").unwrap())
         .await;
 
     let dest_c = transport_c
-        .add_destination(id_c, DestinationName::new("test", "hop"))
+        .add_destination(id_c, DestinationName::new("test", "hop").unwrap())
         .await;
 
     time::sleep(Duration::from_secs(2)).await;

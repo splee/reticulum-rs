@@ -1,0 +1,42 @@
+# Build artifacts
+target/
+debug/
+*.rlib
+*.rmeta
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+*.pyc
+__pycache__/
+
+# Documentation
+*.md
+!README.md
+
+# Test artifacts (keep test scripts but exclude temp files)
+*.log
+*.tmp
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Docker (avoid recursive copying)
+docker-compose*.yml
