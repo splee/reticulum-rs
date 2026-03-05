@@ -142,6 +142,8 @@ pub struct TransportConfig {
 pub struct AnnounceEvent {
     pub destination: DestinationDesc,
     pub app_data: PacketDataBuffer,
+    /// Whether this announce originated from the path table (cached) rather than a fresh network announce
+    pub is_path_response: bool,
 }
 
 struct TransportHandler {
@@ -2436,6 +2438,7 @@ async fn handle_announce<'a>(
         let _ = handler.announce_manager.emit(AnnounceEvent {
             destination: dest_desc,
             app_data: PacketDataBuffer::new_from_slice(app_data),
+            is_path_response: packet.context == PacketContext::PathResponse,
         });
     } else {
         log::warn!(
