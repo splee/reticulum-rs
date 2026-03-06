@@ -123,8 +123,16 @@ impl PythonVenv {
 
     /// Create the Python virtual environment.
     fn create_venv(&self) -> Result<(), VenvError> {
+        // Use --upgrade-deps to ensure pip/setuptools are up-to-date.
+        // Without this, the bundled pip can be too old to install packages
+        // that use modern packaging (e.g., pyserial fails with pip 21.2.4).
         let output = Command::new("python3")
-            .args(["-m", "venv", self.venv_path.to_str().unwrap()])
+            .args([
+                "-m",
+                "venv",
+                "--upgrade-deps",
+                self.venv_path.to_str().unwrap(),
+            ])
             .output()?;
 
         if !output.status.success() {
