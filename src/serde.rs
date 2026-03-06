@@ -92,7 +92,7 @@ impl Packet {
             ratchet_id: None,
         };
 
-        buffer.read(packet.data.accuire_buf(buffer.bytes_left()))?;
+        buffer.read(packet.data.accuire_buf(buffer.bytes_left())?)?;
 
         Ok(packet)
     }
@@ -110,6 +110,8 @@ mod tests {
             TransportType,
         },
     };
+
+    use crate::packet::{PACKET_DATA_MAX, RETICULUM_MTU};
 
     use super::Serialize;
 
@@ -179,5 +181,54 @@ mod tests {
         assert_eq!(packet.transport, new_packet.transport);
         assert_eq!(packet.context, new_packet.context);
         assert_eq!(packet.data.as_slice(), new_packet.data.as_slice());
+    }
+
+    /// Verify that a packet whose data exceeds PACKET_DATA_MAX returns an
+    /// error instead of panicking.
+    #[test]
+    fn deserialize_oversized_packet_returns_error() {
+        // Build a raw wire packet with a data payload that exceeds PACKET_DATA_MAX.
+        // Header (Type1): 2 bytes (meta + hops) + 16 bytes destination + 1 byte context = 19 bytes
+        // Fill the remaining space with more data than the buffer can hold.
+        let oversized_data_len = PACKET_DATA_MAX + 1;
+        let wire_len = 2 + 16 + 1 + oversized_data_len; // header + dest + context + data
+        let mut raw = vec![0u8; wire_len];
+        // meta byte: all zeros = Type1, Broadcast, Single, Data
+        raw[0] = 0x00;
+        // hops
+        raw[1] = 0;
+        // destination: 16 zero bytes (already zero)
+        // context byte at offset 18
+        raw[18] = 0x00;
+        // data: fill with 0xAA starting at offset 19
+        for byte in raw[19..].iter_mut() {
+            *byte = 0xAA;
+        }
+
+        let mut input_buffer = InputBuffer::new(&raw);
+        let result = Packet::deserialize(&mut input_buffer);
+        assert!(result.is_err(), "oversized packet should return an error, not panic");
+    }
+
+    /// Verify that a packet using the full MTU worth of data deserializes
+    /// successfully (the largest valid data payload after a Type1 header).
+    #[test]
+    fn deserialize_max_data_packet_succeeds() {
+        // Type1 header consumes 19 bytes, leaving MTU - 19 = 481 bytes for data.
+        let data_len = RETICULUM_MTU - 19;
+        assert!(data_len <= PACKET_DATA_MAX, "data_len must fit in buffer");
+        let wire_len = 19 + data_len;
+        let mut raw = vec![0u8; wire_len];
+        raw[0] = 0x00; // Type1, Broadcast, Single, Data
+        raw[1] = 0;
+        raw[18] = 0x00; // context
+        for byte in raw[19..].iter_mut() {
+            *byte = 0xBB;
+        }
+
+        let mut input_buffer = InputBuffer::new(&raw);
+        let packet = Packet::deserialize(&mut input_buffer).expect("max-data packet should deserialize");
+        assert_eq!(packet.data.len(), data_len);
+        assert!(packet.data.as_slice().iter().all(|&b| b == 0xBB));
     }
 }

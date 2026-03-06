@@ -102,9 +102,14 @@ impl<const N: usize> StaticBuffer<N> {
         &mut self.buffer[..self.len]
     }
 
-    pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
+    /// Acquire a mutable buffer of exactly `len` bytes, setting the
+    /// logical length. Returns `BufferOverflow` if `len` exceeds capacity.
+    pub fn accuire_buf(&mut self, len: usize) -> Result<&mut [u8], RnsError> {
+        if len > N {
+            return Err(RnsError::BufferOverflow);
+        }
         self.len = len;
-        &mut self.buffer[..self.len]
+        Ok(&mut self.buffer[..self.len])
     }
 
     pub fn accuire_buf_max(&mut self) -> &mut [u8] {
@@ -475,9 +480,23 @@ mod tests {
         #[test]
         fn test_accuire_buf_sets_length() {
             let mut buffer = StaticBuffer::<256>::new();
-            let slice = buffer.accuire_buf(10);
+            let slice = buffer.accuire_buf(10).unwrap();
             assert_eq!(slice.len(), 10);
             assert_eq!(buffer.len(), 10);
+        }
+
+        #[test]
+        fn test_accuire_buf_overflow_returns_error() {
+            let mut buffer = StaticBuffer::<10>::new();
+            assert_eq!(buffer.accuire_buf(11), Err(RnsError::BufferOverflow));
+            assert_eq!(buffer.len(), 0); // Length unchanged on error
+        }
+
+        #[test]
+        fn test_accuire_buf_exact_capacity_succeeds() {
+            let mut buffer = StaticBuffer::<10>::new();
+            let slice = buffer.accuire_buf(10).unwrap();
+            assert_eq!(slice.len(), 10);
         }
 
         #[test]

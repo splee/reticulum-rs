@@ -24,6 +24,8 @@ pub enum RnsError {
     ResourceRequired,
     /// No identity is known for the target destination hash
     UnknownDestination,
+    /// Buffer write/acquire exceeded the fixed capacity
+    BufferOverflow,
 }
 
 impl fmt::Display for RnsError {
@@ -43,6 +45,7 @@ impl fmt::Display for RnsError {
             RnsError::ParseError => write!(f, "parse error"),
             RnsError::ResourceRequired => write!(f, "resource required for large data"),
             RnsError::UnknownDestination => write!(f, "no known identity for destination"),
+            RnsError::BufferOverflow => write!(f, "buffer overflow"),
         }
     }
 }
