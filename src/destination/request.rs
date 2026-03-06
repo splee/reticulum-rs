@@ -24,12 +24,19 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sha2::{Sha256, Digest};
 
+/// A shared, interior-mutable allow list that can be modified at runtime.
+///
+/// Callers hold a clone of this handle and can add/remove identity hashes
+/// without re-registering the request handler. This mirrors Python's behavior
+/// where `allowed_list` is a mutable list passed by reference.
+pub type SharedAllowList = Arc<RwLock<Vec<[u8; 16]>>>;
+
 /// Access control policy for request handlers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[derive(Default)]
 pub enum AllowPolicy {
     /// No requests allowed (handler disabled).
@@ -39,11 +46,36 @@ pub enum AllowPolicy {
     AllowAll,
     /// Only peers in the allowed list can make requests.
     /// The list contains truncated identity hashes (16 bytes each).
-    AllowList(Vec<[u8; 16]>),
+    /// Uses `Arc<RwLock<...>>` so the list can be mutated at runtime
+    /// by callers who hold a clone of the `SharedAllowList`.
+    AllowList(SharedAllowList),
 }
 
+impl PartialEq for AllowPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AllowPolicy::AllowNone, AllowPolicy::AllowNone) => true,
+            (AllowPolicy::AllowAll, AllowPolicy::AllowAll) => true,
+            (AllowPolicy::AllowList(a), AllowPolicy::AllowList(b)) => {
+                let a = a.read().expect("AllowList lock poisoned");
+                let b = b.read().expect("AllowList lock poisoned");
+                *a == *b
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AllowPolicy {}
 
 impl AllowPolicy {
+    /// Create a new AllowList policy, returning the policy and a shared handle
+    /// that callers can use to mutate the list at runtime.
+    pub fn new_allow_list(identities: Vec<[u8; 16]>) -> (Self, SharedAllowList) {
+        let list = Arc::new(RwLock::new(identities));
+        (AllowPolicy::AllowList(Arc::clone(&list)), list)
+    }
+
     /// Check if a remote identity is allowed by this policy.
     ///
     /// # Arguments
@@ -57,7 +89,8 @@ impl AllowPolicy {
             AllowPolicy::AllowAll => remote_identity_hash.is_some(),
             AllowPolicy::AllowList(allowed) => {
                 if let Some(hash) = remote_identity_hash {
-                    allowed.iter().any(|h| h == hash)
+                    let list = allowed.read().expect("AllowList lock poisoned");
+                    list.iter().any(|h| h == hash)
                 } else {
                     false
                 }
@@ -458,10 +491,19 @@ mod tests {
         assert!(!policy.is_allowed(None));
 
         // AllowList only allows listed identities
-        let policy = AllowPolicy::AllowList(vec![identity]);
+        let (policy, _handle) = AllowPolicy::new_allow_list(vec![identity]);
         assert!(policy.is_allowed(Some(&identity)));
         assert!(!policy.is_allowed(Some(&other_identity)));
         assert!(!policy.is_allowed(None));
+
+        // AllowList can be mutated at runtime via the shared handle
+        let (policy, handle) = AllowPolicy::new_allow_list(vec![identity]);
+        assert!(!policy.is_allowed(Some(&other_identity)));
+        handle.write().expect("lock").push(other_identity);
+        assert!(policy.is_allowed(Some(&other_identity)));
+        // Removing from the list is also reflected
+        handle.write().expect("lock").retain(|h| *h != identity);
+        assert!(!policy.is_allowed(Some(&identity)));
     }
 
     #[test]

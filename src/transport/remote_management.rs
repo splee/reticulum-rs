@@ -89,11 +89,18 @@ impl RemoteManagementConfig {
     }
 
     /// Create a new config with a specific allow list.
-    pub fn allow_list(identities: Vec<[u8; 16]>) -> Self {
-        Self {
-            enabled: true,
-            allow_policy: AllowPolicy::AllowList(identities),
-        }
+    ///
+    /// Returns the config and a `SharedAllowList` handle that can be used
+    /// to add/remove identities at runtime.
+    pub fn allow_list(identities: Vec<[u8; 16]>) -> (Self, crate::destination::request::SharedAllowList) {
+        let (policy, handle) = AllowPolicy::new_allow_list(identities);
+        (
+            Self {
+                enabled: true,
+                allow_policy: policy,
+            },
+            handle,
+        )
     }
 }
 
