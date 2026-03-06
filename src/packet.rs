@@ -37,6 +37,17 @@ const _: () = assert!(ENCRYPTED_MDU == 383);
 
 // Packet payload buffer size (plain MDU)
 pub const PACKET_MDU: usize = RETICULUM_MDU;
+
+/// Maximum wire-level data payload after the smallest possible header.
+///
+/// This differs from RETICULUM_MDU (464), which is the max *plaintext* data
+/// assuming HEADER_MAX_SIZE. Link-encrypted packets use HEADER_MIN_SIZE,
+/// so their ciphertext can be larger than RETICULUM_MDU on the wire.
+///
+/// Using the full MTU as the buffer capacity guarantees that any single
+/// packet's data portion fits, regardless of header type.
+pub const PACKET_DATA_MAX: usize = RETICULUM_MTU;
+
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -286,7 +297,7 @@ impl fmt::Display for Header {
     }
 }
 
-pub type PacketDataBuffer = StaticBuffer<PACKET_MDU>;
+pub type PacketDataBuffer = StaticBuffer<PACKET_DATA_MAX>;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct PacketIfac {
