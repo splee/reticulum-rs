@@ -638,18 +638,11 @@ impl Transport {
                                         ).await {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
-                                            if let Some(link) = handler.link_manager.get_in_link(&event.id) {
-                                                let link = link.lock().await;
-                                                if link.status() == LinkStatus::Active {
-                                                    if let Ok(packet) = link.response_packet(&response) {
-                                                        handler.send_packet(packet).await;
-                                                        log::debug!(
-                                                            "remote_management: sent response on link {}",
-                                                            event.id
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                            handler.send_response_on_link(
+                                                &event.id,
+                                                &response,
+                                                "remote_management",
+                                            ).await;
                                         }
                                     }
                                     LinkEvent::Closed => {
@@ -765,18 +758,11 @@ impl Transport {
                                         ).await {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
-                                            if let Some(link) = handler.link_manager.get_in_link(&event.id) {
-                                                let link = link.lock().await;
-                                                if link.status() == LinkStatus::Active {
-                                                    if let Ok(packet) = link.response_packet(&response) {
-                                                        handler.send_packet(packet).await;
-                                                        log::debug!(
-                                                            "blackhole_info: sent response on link {}",
-                                                            event.id
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                            handler.send_response_on_link(
+                                                &event.id,
+                                                &response,
+                                                "blackhole_info",
+                                            ).await;
                                         }
                                     }
                                     LinkEvent::Closed => {
@@ -897,18 +883,11 @@ impl Transport {
                                         match pack_response(request_id, &response_data) {
                                             Ok(packed) => {
                                                 let handler = transport.lock().await;
-                                                if let Some(link) = handler.link_manager.get_in_link(&event.id) {
-                                                    let link = link.lock().await;
-                                                    if link.status() == LinkStatus::Active {
-                                                        if let Ok(packet) = link.response_packet(&packed) {
-                                                            handler.send_packet(packet).await;
-                                                            log::debug!(
-                                                                "request_dispatch({}): sent response on link {}",
-                                                                dest_hash, event.id
-                                                            );
-                                                        }
-                                                    }
-                                                }
+                                                handler.send_response_on_link(
+                                                    &event.id,
+                                                    &packed,
+                                                    &format!("request_dispatch({})", dest_hash),
+                                                ).await;
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -1149,31 +1128,51 @@ impl Transport {
     /// Send a resource request packet on an incoming link by link ID.
     pub async fn send_resource_request(&self, link_id: &AddressHash, request_data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_in_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_request_packet(request_data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_in_link(link_id) else {
+            log::warn!("send_resource_request: in-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_request: in-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_request_packet(request_data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_request: failed to create packet on in-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     /// Send a resource proof packet on an incoming link by link ID.
     pub async fn send_resource_proof(&self, link_id: &AddressHash, proof_data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_in_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_proof_packet(proof_data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_in_link(link_id) else {
+            log::warn!("send_resource_proof: in-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_proof: in-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_proof_packet(proof_data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_proof: failed to create packet on in-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     /// Get the remote identity from an inbound link, if the peer has identified.
@@ -1195,62 +1194,102 @@ impl Transport {
     /// Used when receiving a resource from a remote server (e.g., propagation node).
     pub async fn send_resource_request_out(&self, link_id: &AddressHash, request_data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_out_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_request_packet(request_data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_out_link(link_id) else {
+            log::warn!("send_resource_request_out: out-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_request_out: out-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_request_packet(request_data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_request_out: failed to create packet on out-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     /// Send a resource proof packet on an outgoing link by address hash.
     /// Used when receiving a resource from a remote server (e.g., propagation node).
     pub async fn send_resource_proof_out(&self, link_id: &AddressHash, proof_data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_out_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_proof_packet(proof_data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_out_link(link_id) else {
+            log::warn!("send_resource_proof_out: out-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_proof_out: out-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_proof_packet(proof_data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_proof_out: failed to create packet on out-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     /// Send a resource data packet on an outgoing link by link ID (for sender side).
     pub async fn send_resource_data(&self, link_id: &AddressHash, data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_out_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_data_packet(data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_out_link(link_id) else {
+            log::warn!("send_resource_data: out-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_data: out-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_data_packet(data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_data: failed to create packet on out-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     /// Send a resource hashmap update packet on an outgoing link by link ID (for sender side).
     pub async fn send_resource_hashmap_update(&self, link_id: &AddressHash, hashmap_data: &[u8]) -> bool {
         let handler = self.handler.lock().await;
-        if let Some(link) = handler.link_manager.get_out_link(link_id) {
-            let link = link.lock().await;
-            if link.status() == LinkStatus::Active {
-                if let Ok(packet) = link.resource_hashmap_update_packet(hashmap_data) {
-                    handler.send_packet(packet).await;
-                    return true;
-                }
+        let Some(link_arc) = handler.link_manager.get_out_link(link_id) else {
+            log::warn!("send_resource_hashmap_update: out-link {} not found", link_id);
+            return false;
+        };
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("send_resource_hashmap_update: out-link {} is {:?}", link_id, status);
+            return false;
+        }
+        match link.resource_hashmap_update_packet(hashmap_data) {
+            Ok(packet) => {
+                handler.send_packet(packet).await;
+                true
+            }
+            Err(e) => {
+                log::warn!("send_resource_hashmap_update: failed to create packet on out-link {}: {}", link_id, e);
+                false
             }
         }
-        false
     }
 
     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Link> {
@@ -1741,6 +1780,42 @@ impl Drop for Transport {
 }
 
 impl TransportHandler {
+    /// Send a response packet on an inbound link, logging all failure modes.
+    ///
+    /// Consolidates the repeated "look up link, check status, encrypt, send"
+    /// pattern used by request dispatch, remote management, and blackhole info.
+    /// Returns `true` if the response was sent successfully.
+    async fn send_response_on_link(
+        &self,
+        link_id: &AddressHash,
+        data: &[u8],
+        label: &str,
+    ) -> bool {
+        let Some(link_arc) = self.link_manager.get_in_link(link_id) else {
+            log::warn!("{}: link {} not found, cannot send response", label, link_id);
+            return false;
+        };
+
+        let link = link_arc.lock().await;
+        let status = link.status();
+        if status != LinkStatus::Active {
+            log::warn!("{}: link {} is {:?}, cannot send response", label, link_id, status);
+            return false;
+        }
+
+        match link.response_packet(data) {
+            Ok(packet) => {
+                self.send_packet(packet).await;
+                log::debug!("{}: sent response on link {}", label, link_id);
+                true
+            }
+            Err(e) => {
+                log::warn!("{}: failed to create response packet on link {}: {}", label, link_id, e);
+                false
+            }
+        }
+    }
+
     async fn send_packet(&self, packet: Packet) {
         // Check if destination needs routing through path_table
         // This adds HEADER_2 routing for remote destinations (hops > 1)
