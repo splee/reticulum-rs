@@ -8,11 +8,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use rand_core::OsRng;
 
 use crate::destination::proof::ProofStrategy;
+use crate::destination::request::{RequestHandler, RequestRouter};
 use crate::destination::{
     DecryptResult, DefaultAppDataCallback, DestinationDesc, DestinationName,
     SingleInputDestination,
@@ -33,12 +34,19 @@ pub struct RegisteredDestination {
 
     // Interior mutable state
     inner: Arc<Mutex<SingleInputDestination>>,
+
+    // Path-based request routing with async handler support
+    router: Arc<RwLock<RequestRouter>>,
 }
 
 impl RegisteredDestination {
     /// Wrap an existing `SingleInputDestination` in a facade.
     pub(crate) fn new(inner: Arc<Mutex<SingleInputDestination>>, desc: DestinationDesc) -> Self {
-        Self { desc, inner }
+        Self {
+            desc,
+            inner,
+            router: Arc::new(RwLock::new(RequestRouter::new())),
+        }
     }
 
     // ========================================================================
@@ -118,6 +126,31 @@ impl RegisteredDestination {
     /// Mirrors Python's `Destination.set_default_app_data(callable)`.
     pub async fn set_default_app_data(&self, callback: DefaultAppDataCallback) {
         self.inner.lock().await.set_default_app_data(callback);
+    }
+
+    // ========================================================================
+    // Request handler registration
+    // ========================================================================
+
+    /// Register a path-based request handler.
+    ///
+    /// Matches Python's `Destination.register_request_handler()`. Use with
+    /// `Transport::start_request_dispatch()` to route incoming link requests
+    /// through the registered handlers.
+    pub async fn register_request_handler(&self, handler: RequestHandler) {
+        self.router.write().await.register(handler);
+    }
+
+    /// Deregister a request handler by path.
+    ///
+    /// Returns true if a handler was removed.
+    pub async fn deregister_request_handler(&self, path: &str) -> bool {
+        self.router.write().await.deregister(path).is_some()
+    }
+
+    /// Access the shared request router (used by dispatch tasks).
+    pub fn router(&self) -> &Arc<RwLock<RequestRouter>> {
+        &self.router
     }
 
     // ========================================================================

@@ -22,6 +22,8 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use sha2::{Sha256, Digest};
@@ -64,9 +66,9 @@ impl AllowPolicy {
     }
 }
 
-/// Handler function type for request processing.
+/// Async handler function type for request processing.
 ///
-/// Arguments:
+/// Arguments (owned for async safety — the future must be `'static`):
 /// - `path`: The request path string
 /// - `data`: Request data (deserialized from msgpack)
 /// - `request_id`: Unique identifier for this request
@@ -77,16 +79,40 @@ impl AllowPolicy {
 /// Returns: Optional response data to send back (None = no response)
 pub type RequestHandlerFn = Arc<
     dyn Fn(
-            &str,                    // path
-            &[u8],                   // data
-            &[u8; 16],               // request_id
-            &[u8],                   // link_id
-            Option<&[u8; 16]>,       // remote_identity
+            String,                  // path
+            Vec<u8>,                 // data
+            [u8; 16],                // request_id
+            Vec<u8>,                 // link_id
+            Option<[u8; 16]>,        // remote_identity
             f64,                     // requested_at
-        ) -> Option<Vec<u8>>
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Wrap a synchronous handler function as an async `RequestHandlerFn`.
+///
+/// This lets existing sync handlers work with the async handler infrastructure
+/// without requiring the caller to deal with futures directly.
+pub fn sync_handler<F>(f: F) -> RequestHandlerFn
+where
+    F: Fn(&str, &[u8], &[u8; 16], &[u8], Option<&[u8; 16]>, f64) -> Option<Vec<u8>>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(move |path, data, request_id, link_id, remote_identity, requested_at| {
+        let result = f(
+            &path,
+            &data,
+            &request_id,
+            &link_id,
+            remote_identity.as_ref(),
+            requested_at,
+        );
+        Box::pin(async move { result })
+    })
+}
 
 /// Configuration for a registered request handler.
 #[derive(Clone)]
@@ -102,8 +128,33 @@ pub struct RequestHandler {
 }
 
 impl RequestHandler {
-    /// Create a new request handler.
-    pub fn new<F>(path: impl Into<String>, handler: F, allow: AllowPolicy) -> Self
+    /// Create a new request handler with an async closure.
+    ///
+    /// The closure receives owned parameters and returns a boxed future.
+    /// For sync handlers, use `new_sync()` instead.
+    pub fn new<F, Fut>(path: impl Into<String>, handler: F, allow: AllowPolicy) -> Self
+    where
+        F: Fn(String, Vec<u8>, [u8; 16], Vec<u8>, Option<[u8; 16]>, f64) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        Self {
+            path: path.into(),
+            handler: Arc::new(move |path, data, request_id, link_id, remote_identity, requested_at| {
+                Box::pin(handler(path, data, request_id, link_id, remote_identity, requested_at))
+            }),
+            allow,
+            auto_compress: true,
+        }
+    }
+
+    /// Create a new request handler with a synchronous closure.
+    ///
+    /// Convenience wrapper that adapts a sync handler (with borrowed params)
+    /// to the async `RequestHandlerFn` type.
+    pub fn new_sync<F>(path: impl Into<String>, handler: F, allow: AllowPolicy) -> Self
     where
         F: Fn(&str, &[u8], &[u8; 16], &[u8], Option<&[u8; 16]>, f64) -> Option<Vec<u8>>
             + Send
@@ -112,7 +163,7 @@ impl RequestHandler {
     {
         Self {
             path: path.into(),
-            handler: Arc::new(handler),
+            handler: sync_handler(handler),
             allow,
             auto_compress: true,
         }
@@ -129,8 +180,8 @@ impl RequestHandler {
         self.allow.is_allowed(remote_identity)
     }
 
-    /// Invoke the handler.
-    pub fn invoke(
+    /// Invoke the handler asynchronously.
+    pub async fn invoke(
         &self,
         data: &[u8],
         request_id: &[u8; 16],
@@ -138,7 +189,14 @@ impl RequestHandler {
         remote_identity: Option<&[u8; 16]>,
         requested_at: f64,
     ) -> Option<Vec<u8>> {
-        (self.handler)(&self.path, data, request_id, link_id, remote_identity, requested_at)
+        (self.handler)(
+            self.path.clone(),
+            data.to_vec(),
+            *request_id,
+            link_id.to_vec(),
+            remote_identity.copied(),
+            requested_at,
+        ).await
     }
 }
 
@@ -235,7 +293,7 @@ impl RequestRouter {
     /// - `Ok(Some(response))` - Handler was found and returned a response
     /// - `Ok(None)` - Handler was found but returned no response
     /// - `Err(RequestError)` - Handler not found or access denied
-    pub fn handle_request(
+    pub async fn handle_request(
         &self,
         path_hash: &[u8; 16],
         data: &[u8],
@@ -250,7 +308,7 @@ impl RequestRouter {
             return Err(RequestError::AccessDenied);
         }
 
-        Ok(handler.invoke(data, request_id, link_id, remote_identity, requested_at))
+        Ok(handler.invoke(data, request_id, link_id, remote_identity, requested_at).await)
     }
 }
 
@@ -411,7 +469,7 @@ mod tests {
         let mut router = RequestRouter::new();
 
         // Register a handler
-        let handler = RequestHandler::new(
+        let handler = RequestHandler::new_sync(
             "/status",
             |_path, _data, _req_id, _link_id, _identity, _time| Some(b"ok".to_vec()),
             AllowPolicy::AllowAll,
@@ -424,9 +482,9 @@ mod tests {
         assert_eq!(router.len(), 1);
     }
 
-    #[test]
-    fn test_request_handler_invocation() {
-        let handler = RequestHandler::new(
+    #[tokio::test]
+    async fn test_request_handler_invocation() {
+        let handler = RequestHandler::new_sync(
             "/echo",
             |_path, data, _req_id, _link_id, _identity, _time| Some(data.to_vec()),
             AllowPolicy::AllowAll,
@@ -437,8 +495,25 @@ mod tests {
 
         assert!(handler.is_allowed(Some(&identity)));
 
-        let result = handler.invoke(b"hello", &request_id, b"link", Some(&identity), 0.0);
+        let result = handler.invoke(b"hello", &request_id, b"link", Some(&identity), 0.0).await;
         assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_async_request_handler() {
+        let handler = RequestHandler::new(
+            "/async-echo",
+            |_path, data, _req_id, _link_id, _identity, _time| async move {
+                Some(data)
+            },
+            AllowPolicy::AllowAll,
+        );
+
+        let identity: [u8; 16] = [1u8; 16];
+        let request_id: [u8; 16] = [2u8; 16];
+
+        let result = handler.invoke(b"async hello", &request_id, b"link", Some(&identity), 0.0).await;
+        assert_eq!(result, Some(b"async hello".to_vec()));
     }
 
     #[test]

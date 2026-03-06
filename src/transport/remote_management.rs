@@ -123,7 +123,7 @@ impl RemoteManagementService {
         let mut router = RequestRouter::new();
 
         // Register the /status handler
-        let status_handler = RequestHandler::new(
+        let status_handler = RequestHandler::new_sync(
             "/status",
             handle_status_request,
             config.allow_policy.clone(),
@@ -131,7 +131,7 @@ impl RemoteManagementService {
         router.register(status_handler);
 
         // Register the /path handler (for path table queries)
-        let path_handler = RequestHandler::new(
+        let path_handler = RequestHandler::new_sync(
             "/path",
             handle_path_request,
             config.allow_policy,
@@ -159,7 +159,7 @@ impl RemoteManagementService {
     ///
     /// # Returns
     /// The response data to send back, or None if no response.
-    pub fn process_request(
+    pub async fn process_request(
         &self,
         request_data: &[u8],
         link_id: &[u8],
@@ -207,7 +207,7 @@ impl RemoteManagementService {
                 link_id,
                 remote_identity,
                 requested_at,
-            ) {
+            ).await {
                 Ok(response) => response,
                 Err(e) => {
                     log::warn!("remote_management: request error: {}", e);
@@ -602,7 +602,7 @@ pub async fn process_link_event(
                 None, // Would need to get this from the link
                 context,
                 request_id,
-            ) {
+            ).await {
                 send_response(event.id, response);
             }
         }
