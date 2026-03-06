@@ -84,7 +84,7 @@ impl BlackholeInfoService {
         let mut router = RequestRouter::new();
 
         // Register the /list handler with ALLOW_ALL policy (public)
-        let list_handler = RequestHandler::new(
+        let list_handler = RequestHandler::new_sync(
             "/list",
             handle_list_request,
             AllowPolicy::AllowAll,
@@ -112,7 +112,7 @@ impl BlackholeInfoService {
     ///
     /// # Returns
     /// The response data to send back, or None if no response.
-    pub fn process_request(
+    pub async fn process_request(
         &self,
         request_data: &[u8],
         link_id: &[u8],
@@ -151,7 +151,7 @@ impl BlackholeInfoService {
                 link_id,
                 remote_identity,
                 requested_at,
-            ) {
+            ).await {
                 Ok(response) => response,
                 Err(e) => {
                     log::warn!("blackhole_info: request error: {}", e);

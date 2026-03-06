@@ -84,6 +84,9 @@ pub use link::Link;
 pub use receipt::PacketReceipt;
 pub use resource::Resource;
 
+// Re-export request handler types for external consumers
+pub use crate::destination::request::{AllowPolicy, RequestHandler, RequestRouter, sync_handler};
+
 use announce_handler::{AnnounceCallback, AnnounceHandlerConfig, AnnounceHandlerHandle, AnnounceHandlerRegistry};
 use announce_manager::AnnounceManager;
 use announce_queue::{AnnounceQueueManager, QueuedAnnounce};
@@ -632,7 +635,7 @@ impl Transport {
                                             remote_identity_hash.as_ref(),
                                             &context,
                                             request_id,
-                                        ) {
+                                        ).await {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
                                             if let Some(link) = handler.link_manager.get_in_link(&event.id) {
@@ -759,7 +762,7 @@ impl Transport {
                                             remote_identity_hash.as_ref(),
                                             &context,
                                             request_id,
-                                        ) {
+                                        ).await {
                                             // Send the response back on the link
                                             let handler = transport.lock().await;
                                             if let Some(link) = handler.link_manager.get_in_link(&event.id) {
@@ -796,6 +799,139 @@ impl Transport {
         });
 
         dest_hash
+    }
+
+    /// Start request dispatch for a registered destination.
+    ///
+    /// Spawns an async task that listens for `LinkEvent::Request` on links
+    /// targeting this destination, routes through its `RequestRouter`, and
+    /// sends responses back on the link.
+    ///
+    /// This is the generic equivalent of `start_remote_management()` — any
+    /// destination with registered request handlers can use this to get
+    /// automatic request routing.
+    pub fn start_request_dispatch(
+        &self,
+        dest: &RegisteredDestination,
+        cancel: CancellationToken,
+    ) {
+        use crate::destination::link::LinkEvent;
+        use crate::destination::request::{parse_request, pack_response};
+
+        let dest_hash = *dest.address_hash();
+        let router = dest.router().clone();
+        let mut link_events = self.in_link_events();
+        let transport = self.handler.clone();
+
+        tokio::spawn(async move {
+            log::debug!("request_dispatch({}): started", dest_hash);
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        log::info!("request_dispatch({}): shutting down", dest_hash);
+                        break;
+                    }
+
+                    result = link_events.recv() => {
+                        match result {
+                            Ok(event) => {
+                                // Only handle events for our destination
+                                if event.address_hash != dest_hash {
+                                    continue;
+                                }
+
+                                if let LinkEvent::Request(payload, request_id) = &event.event {
+                                    // Get remote identity from the link
+                                    let remote_identity_hash = {
+                                        let handler = transport.lock().await;
+                                        if let Some(link) = handler.link_manager.get_in_link(&event.id) {
+                                            let link = link.lock().await;
+                                            link.remote_identity_hash()
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    // Parse the request
+                                    let (requested_at, path_hash, data) = match parse_request(payload.as_slice()) {
+                                        Ok(parsed) => parsed,
+                                        Err(e) => {
+                                            log::warn!("request_dispatch({}): parse error: {}", dest_hash, e);
+                                            continue;
+                                        }
+                                    };
+
+                                    // Clone the handler out of the RwLock before awaiting,
+                                    // so the lock isn't held across the .await point.
+                                    let handler = {
+                                        let router = router.read().await;
+                                        router.get(&path_hash).cloned()
+                                    };
+
+                                    let response = if let Some(handler) = handler {
+                                        if !handler.is_allowed(remote_identity_hash.as_ref()) {
+                                            log::warn!(
+                                                "request_dispatch({}): access denied for path {}",
+                                                dest_hash, handler.path
+                                            );
+                                            continue;
+                                        }
+                                        handler.invoke(
+                                            &data,
+                                            request_id,
+                                            event.id.as_slice(),
+                                            remote_identity_hash.as_ref(),
+                                            requested_at,
+                                        ).await
+                                    } else {
+                                        log::warn!(
+                                            "request_dispatch({}): no handler for path hash {:?}",
+                                            dest_hash, hex::encode(path_hash)
+                                        );
+                                        continue;
+                                    };
+
+                                    // Send response if handler returned one
+                                    if let Some(response_data) = response {
+                                        match pack_response(request_id, &response_data) {
+                                            Ok(packed) => {
+                                                let handler = transport.lock().await;
+                                                if let Some(link) = handler.link_manager.get_in_link(&event.id) {
+                                                    let link = link.lock().await;
+                                                    if link.status() == LinkStatus::Active {
+                                                        if let Ok(packet) = link.response_packet(&packed) {
+                                                            handler.send_packet(packet).await;
+                                                            log::debug!(
+                                                                "request_dispatch({}): sent response on link {}",
+                                                                dest_hash, event.id
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "request_dispatch({}): pack_response error: {}",
+                                                    dest_hash, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("request_dispatch({}): lagged {} events", dest_hash, n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                log::info!("request_dispatch({}): event channel closed", dest_hash);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn send_packet(&self, packet: Packet) {
