@@ -85,7 +85,7 @@ pub use receipt::PacketReceipt;
 pub use resource::Resource;
 
 // Re-export request handler types for external consumers
-pub use crate::destination::request::{AllowPolicy, RequestHandler, RequestRouter, sync_handler};
+pub use crate::destination::request::{AllowPolicy, RequestHandler, RequestRouter, SharedAllowList, sync_handler};
 
 use announce_handler::{AnnounceCallback, AnnounceHandlerConfig, AnnounceHandlerHandle, AnnounceHandlerRegistry};
 use announce_manager::AnnounceManager;

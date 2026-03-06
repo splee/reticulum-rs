@@ -525,9 +525,10 @@ fn create_remote_management_config(allowed_hashes: &[String]) -> RemoteManagemen
             log::warn!("No valid identity hashes, allowing all identified peers");
             RemoteManagementConfig::allow_all()
         } else {
+            let (policy, _allow_list_handle) = AllowPolicy::new_allow_list(identities);
             RemoteManagementConfig {
                 enabled: true,
-                allow_policy: AllowPolicy::AllowList(identities),
+                allow_policy: policy,
             }
         }
     }
