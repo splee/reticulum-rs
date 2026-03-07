@@ -820,6 +820,7 @@ impl Transport {
         let mut link_events = self.in_link_events();
         let transport = self.handler.clone();
         let link_in_event_tx = self.link_in_event_tx.clone();
+        let link_out_event_tx = self.link_out_event_tx.clone();
         let response_resource_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPONSE_RESOURCES));
 
         tokio::spawn(async move {
@@ -949,11 +950,13 @@ impl Transport {
                                                                     let link_id = event.id;
                                                                     let cancel_clone = cancel.clone();
                                                                     let event_tx = link_in_event_tx.clone();
+                                                                    let out_event_tx = link_out_event_tx.clone();
                                                                     let label_clone = label.clone();
 
                                                                     tokio::spawn(drive_response_resource(
                                                                         transport_clone,
                                                                         event_tx,
+                                                                        out_event_tx,
                                                                         link_id,
                                                                         resource,
                                                                         label_clone,
@@ -1390,7 +1393,7 @@ impl Transport {
         let destination = *link_guard.destination();
         let initiator = link_guard.is_initiator();
         drop(link_guard);
-        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator))
+        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator, self.link_out_event_tx.clone()))
     }
 
     pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Link> {
@@ -1401,7 +1404,7 @@ impl Transport {
         let destination = *link_guard.destination();
         let initiator = link_guard.is_initiator();
         drop(link_guard);
-        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator))
+        Some(Link::new(link_arc, self.handler.clone(), id, destination, initiator, self.link_out_event_tx.clone()))
     }
 
     /// Decrypt data using an incoming link's key.
@@ -1440,7 +1443,7 @@ impl Transport {
                 let dest = *link_guard.destination();
                 let initiator = link_guard.is_initiator();
                 drop(link_guard);
-                return Link::new(link_arc, self.handler.clone(), id, dest, initiator);
+                return Link::new(link_arc, self.handler.clone(), id, dest, initiator, self.link_out_event_tx.clone());
             } else {
                 log::warn!("tp({}): link was closed", self.name);
             }
@@ -1469,7 +1472,7 @@ impl Transport {
             .link_manager
             .insert_out_link(destination.address_hash, link_arc.clone());
 
-        Link::new(link_arc, self.handler.clone(), id, destination, initiator)
+        Link::new(link_arc, self.handler.clone(), id, destination, initiator, self.link_out_event_tx.clone())
     }
 
     pub fn out_link_events(&self) -> broadcast::Receiver<LinkEventData> {
@@ -1969,6 +1972,7 @@ async fn handle_resource_transfer_event(
 async fn drive_response_resource(
     transport: Arc<Mutex<TransportHandler>>,
     link_in_event_tx: broadcast::Sender<LinkEventData>,
+    link_out_event_tx: broadcast::Sender<LinkEventData>,
     link_id: AddressHash,
     resource: Resource,
     label: String,
@@ -1992,7 +1996,7 @@ async fn drive_response_resource(
         let destination = *link_guard.destination();
         let initiator = link_guard.is_initiator();
         drop(link_guard);
-        Link::new(link_arc, transport.clone(), id, destination, initiator)
+        Link::new(link_arc, transport.clone(), id, destination, initiator, link_out_event_tx)
     };
 
     // Register the resource as outgoing on the link and send advertisement
