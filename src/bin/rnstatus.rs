@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest as Sha2Digest};
 
 use reticulum::cli::format::{
-    format_frequency, format_size, format_time_ago, format_time_compact,
-    format_transfer_rate, format_with_commas, speed_str,
+    format_frequency, format_size, format_time_compact, format_transfer_rate, format_with_commas,
+    speed_str,
 };
 use reticulum::cli::hash::parse_destination;
 use reticulum::config::{LogLevel, ReticulumConfig};
@@ -1516,7 +1516,24 @@ fn show_discovered_interfaces(args: &Args, config: &ReticulumConfig) {
             let if_type = iface.interface_type.replace("Interface", "");
             let status_display = format_status(&iface.status);
 
-            let last_heard = format_time_ago(iface.last_heard);
+            // Inline abbreviated time-ago formatting, matching Python rnstatus
+            // table mode (lines 270-282) which uses "Just now", "Xm ago", etc.
+            let last_heard = {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let diff = now - iface.last_heard;
+                if diff < 60.0 {
+                    "Just now".to_string()
+                } else if diff < 3600.0 {
+                    format!("{}m ago", (diff / 60.0) as i32)
+                } else if diff < 86400.0 {
+                    format!("{}h ago", (diff / 3600.0) as i32)
+                } else {
+                    format!("{}d ago", (diff / 86400.0) as i32)
+                }
+            };
 
             let location = if let (Some(lat), Some(lon)) = (iface.latitude, iface.longitude) {
                 format!("{:.4}, {:.4}", lat, lon)

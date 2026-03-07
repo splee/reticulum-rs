@@ -5,7 +5,8 @@
 //! - `format_size` / `size_str` - Size formatting (RNS.prettysize)
 //! - `format_speed` / `speed_str` - Speed formatting (RNS.prettyspeed)
 //! - `format_time` / `format_time_compact` - Time formatting (RNS.prettytime)
-//! - `format_time_ago` - Time ago formatting
+//! - `format_time_ago` - Time ago formatting (RNS.Utilities.rnpath.pretty_date)
+//! - `format_frequency` - Frequency formatting (RNS.prettyfrequency)
 
 use crate::hash::AddressHash;
 
@@ -95,7 +96,8 @@ pub fn size_str(num: u64, suffix: char) -> String {
         }
     }
 
-    format!("{:.2} Y{}", num, suffix.to_ascii_uppercase())
+    // No space before Y, matching Python's "%.2f%s%s" format
+    format!("{:.2}Y{}", num, suffix.to_ascii_uppercase())
 }
 
 /// Format size in bytes as human-readable string.
@@ -107,7 +109,8 @@ pub fn format_size(bytes: u64) -> String {
 
 /// Format bitrate in bits/sec as human-readable string.
 ///
-/// Matches Python's `RNS.prettyspeed()`.
+/// Matches Python's `speed_str()` in `RNS/Utilities/rnstatus.py`.
+/// Uses `%3.2f` formatting for parity with Python.
 ///
 /// # Example
 /// ```
@@ -121,7 +124,8 @@ pub fn speed_str(bits_per_sec: f64) -> String {
 
     for unit in UNITS {
         if speed.abs() < 1000.0 {
-            return format!("{:.2} {}bps", speed, unit);
+            // Match Python's "%3.2f %s%s" format (min width 3, 2 decimals)
+            return format!("{:>3.2} {}bps", speed, unit);
         }
         speed /= 1000.0;
     }
@@ -146,109 +150,168 @@ pub fn format_transfer_rate(bytes_per_sec: f64) -> String {
     format!("{:.2} YB/s", speed)
 }
 
+/// Join time components with `", "` between middle items and `" and "` before the last.
+///
+/// Returns `"0s"` if the components list is empty (input time was zero).
+/// Matches Python's `prettytime()` join logic.
+fn join_time_components(components: &[String]) -> String {
+    if components.is_empty() {
+        return "0s".to_string();
+    }
+    let mut result = String::new();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 && i < components.len() - 1 {
+            result.push_str(", ");
+        } else if i > 0 {
+            result.push_str(" and ");
+        }
+        result.push_str(c);
+    }
+    result
+}
+
+/// Format a seconds value for verbose time display.
+///
+/// Integer-valued floats display without a decimal point (e.g., 45.0 → "45").
+/// Fractional values display with up to 2 decimal places (e.g., 1.5 → "1.5").
+fn format_seconds_value(seconds: f64) -> String {
+    if seconds.fract() == 0.0 {
+        return format!("{}", seconds as i64);
+    }
+    let s = format!("{:.2}", seconds);
+    s.trim_end_matches('0').to_string()
+}
+
 /// Format seconds as compact human-readable time.
 ///
 /// Matches Python's `RNS.prettytime(compact=True)`.
-/// Used by rnstatus for interface timing info.
+/// Decomposes into up to 2 non-zero components with abbreviated units,
+/// joined with `", "` and `" and "`.
 ///
 /// # Example
 /// ```
 /// use reticulum::cli::format::format_time_compact;
 /// assert_eq!(format_time_compact(45.0), "45s");
-/// assert_eq!(format_time_compact(125.0), "2m");
-/// assert_eq!(format_time_compact(7200.0), "2.0h");
+/// assert_eq!(format_time_compact(3661.0), "1h and 1m");
+/// assert_eq!(format_time_compact(90061.0), "1d and 1h");
 /// ```
 pub fn format_time_compact(seconds: f64) -> String {
-    if seconds < 60.0 {
-        format!("{:.0}s", seconds)
-    } else if seconds < 3600.0 {
-        let mins = seconds / 60.0;
-        format!("{:.0}m", mins)
-    } else if seconds < 86400.0 {
-        let hours = seconds / 3600.0;
-        format!("{:.1}h", hours)
-    } else if seconds < 604800.0 {
-        let days = seconds / 86400.0;
-        format!("{:.1}d", days)
+    let neg = seconds < 0.0;
+    let time = seconds.abs();
+
+    let days = (time / 86400.0) as i64;
+    let remainder = time % 86400.0;
+    let hours = (remainder / 3600.0) as i64;
+    let remainder = remainder % 3600.0;
+    let minutes = (remainder / 60.0) as i64;
+    // Truncate seconds to integer, matching Python's int(time)
+    let secs = (remainder % 60.0) as i64;
+
+    let mut components = Vec::new();
+    let mut displayed = 0;
+
+    if days > 0 && displayed < 2 {
+        components.push(format!("{}d", days));
+        displayed += 1;
+    }
+    if hours > 0 && displayed < 2 {
+        components.push(format!("{}h", hours));
+        displayed += 1;
+    }
+    if minutes > 0 && displayed < 2 {
+        components.push(format!("{}m", minutes));
+        displayed += 1;
+    }
+    if secs > 0 && displayed < 2 {
+        components.push(format!("{}s", secs));
+    }
+
+    let result = join_time_components(&components);
+    if neg {
+        format!("-{}", result)
     } else {
-        let weeks = seconds / 604800.0;
-        format!("{:.1}w", weeks)
+        result
     }
 }
 
 /// Format seconds as verbose human-readable time.
 ///
-/// Matches Python's `RNS.prettytime(compact=False)`.
-/// Used by rnpath for path timing info.
+/// Matches Python's `RNS.prettytime(verbose=True)`.
+/// Decomposes into all non-zero components with verbose labels
+/// (e.g., "days", "hours", "minutes", "seconds"), joined with
+/// `", "` and `" and "`. Handles singular/plural forms.
 ///
 /// # Example
 /// ```
 /// use reticulum::cli::format::format_time;
-/// assert_eq!(format_time(45.0), "45 seconds");
-/// assert_eq!(format_time(125.0), "2 minutes");
-/// assert_eq!(format_time(7200.0), "2 hours");
+/// assert_eq!(format_time(90061.5), "1 day, 1 hour, 1 minute and 1.5 seconds");
+/// assert_eq!(format_time(3661.0), "1 hour, 1 minute and 1 second");
+/// assert_eq!(format_time(86400.0), "1 day");
 /// ```
 pub fn format_time(seconds: f64) -> String {
-    if seconds < 60.0 {
-        format!("{:.0} seconds", seconds)
-    } else if seconds < 3600.0 {
-        let mins = seconds / 60.0;
-        if mins < 2.0 {
-            "1 minute".to_string()
-        } else {
-            format!("{:.0} minutes", mins)
-        }
-    } else if seconds < 86400.0 {
-        let hours = seconds / 3600.0;
-        if hours < 2.0 {
-            "1 hour".to_string()
-        } else {
-            format!("{:.0} hours", hours)
-        }
-    } else if seconds < 604800.0 {
-        let days = seconds / 86400.0;
-        if days < 2.0 {
-            "1 day".to_string()
-        } else {
-            format!("{:.0} days", days)
-        }
-    } else if seconds < 2592000.0 {
-        let weeks = seconds / 604800.0;
-        if weeks < 2.0 {
-            "1 week".to_string()
-        } else {
-            format!("{:.0} weeks", weeks)
-        }
-    } else if seconds < 31536000.0 {
-        let months = seconds / 2592000.0;
-        if months < 2.0 {
-            "1 month".to_string()
-        } else {
-            format!("{:.0} months", months)
-        }
+    let neg = seconds < 0.0;
+    let time = seconds.abs();
+
+    let days = (time / 86400.0) as i64;
+    let remainder = time % 86400.0;
+    let hours = (remainder / 3600.0) as i64;
+    let remainder = remainder % 3600.0;
+    let minutes = (remainder / 60.0) as i64;
+    // Round seconds to 2 decimal places, matching Python's round(time, 2)
+    let secs = ((remainder % 60.0) * 100.0).round() / 100.0;
+
+    let mut components = Vec::new();
+
+    if days > 0 {
+        components.push(format!(
+            "{} day{}",
+            days,
+            if days == 1 { "" } else { "s" }
+        ));
+    }
+    if hours > 0 {
+        components.push(format!(
+            "{} hour{}",
+            hours,
+            if hours == 1 { "" } else { "s" }
+        ));
+    }
+    if minutes > 0 {
+        components.push(format!(
+            "{} minute{}",
+            minutes,
+            if minutes == 1 { "" } else { "s" }
+        ));
+    }
+    if secs > 0.0 {
+        let secs_str = format_seconds_value(secs);
+        components.push(format!(
+            "{} second{}",
+            secs_str,
+            if secs == 1.0 { "" } else { "s" }
+        ));
+    }
+
+    let result = join_time_components(&components);
+    if neg {
+        format!("-{}", result)
     } else {
-        let years = seconds / 31536000.0;
-        if years < 2.0 {
-            "1 year".to_string()
-        } else {
-            format!("{:.0} years", years)
-        }
+        result
     }
 }
 
 /// Format time elapsed since a Unix timestamp.
 ///
-/// Returns strings like "Just now", "5m ago", "2h ago", "3d ago".
+/// Matches Python's `pretty_date()` from `RNS/Utilities/rnpath.py`.
+/// Returns verbose human-readable strings without an "ago" suffix.
 ///
 /// # Example
 /// ```
 /// use reticulum::cli::format::format_time_ago;
 /// use std::time::{SystemTime, UNIX_EPOCH};
 /// let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-/// // Recent timestamp returns "Just now"
-/// assert_eq!(format_time_ago(now - 30.0), "Just now");
-/// // 2 minutes ago
-/// assert_eq!(format_time_ago(now - 120.0), "2m ago");
+/// assert_eq!(format_time_ago(now - 30.0), "30 seconds");
+/// assert_eq!(format_time_ago(now - 300.0), "5 minutes");
 /// ```
 pub fn format_time_ago(last_heard: f64) -> String {
     let now = std::time::SystemTime::now()
@@ -257,42 +320,72 @@ pub fn format_time_ago(last_heard: f64) -> String {
         .unwrap_or(0.0);
     let diff = now - last_heard;
 
-    if diff < 60.0 {
-        "Just now".to_string()
-    } else if diff < 3600.0 {
-        format!("{}m ago", (diff / 60.0) as i32)
-    } else if diff < 86400.0 {
-        format!("{}h ago", (diff / 3600.0) as i32)
-    } else {
-        format!("{}d ago", (diff / 86400.0) as i32)
+    if diff < 0.0 {
+        return String::new();
     }
+
+    let day_diff = (diff / 86400.0) as i64;
+    let second_diff = (diff % 86400.0) as i64;
+
+    if day_diff == 0 {
+        if second_diff < 10 {
+            return format!("{} seconds", second_diff);
+        }
+        if second_diff < 60 {
+            return format!("{} seconds", second_diff);
+        }
+        if second_diff < 120 {
+            return "1 minute".to_string();
+        }
+        if second_diff < 3600 {
+            return format!("{} minutes", second_diff / 60);
+        }
+        if second_diff < 7200 {
+            return "an hour".to_string();
+        }
+        if second_diff < 86400 {
+            return format!("{} hours", second_diff / 3600);
+        }
+    }
+    if day_diff == 1 {
+        return "1 day".to_string();
+    }
+    if day_diff < 7 {
+        return format!("{} days", day_diff);
+    }
+    if day_diff < 31 {
+        return format!("{} weeks", day_diff / 7);
+    }
+    if day_diff < 365 {
+        return format!("{} months", day_diff / 30);
+    }
+    format!("{} years", day_diff / 365)
 }
 
-/// Format frequency as human-readable rate.
+/// Format frequency as human-readable Hz string.
 ///
 /// Matches Python's `RNS.prettyfrequency()`.
+/// Scales by 1e6 and iterates through µ/m/ /K/M/G/T/P/E/Z units with "Hz" suffix.
 ///
 /// # Example
 /// ```
 /// use reticulum::cli::format::format_frequency;
-/// assert_eq!(format_frequency(0.5), "0.5/s");
-/// assert_eq!(format_frequency(0.01), "0.6/min");
+/// assert_eq!(format_frequency(1.0), "1.00 Hz");
+/// assert_eq!(format_frequency(1000.0), "1.00 KHz");
 /// ```
-pub fn format_frequency(freq: f64) -> String {
-    if freq < 0.001 {
-        return "never".to_string();
+pub fn format_frequency(hz: f64) -> String {
+    let mut num = hz * 1e6;
+    let units = ["µ", "m", "", "K", "M", "G", "T", "P", "E", "Z"];
+
+    for unit in units {
+        if num.abs() < 1000.0 {
+            return format!("{:.2} {}Hz", num, unit);
+        }
+        num /= 1000.0;
     }
 
-    let period = 1.0 / freq;
-    if period < 60.0 {
-        format!("{:.1}/s", freq)
-    } else if period < 3600.0 {
-        format!("{:.1}/min", freq * 60.0)
-    } else if period < 86400.0 {
-        format!("{:.1}/h", freq * 3600.0)
-    } else {
-        format!("{:.2}/day", freq * 86400.0)
-    }
+    // No space before Y, matching Python's "%.2f%s%s" format
+    format!("{:.2}YHz", num)
 }
 
 /// Format a number with comma separators.
@@ -367,26 +460,97 @@ mod tests {
 
     #[test]
     fn test_format_time_compact() {
+        // Zero
+        assert_eq!(format_time_compact(0.0), "0s");
+        // Seconds only
         assert_eq!(format_time_compact(45.0), "45s");
-        assert_eq!(format_time_compact(90.0), "2m");
-        assert_eq!(format_time_compact(7200.0), "2.0h");
-        assert_eq!(format_time_compact(172800.0), "2.0d");
+        // Minutes and seconds (2-component cap)
+        assert_eq!(format_time_compact(90.0), "1m and 30s");
+        assert_eq!(format_time_compact(3661.0), "1h and 1m");
+        // Single larger units
+        assert_eq!(format_time_compact(7200.0), "2h");
+        assert_eq!(format_time_compact(172800.0), "2d");
+        // Days + hours (capped at 2)
+        assert_eq!(format_time_compact(90061.0), "1d and 1h");
+        // Negative
+        assert_eq!(format_time_compact(-45.0), "-45s");
+        assert_eq!(format_time_compact(-3661.0), "-1h and 1m");
     }
 
     #[test]
     fn test_format_time() {
+        // Zero
+        assert_eq!(format_time(0.0), "0s");
+        // Seconds only
+        assert_eq!(format_time(1.0), "1 second");
         assert_eq!(format_time(45.0), "45 seconds");
+        assert_eq!(format_time(1.5), "1.5 seconds");
+        // Minutes
         assert_eq!(format_time(60.0), "1 minute");
         assert_eq!(format_time(120.0), "2 minutes");
+        // Minutes and seconds
+        assert_eq!(format_time(61.0), "1 minute and 1 second");
+        assert_eq!(format_time(125.0), "2 minutes and 5 seconds");
+        // Hours
         assert_eq!(format_time(3600.0), "1 hour");
         assert_eq!(format_time(7200.0), "2 hours");
+        // Hours, minutes, seconds
+        assert_eq!(
+            format_time(3661.0),
+            "1 hour, 1 minute and 1 second"
+        );
+        // Days
+        assert_eq!(format_time(86400.0), "1 day");
+        assert_eq!(format_time(172800.0), "2 days");
+        // All components
+        assert_eq!(
+            format_time(90061.0),
+            "1 day, 1 hour, 1 minute and 1 second"
+        );
+        assert_eq!(
+            format_time(90061.5),
+            "1 day, 1 hour, 1 minute and 1.5 seconds"
+        );
+        // Negative
+        assert_eq!(format_time(-45.0), "-45 seconds");
+        assert_eq!(
+            format_time(-3661.0),
+            "-1 hour, 1 minute and 1 second"
+        );
+    }
+
+    #[test]
+    fn test_format_time_ago() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Same day
+        assert_eq!(format_time_ago(now - 5.0), "5 seconds");
+        assert_eq!(format_time_ago(now - 30.0), "30 seconds");
+        assert_eq!(format_time_ago(now - 90.0), "1 minute");
+        assert_eq!(format_time_ago(now - 300.0), "5 minutes");
+        assert_eq!(format_time_ago(now - 5400.0), "an hour");
+        assert_eq!(format_time_ago(now - 10800.0), "3 hours");
+
+        // Multiple days
+        assert_eq!(format_time_ago(now - 86400.0), "1 day");
+        assert_eq!(format_time_ago(now - 172800.0), "2 days");
+        assert_eq!(format_time_ago(now - 604800.0), "1 weeks");
+        assert_eq!(format_time_ago(now - 2592000.0), "4 weeks");
+
+        // Future timestamp
+        assert_eq!(format_time_ago(now + 100.0), "");
     }
 
     #[test]
     fn test_format_frequency() {
-        assert_eq!(format_frequency(0.0001), "never");
-        assert!(format_frequency(0.5).contains("/s"));
-        assert!(format_frequency(0.01).contains("/min"));
+        assert_eq!(format_frequency(0.000001), "1.00 µHz");
+        assert_eq!(format_frequency(0.001), "1.00 mHz");
+        assert_eq!(format_frequency(1.0), "1.00 Hz");
+        assert_eq!(format_frequency(1000.0), "1.00 KHz");
+        assert_eq!(format_frequency(1000000.0), "1.00 MHz");
     }
 
     #[test]
