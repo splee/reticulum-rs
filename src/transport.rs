@@ -118,6 +118,14 @@ const INTERVAL_ANNOUNCE_QUEUE_PROCESS: Duration = Duration::from_millis(100);
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
 
+/// Maximum concurrent response resource transfers per destination.
+/// Provides load shedding — when exceeded, oversized responses are dropped
+/// and the client will time out (correct behavior under overload).
+const MAX_CONCURRENT_RESPONSE_RESOURCES: usize = 64;
+
+/// Timeout for a single response resource transfer.
+const RESPONSE_RESOURCE_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct ReceivedData {
     pub destination: AddressHash,
@@ -793,6 +801,9 @@ impl Transport {
     /// targeting this destination, routes through its `RequestRouter`, and
     /// sends responses back on the link.
     ///
+    /// When a response exceeds the link MDU, it falls back to sending the
+    /// response as a Resource transfer (matching Python RNS behavior).
+    ///
     /// This is the generic equivalent of `start_remote_management()` — any
     /// destination with registered request handlers can use this to get
     /// automatic request routing.
@@ -803,11 +814,14 @@ impl Transport {
     ) {
         use crate::destination::link::LinkEvent;
         use crate::destination::request::{parse_request, pack_response};
+        use crate::resource::ResourceConfig;
 
         let dest_hash = *dest.address_hash();
         let router = dest.router().clone();
         let mut link_events = self.in_link_events();
         let transport = self.handler.clone();
+        let link_in_event_tx = self.link_in_event_tx.clone();
+        let response_resource_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPONSE_RESOURCES));
 
         tokio::spawn(async move {
             log::debug!("request_dispatch({}): started", dest_hash);
@@ -879,15 +893,94 @@ impl Transport {
                                     };
 
                                     // Send response if handler returned one
+                                    let label = format!("request_dispatch({})", dest_hash);
                                     if let Some(response_data) = response {
                                         match pack_response(request_id, &response_data) {
                                             Ok(packed) => {
-                                                let handler = transport.lock().await;
-                                                handler.send_response_on_link(
-                                                    &event.id,
-                                                    &packed,
-                                                    &format!("request_dispatch({})", dest_hash),
-                                                ).await;
+                                                // Check if the packed response fits in a single link packet
+                                                let link_mdu = {
+                                                    let handler = transport.lock().await;
+                                                    handler.link_manager.get_in_link(&event.id)
+                                                        .map(|arc| {
+                                                            // try_lock to avoid deadlock; fall back to 0 on contention
+                                                            arc.try_lock()
+                                                                .map(|l| l.mdu())
+                                                                .unwrap_or(0)
+                                                        })
+                                                        .unwrap_or(0)
+                                                };
+
+                                                if packed.len() <= link_mdu {
+                                                    // Fits in a single packet — use the fast path
+                                                    let handler = transport.lock().await;
+                                                    handler.send_response_on_link(
+                                                        &event.id,
+                                                        &packed,
+                                                        &label,
+                                                    ).await;
+                                                } else {
+                                                    // Response exceeds link MDU — fall back to Resource transfer
+                                                    log::info!(
+                                                        "{}: response too large for link packet ({} > {}), \
+                                                         falling back to resource transfer",
+                                                        label, packed.len(), link_mdu,
+                                                    );
+
+                                                    match response_resource_semaphore.clone().try_acquire_owned() {
+                                                        Ok(permit) => {
+                                                            // Build an encrypt_fn from the link's key material
+                                                            let encrypt_fn = {
+                                                                let handler = transport.lock().await;
+                                                                handler.link_manager.get_in_link(&event.id)
+                                                                    .and_then(|arc| {
+                                                                        arc.try_lock()
+                                                                            .map(|l| l.build_encrypt_fn())
+                                                                            .ok()
+                                                                    })
+                                                            };
+
+                                                            let config = ResourceConfig::default();
+                                                            match Resource::new_response(
+                                                                &mut OsRng,
+                                                                &packed,
+                                                                config,
+                                                                encrypt_fn.as_deref(),
+                                                                *request_id,
+                                                            ) {
+                                                                Ok(resource) => {
+                                                                    let transport_clone = transport.clone();
+                                                                    let link_id = event.id;
+                                                                    let cancel_clone = cancel.clone();
+                                                                    let event_tx = link_in_event_tx.clone();
+                                                                    let label_clone = label.clone();
+
+                                                                    tokio::spawn(drive_response_resource(
+                                                                        transport_clone,
+                                                                        event_tx,
+                                                                        link_id,
+                                                                        resource,
+                                                                        label_clone,
+                                                                        cancel_clone,
+                                                                        permit,
+                                                                    ));
+                                                                }
+                                                                Err(e) => {
+                                                                    log::warn!(
+                                                                        "{}: failed to create response resource: {:?}",
+                                                                        label, e,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(_) => {
+                                                            log::warn!(
+                                                                "{}: response resource limit reached ({}), \
+                                                                 shedding oversized response",
+                                                                label, MAX_CONCURRENT_RESPONSE_RESOURCES,
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -1776,6 +1869,200 @@ impl Transport {
 impl Drop for Transport {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+/// Drive a response resource transfer on an incoming link.
+///
+/// Spawned by `start_request_dispatch()` when a response exceeds the link MDU.
+/// Sends the advertisement, then handles ResourceRequest/ResourceProof events
+/// to drive the transfer to completion (or timeout/cancellation).
+///
+/// The `_permit` is held for the lifetime of this task and released automatically
+/// on completion, providing backpressure via the semaphore.
+async fn drive_response_resource(
+    transport: Arc<Mutex<TransportHandler>>,
+    link_in_event_tx: broadcast::Sender<LinkEventData>,
+    link_id: AddressHash,
+    resource: Resource,
+    label: String,
+    cancel: CancellationToken,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    use crate::destination::link::LinkEvent;
+
+    let resource_hash = hex::encode(&resource.hash()[..8]);
+
+    // Build a Link facade for this incoming link
+    let link_handle = {
+        let handler = transport.lock().await;
+        let Some(link_arc) = handler.link_manager.get_in_link(&link_id) else {
+            log::warn!(
+                "{}: in-link {} not found for response resource {}",
+                label, link_id, resource_hash,
+            );
+            return;
+        };
+        let link_guard = link_arc.lock().await;
+        let id = *link_guard.id();
+        let destination = *link_guard.destination();
+        let initiator = link_guard.is_initiator();
+        drop(link_guard);
+        Link::new(link_arc, transport.clone(), id, destination, initiator)
+    };
+
+    // Register the resource as outgoing on the link
+    if let Err(e) = link_handle.register_outgoing_resource(&resource).await {
+        log::warn!(
+            "{}: failed to register outgoing response resource {}: {:?}",
+            label, resource_hash, e,
+        );
+        return;
+    }
+
+    // Send the advertisement
+    let advertisement = resource.create_advertisement();
+    if let Err(e) = link_handle.send_resource_advertisement(&advertisement, 0).await {
+        log::warn!(
+            "{}: failed to send resource advertisement {}: {:?}",
+            label, resource_hash, e,
+        );
+        return;
+    }
+    resource.mark_adv_sent();
+    log::debug!("{}: sent response resource advertisement {}", label, resource_hash);
+
+    // Subscribe to link events and drive the transfer
+    let mut link_events = link_in_event_tx.subscribe();
+    let deadline = tokio::time::Instant::now() + RESPONSE_RESOURCE_TIMEOUT;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!(
+                "{}: response resource {} timed out",
+                label, resource_hash,
+            );
+            link_handle.resource_concluded(resource.truncated_hash(), false).await;
+            return;
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                log::debug!(
+                    "{}: response resource {} cancelled",
+                    label, resource_hash,
+                );
+                link_handle.resource_concluded(resource.truncated_hash(), false).await;
+                return;
+            }
+
+            result = link_events.recv() => {
+                match result {
+                    Ok(event) => {
+                        // Only handle events for our link
+                        if event.id != link_id {
+                            continue;
+                        }
+
+                        match &event.event {
+                            LinkEvent::ResourceRequest(payload) => {
+                                match resource.handle_request(payload.as_slice()) {
+                                    Ok(result) => {
+                                        // Send hashmap update if needed
+                                        if let Some(ref hmu_data) = result.hashmap_update {
+                                            if let Err(e) = link_handle
+                                                .send_resource_hashmap_update(hmu_data)
+                                                .await
+                                            {
+                                                log::warn!(
+                                                    "{}: failed to send HMU for {}: {:?}",
+                                                    label, resource_hash, e,
+                                                );
+                                            }
+                                        }
+
+                                        // Send requested parts
+                                        let parts: Vec<_> = result.parts_to_send
+                                            .iter()
+                                            .filter_map(|&idx| {
+                                                resource.get_part_data(idx).map(|d| (idx, d))
+                                            })
+                                            .collect();
+
+                                        for (idx, part_data) in parts {
+                                            if let Err(e) = link_handle
+                                                .send_resource_data(&part_data)
+                                                .await
+                                            {
+                                                log::warn!(
+                                                    "{}: failed to send part {} of {}: {:?}",
+                                                    label, idx, resource_hash, e,
+                                                );
+                                                link_handle.resource_concluded(
+                                                    resource.truncated_hash(), false,
+                                                ).await;
+                                                return;
+                                            }
+                                            resource.mark_part_sent(idx);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "{}: handle_request error for {}: {:?}",
+                                            label, resource_hash, e,
+                                        );
+                                    }
+                                }
+                            }
+
+                            LinkEvent::ResourceProof(payload) => {
+                                if resource.verify_proof(payload.as_slice()) {
+                                    log::debug!(
+                                        "{}: response resource {} proof verified, transfer complete",
+                                        label, resource_hash,
+                                    );
+                                    link_handle.resource_concluded(
+                                        resource.truncated_hash(), true,
+                                    ).await;
+                                    return;
+                                }
+                            }
+
+                            LinkEvent::Closed => {
+                                log::debug!(
+                                    "{}: link closed during response resource {} transfer",
+                                    label, resource_hash,
+                                );
+                                link_handle.resource_concluded(
+                                    resource.truncated_hash(), false,
+                                ).await;
+                                return;
+                            }
+
+                            _ => {} // Ignore other events
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "{}: response resource {} lagged {} events",
+                            label, resource_hash, n,
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        log::debug!(
+                            "{}: event channel closed for response resource {}",
+                            label, resource_hash,
+                        );
+                        link_handle.resource_concluded(
+                            resource.truncated_hash(), false,
+                        ).await;
+                        return;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 }
 

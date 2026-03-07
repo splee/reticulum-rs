@@ -240,7 +240,7 @@ pub async fn run_send_mode(
     };
 
     let mut rng = OsRng;
-    let resource = match Resource::new(&mut rng, &file_data, config, Some(&metadata), None) {
+    let resource = match Resource::new(&mut rng, &file_data, config, Some(&metadata), None, None, false) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to create resource: {:?}", e);

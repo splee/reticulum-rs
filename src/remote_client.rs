@@ -407,20 +407,31 @@ impl RemoteClient {
     }
 
     /// Send a request on an established link and wait for response.
+    ///
+    /// Handles both single-packet responses (fast path) and resource-based
+    /// responses (fallback for data exceeding link MDU).
     pub async fn request(
         &self,
         link: &crate::transport::Link,
         path: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, RemoteError> {
+        use crate::packet::RETICULUM_MDU;
+        use crate::resource::ResourceAdvertisement;
+        use crate::transport::Resource;
+
         let request_data = build_request(path, data);
 
         link.send_request(&request_data).await
             .map_err(|e| RemoteError::Other(format!("Failed to send request packet: {:?}", e)))?;
 
-        // Wait for response
+        // Wait for response — either a single Response packet or a Resource transfer
         let mut out_link_events = self.transport.out_link_events();
         let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let link_id = *link.id();
+
+        // Resource state for handling resource-based responses
+        let mut response_resource: Option<Resource> = None;
 
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -429,13 +440,159 @@ impl RemoteClient {
 
             tokio::select! {
                 Ok(event) = out_link_events.recv() => {
-                    if let LinkEvent::Response(payload) = &event.event {
-                        return Ok(payload.as_slice().to_vec());
+                    // Only handle events for our link
+                    if event.id != link_id {
+                        continue;
+                    }
+
+                    match &event.event {
+                        // Fast path: response fits in a single link packet
+                        LinkEvent::Response(payload) => {
+                            return Ok(payload.as_slice().to_vec());
+                        }
+
+                        // Resource-based response: server fell back to Resource transfer
+                        LinkEvent::ResourceAdvertisement(payload) => {
+                            match ResourceAdvertisement::unpack(payload.as_slice()) {
+                                Ok(adv) => {
+                                    if !adv.is_response() {
+                                        // Not a response resource — ignore
+                                        continue;
+                                    }
+
+                                    log::debug!(
+                                        "request: received response resource advertisement \
+                                         ({} parts, {} bytes)",
+                                        adv.num_parts, adv.transfer_size,
+                                    );
+
+                                    match Resource::from_advertisement(&adv, RETICULUM_MDU) {
+                                        Ok(resource) => {
+                                            // Request first batch of parts
+                                            if let Some(req_data) = resource.request_next() {
+                                                let dest_hash = link.destination().address_hash;
+                                                self.transport.send_resource_request_out(
+                                                    &dest_hash, &req_data,
+                                                ).await;
+                                                resource.mark_request_sent(req_data.len());
+                                            }
+                                            response_resource = Some(resource);
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "request: failed to create resource from advertisement: {:?}",
+                                                e,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "request: failed to unpack resource advertisement: {:?}",
+                                        e,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Resource data part received
+                        LinkEvent::ResourceData(payload) => {
+                            if let Some(ref resource) = response_resource {
+                                if resource.receive_part(payload.as_slice().to_vec()) {
+                                    if resource.is_complete() {
+                                        // All parts received — assemble the response
+                                        return self.finalize_response_resource(
+                                            resource, link,
+                                        ).await;
+                                    }
+
+                                    // Request more parts
+                                    if let Some(req_data) = resource.request_next() {
+                                        let dest_hash = link.destination().address_hash;
+                                        self.transport.send_resource_request_out(
+                                            &dest_hash, &req_data,
+                                        ).await;
+                                        resource.mark_request_sent(req_data.len());
+                                    }
+                                }
+                            }
+                        }
+
+                        // Hashmap update from sender
+                        LinkEvent::ResourceHashmapUpdate(payload) => {
+                            if let Some(ref resource) = response_resource {
+                                if let Some((_hash, segment, hashmap_data)) =
+                                    Resource::parse_hashmap_update(payload.as_slice())
+                                {
+                                    resource.update_hashmap(segment, &hashmap_data);
+
+                                    // Request more parts after hashmap update
+                                    if let Some(req_data) = resource.request_next() {
+                                        let dest_hash = link.destination().address_hash;
+                                        self.transport.send_resource_request_out(
+                                            &dest_hash, &req_data,
+                                        ).await;
+                                        resource.mark_request_sent(req_data.len());
+                                    }
+                                }
+                            }
+                        }
+
+                        LinkEvent::Closed => {
+                            return Err(RemoteError::Other(
+                                "Link closed while waiting for response".to_string(),
+                            ));
+                        }
+
+                        _ => {} // Ignore other events
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
+    }
+
+    /// Assemble, decrypt, and finalize a response resource transfer.
+    ///
+    /// Returns the assembled response data and sends the proof back to the sender.
+    async fn finalize_response_resource(
+        &self,
+        resource: &crate::transport::Resource,
+        link: &crate::transport::Link,
+    ) -> Result<Vec<u8>, RemoteError> {
+        // Get the raw assembled data (still encrypted)
+        let raw_data = resource.get_raw_assembled_data()
+            .ok_or_else(|| RemoteError::Other(
+                "Failed to get raw assembled data from response resource".to_string(),
+            ))?;
+
+        // Decrypt if the resource was encrypted
+        let decrypted = if resource.is_encrypted() {
+            link.decrypt(&raw_data).await
+                .map_err(|e| RemoteError::Other(
+                    format!("Failed to decrypt response resource: {:?}", e),
+                ))?
+        } else {
+            raw_data
+        };
+
+        // Finalize assembly (strips random hash, decompresses, verifies hash)
+        let assembled = resource.finalize_assembly(decrypted)
+            .map_err(|e| RemoteError::Other(
+                format!("Failed to finalize response resource: {:?}", e),
+            ))?;
+
+        // Send proof to acknowledge successful receipt
+        let proof = resource.generate_proof_with_data(&assembled);
+        let dest_hash = link.destination().address_hash;
+        self.transport.send_resource_proof_out(&dest_hash, &proof).await;
+
+        log::debug!(
+            "request: response resource transfer complete ({} bytes assembled)",
+            assembled.len(),
+        );
+
+        Ok(assembled)
     }
 }
 
