@@ -183,6 +183,54 @@ mod tests {
         assert_eq!(packet.data.as_slice(), new_packet.data.as_slice());
     }
 
+    /// Verify that packets with data between RETICULUM_MTU and PACKET_DATA_MAX
+    /// (the expanded buffer range) deserialize successfully. This covers the
+    /// case where a Python peer using link MTU discovery sends packets larger
+    /// than the standard 500-byte MTU through a Rust relay hub.
+    #[test]
+    fn deserialize_oversized_mtu_packet_succeeds() {
+        // Simulate a resource transfer packet with 595 bytes of data — the
+        // scenario from issue #25 where Python endpoints negotiate an MTU
+        // above 500 bytes via link MTU discovery.
+        let data_len = 595;
+        assert!(data_len > RETICULUM_MTU, "data must exceed standard MTU");
+        assert!(data_len <= PACKET_DATA_MAX, "data must fit in expanded buffer");
+
+        let wire_len = 19 + data_len; // Type1 header (19 bytes) + data
+        let mut raw = vec![0u8; wire_len];
+        raw[0] = 0x00; // Type1, Broadcast, Single, Data
+        raw[1] = 0;
+        raw[18] = 0x00; // context
+        for byte in raw[19..].iter_mut() {
+            *byte = 0xCC;
+        }
+
+        let mut input_buffer = InputBuffer::new(&raw);
+        let packet = Packet::deserialize(&mut input_buffer)
+            .expect("packet with data between MTU and PACKET_DATA_MAX should deserialize");
+        assert_eq!(packet.data.len(), data_len);
+        assert!(packet.data.as_slice().iter().all(|&b| b == 0xCC));
+    }
+
+    /// Verify that a packet at the exact PACKET_DATA_MAX boundary succeeds.
+    #[test]
+    fn deserialize_max_buffer_packet_succeeds() {
+        let data_len = PACKET_DATA_MAX;
+        let wire_len = 19 + data_len;
+        let mut raw = vec![0u8; wire_len];
+        raw[0] = 0x00;
+        raw[1] = 0;
+        raw[18] = 0x00;
+        for byte in raw[19..].iter_mut() {
+            *byte = 0xDD;
+        }
+
+        let mut input_buffer = InputBuffer::new(&raw);
+        let packet = Packet::deserialize(&mut input_buffer)
+            .expect("packet at exact PACKET_DATA_MAX should deserialize");
+        assert_eq!(packet.data.len(), data_len);
+    }
+
     /// Verify that a packet whose data exceeds PACKET_DATA_MAX returns an
     /// error instead of panicking.
     #[test]
