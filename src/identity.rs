@@ -676,6 +676,14 @@ impl DerivedKey {
         Self::new(&shared_key, salt)
     }
 
+    /// Reconstruct a `DerivedKey` from raw bytes.
+    ///
+    /// Used when building standalone encryption closures that need to
+    /// capture key material without holding a reference to the original key.
+    pub fn from_raw(key: [u8; DERIVED_KEY_LENGTH]) -> Self {
+        Self { key }
+    }
+
     pub fn as_bytes(&self) -> &[u8; DERIVED_KEY_LENGTH] {
         &self.key
     }

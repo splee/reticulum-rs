@@ -74,6 +74,24 @@ impl Resource {
         Ok(Self::from_inner(arc))
     }
 
+    /// Create a new outgoing resource for a response that exceeds link MDU.
+    ///
+    /// Sets the `is_response` flag and includes the `request_id` so the
+    /// receiver can match this resource transfer to its pending request.
+    pub fn new_response<R: CryptoRngCore>(
+        rng: &mut R,
+        data: &[u8],
+        encrypt_fn: Option<&EncryptFn>,
+        request_id: [u8; 16],
+    ) -> Result<Self, RnsError> {
+        let config = ResourceConfig {
+            request_id: Some(request_id),
+            is_response: true,
+            ..ResourceConfig::default()
+        };
+        Self::new(rng, data, config, None, encrypt_fn)
+    }
+
     /// Create an incoming resource from an advertisement.
     pub fn from_advertisement(adv: &ResourceAdvertisement, sdu: usize) -> Result<Self, RnsError> {
         let inner = ResourceInner::from_advertisement(adv, sdu)?;
@@ -151,6 +169,16 @@ impl Resource {
     /// Resource flags. Lock-free.
     pub fn flags(&self) -> ResourceFlags {
         self.flags
+    }
+
+    /// Whether this resource is a response to a request. Lock-free.
+    pub fn is_response(&self) -> bool {
+        self.flags.is_response
+    }
+
+    /// Get the request ID, if this resource is part of a request/response exchange.
+    pub fn request_id(&self) -> Option<[u8; 16]> {
+        self.inner.read().unwrap().request_id()
     }
 
     // ========================================================================

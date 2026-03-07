@@ -981,6 +981,22 @@ impl LinkInner {
             .decrypt(OsRng, text, &self.derived_key, out_buf)
     }
 
+    /// Build a standalone encryption closure that captures cloned key material.
+    ///
+    /// The returned closure can encrypt data without holding the link lock,
+    /// which is needed when creating Resource objects for response fallback.
+    /// Safe because the derived key is immutable after link activation.
+    pub fn build_encrypt_fn(&self) -> Box<crate::resource::EncryptFn> {
+        let priv_identity = self.priv_identity.clone();
+        let key_bytes = *self.derived_key.as_bytes();
+        Box::new(move |data: &[u8]| -> Result<Vec<u8>, RnsError> {
+            let dk = DerivedKey::from_raw(key_bytes);
+            let mut buf = vec![0u8; data.len() + 128];
+            let encrypted = priv_identity.encrypt(OsRng, data, &dk, &mut buf)?;
+            Ok(encrypted.to_vec())
+        })
+    }
+
     pub fn destination(&self) -> &DestinationDesc {
         &self.destination
     }

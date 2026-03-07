@@ -403,8 +403,8 @@ impl ResourceInner {
             encrypted,
             compressed,
             split: total_segments > 1,
-            is_request: false,
-            is_response: false,
+            is_request: config.request_id.is_some() && !config.is_response,
+            is_response: config.request_id.is_some() && config.is_response,
             has_metadata,
         };
 
@@ -450,8 +450,8 @@ impl ResourceInner {
             timeout_factor: PART_TIMEOUT_FACTOR,
             part_timeout_factor: PART_TIMEOUT_FACTOR,
             sender_grace_time: SENDER_GRACE_TIME,
+            request_id: config.request_id,
             config,
-            request_id: None,
             metadata: metadata_bytes,
             original_data: Some(data.to_vec()),
             progress_callback: None,
@@ -591,6 +591,11 @@ impl ResourceInner {
     /// Get current segment index
     pub fn segment_index(&self) -> usize {
         self.segment_index
+    }
+
+    /// Get the request ID, if this resource is part of a request/response exchange.
+    pub fn request_id(&self) -> Option<[u8; 16]> {
+        self.request_id
     }
 
     /// Check if resource is compressed

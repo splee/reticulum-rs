@@ -185,6 +185,13 @@ impl Link {
         Ok(())
     }
 
+    /// Send a resource hashmap update packet over the link.
+    pub async fn send_resource_hashmap_update(&self, data: &[u8]) -> Result<(), RnsError> {
+        let packet = self.inner.lock().await.resource_hashmap_update_packet(data)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
     // ========================================================================
     // Resource tracking (lock inner only, no send)
     // ========================================================================
