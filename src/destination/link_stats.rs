@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::packet::{MAX_SUPPORTED_LINK_MTU, RETICULUM_MTU};
+
 /// Statistics for a link
 #[derive(Debug, Clone)]
 pub struct LinkStats {
@@ -245,9 +247,9 @@ pub struct LinkMtuConfig {
 impl Default for LinkMtuConfig {
     fn default() -> Self {
         Self {
-            mtu: 500, // Default Reticulum MTU
+            mtu: RETICULUM_MTU,
             min_mtu: 219, // Absolute minimum
-            max_mtu: 500, // Default maximum
+            max_mtu: MAX_SUPPORTED_LINK_MTU,
             discovery_enabled: true,
             discovered: false,
         }
@@ -258,7 +260,7 @@ impl LinkMtuConfig {
     /// Create with a specific MTU
     pub fn with_mtu(mtu: usize) -> Self {
         Self {
-            mtu: mtu.clamp(219, 500),
+            mtu: mtu.clamp(219, MAX_SUPPORTED_LINK_MTU),
             discovered: true,
             ..Default::default()
         }
@@ -289,7 +291,7 @@ impl LinkMtuConfig {
         let discovery_enabled = bytes[2] & 0x01 != 0;
 
         Some(Self {
-            mtu: mtu.clamp(219, 500),
+            mtu: mtu.clamp(219, MAX_SUPPORTED_LINK_MTU),
             discovery_enabled,
             discovered: true,
             ..Default::default()

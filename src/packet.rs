@@ -38,15 +38,23 @@ const _: () = assert!(ENCRYPTED_MDU == 383);
 // Packet payload buffer size (plain MDU)
 pub const PACKET_MDU: usize = RETICULUM_MDU;
 
-/// Maximum wire-level data payload after the smallest possible header.
+/// Maximum wire-level data payload buffer capacity.
 ///
-/// This differs from RETICULUM_MDU (464), which is the max *plaintext* data
-/// assuming HEADER_MAX_SIZE. Link-encrypted packets use HEADER_MIN_SIZE,
-/// so their ciphertext can be larger than RETICULUM_MDU on the wire.
+/// Larger than RETICULUM_MTU to support relaying packets from peers using
+/// link MTU discovery. Python's Link MTU Discovery allows links to negotiate
+/// MTUs above the standard 500-byte RETICULUM_MTU (up to HW_MTU of the
+/// interface). Resource transfer segments are sized to the negotiated MTU,
+/// producing wire packets that exceed 500 bytes.
 ///
-/// Using the full MTU as the buffer capacity guarantees that any single
-/// packet's data portion fits, regardless of header type.
-pub const PACKET_DATA_MAX: usize = RETICULUM_MTU;
+/// Links negotiated through this implementation are clamped to
+/// MAX_SUPPORTED_LINK_MTU so resource segments fit within this buffer.
+pub const PACKET_DATA_MAX: usize = 1024;
+
+/// Maximum link MTU this implementation can handle.
+///
+/// Derived from PACKET_DATA_MAX minus the minimum header overhead, ensuring
+/// any packet produced by a link at this MTU fits within our buffers.
+pub const MAX_SUPPORTED_LINK_MTU: usize = PACKET_DATA_MAX + HEADER_MIN_SIZE;
 
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 

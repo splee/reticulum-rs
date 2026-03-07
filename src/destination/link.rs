@@ -19,7 +19,7 @@ use crate::{
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
-        RETICULUM_MTU,
+        MAX_SUPPORTED_LINK_MTU, RETICULUM_MTU,
     },
     resource::{ResourceInner, ResourceAdvertisement},
 };
@@ -30,7 +30,7 @@ use super::DestinationDesc;
 type ResourceAcceptCallback = Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>;
 
 /// Size of MTU/mode signalling field in link packets (3 bytes).
-const LINK_MTU_SIZE: usize = 3;
+pub(crate) const LINK_MTU_SIZE: usize = 3;
 
 /// Default link MTU matching Python's RNS.Reticulum.MTU (500 bytes).
 const DEFAULT_LINK_MTU: u32 = 500;
@@ -62,7 +62,7 @@ pub enum ResourceStrategy {
 }
 
 /// MTU byte mask for extracting MTU from signalling bytes (21 bits).
-const MTU_BYTEMASK: u32 = 0x1FFFFF;
+pub(crate) const MTU_BYTEMASK: u32 = 0x1FFFFF;
 
 /// Mode byte mask for extracting mode from signalling bytes.
 const MODE_BYTEMASK: u32 = 0xE0;
@@ -73,7 +73,7 @@ const MODE_BYTEMASK: u32 = 0xE0;
 /// Format: Big-endian 24-bit value where:
 /// - Lower 21 bits: MTU value
 /// - Upper 3 bits: Mode (shifted left by 5)
-fn signalling_bytes(mtu: u32, mode: LinkMode) -> [u8; LINK_MTU_SIZE] {
+pub(crate) fn signalling_bytes(mtu: u32, mode: LinkMode) -> [u8; LINK_MTU_SIZE] {
     let signalling_value = (mtu & MTU_BYTEMASK) + ((((mode as u32) << 5) & MODE_BYTEMASK) << 16);
     // Pack as big-endian 32-bit, take last 3 bytes (like Python's struct.pack(">I", ...)[1:])
     let packed = signalling_value.to_be_bytes();
@@ -411,9 +411,9 @@ impl LinkInner {
             (DEFAULT_LINK_MTU, LinkMode::default())
         };
 
-        // Clamp MTU to Reticulum's standard MTU to match Rust packet buffer limits.
-        if mtu > RETICULUM_MTU as u32 {
-            mtu = RETICULUM_MTU as u32;
+        // Clamp MTU to the maximum this implementation can handle.
+        if mtu > MAX_SUPPORTED_LINK_MTU as u32 {
+            mtu = MAX_SUPPORTED_LINK_MTU as u32;
         }
 
         let link_id = LinkId::from(packet);

@@ -20,7 +20,9 @@ use crate::destination::link::LinkInner;
 use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkResult;
 use crate::destination::link::LinkId;
+use crate::destination::link::LinkMode;
 use crate::destination::link::LinkStatus;
+use crate::destination::link::{LINK_MTU_SIZE, MTU_BYTEMASK};
 use crate::destination::plain::PlainDestination;
 use crate::destination::DestinationAnnounce;
 use crate::destination::DestinationDesc;
@@ -53,6 +55,7 @@ use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::packet::TransportType;
+use crate::packet::MAX_SUPPORTED_LINK_MTU;
 use crate::receipt::{PacketReceiptInner, ReceiptManager, EXPLICIT_PROOF_LENGTH};
 use crate::discovery::{InterfaceDiscoveryStorage, PythonDiscoveryHandler, DEFAULT_DISCOVERY_STAMP_VALUE};
 use crate::persistence::{KnownDestinations, RatchetManager};
@@ -3028,7 +3031,60 @@ async fn handle_link_request_as_intermediate<'a>(
         next_hop_iface
     );
 
-    send_to_next_hop(packet, &handler, None).await;
+    // Clamp link MTU signalling in relayed link requests so that endpoints
+    // behind this hub don't negotiate MTUs we can't relay.
+    // Matches Python Transport.py intermediate hop behavior.
+    let mut packet = *packet;
+    clamp_link_request_mtu(&mut packet);
+
+    send_to_next_hop(&packet, &handler, None).await;
+}
+
+/// Clamp the MTU signalling bytes in a link request packet if the advertised
+/// MTU exceeds what this implementation can handle.
+///
+/// Link request data layout:
+///   [0..32]  X25519 public key
+///   [32..64] Ed25519 verifying key
+///   [64..67] signalling bytes (optional): MTU + mode
+///
+/// The signalling bytes encode MTU in the lower 21 bits and mode in the
+/// upper 3 bits of a big-endian 24-bit value. If the MTU exceeds
+/// MAX_SUPPORTED_LINK_MTU, we rewrite the signalling bytes with the clamped
+/// value while preserving the mode bits.
+fn clamp_link_request_mtu(packet: &mut Packet) {
+    const SIG_OFFSET: usize = 64; // PUBLIC_KEY_LENGTH * 2
+    if packet.data.len() < SIG_OFFSET + LINK_MTU_SIZE {
+        return;
+    }
+
+    let sig_bytes = &packet.data.as_slice()[SIG_OFFSET..SIG_OFFSET + LINK_MTU_SIZE];
+    let mtu_value = ((sig_bytes[0] as u32) << 16)
+        + ((sig_bytes[1] as u32) << 8)
+        + (sig_bytes[2] as u32);
+    let mtu = mtu_value & MTU_BYTEMASK;
+
+    if mtu > MAX_SUPPORTED_LINK_MTU as u32 {
+        // Extract mode from the upper bits and re-encode with clamped MTU.
+        let mode_byte = (sig_bytes[0] >> 5) & 0x07;
+        let mode = if mode_byte == 0 {
+            LinkMode::Aes128Cbc
+        } else {
+            LinkMode::Aes256Cbc
+        };
+        let new_sig = crate::destination::link::signalling_bytes(
+            MAX_SUPPORTED_LINK_MTU as u32,
+            mode,
+        );
+        let data_slice = packet.data.as_mut_slice();
+        data_slice[SIG_OFFSET..SIG_OFFSET + LINK_MTU_SIZE].copy_from_slice(&new_sig);
+
+        log::debug!(
+            "tp: clamped link request MTU from {} to {} for relay",
+            mtu,
+            MAX_SUPPORTED_LINK_MTU
+        );
+    }
 }
 
 async fn handle_link_request<'a>(
