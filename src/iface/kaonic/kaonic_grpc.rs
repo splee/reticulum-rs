@@ -120,10 +120,18 @@ impl KaonicGrpc {
                                         let module = current_config.lock().await.module;
                                         if frame.length > 0 && response.module == module {
                                             if let Ok(buf) = decode_frame_to_buffer(&frame, &mut rx_buffer[..]) {
-                                                if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(buf)) {
+                                                match Packet::deserialize(&mut InputBuffer::new(buf)) {
+                                                    Ok(packet) => {
                                                         let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
-                                                } else {
-                                                    log::warn!("kaonic_grpc: couldn't decode packet");
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "kaonic_grpc: couldn't decode packet ({}) raw ({} bytes): {:02x?}",
+                                                            e,
+                                                            buf.len(),
+                                                            &buf[..buf.len().min(64)]
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
