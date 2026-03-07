@@ -438,6 +438,9 @@ impl RemoteClient {
 
         // Resource state for handling resource-based responses
         let mut response_resource: Option<Resource> = None;
+        // Cumulative bytes received for the current resource transfer, used to
+        // detect a peer that advertises one size but sends more data than claimed.
+        let mut resource_bytes_received: usize = 0;
 
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -493,6 +496,7 @@ impl RemoteClient {
                                                 resource.mark_request_sent(req_data.len());
                                             }
                                             response_resource = Some(resource);
+                                            resource_bytes_received = 0;
                                         }
                                         Err(e) => {
                                             log::warn!(
@@ -514,6 +518,18 @@ impl RemoteClient {
                         // Resource data part received
                         LinkEvent::ResourceData(payload) => {
                             if let Some(ref resource) = response_resource {
+                                // Guard against a peer sending more data than advertised
+                                resource_bytes_received += payload.len();
+                                if resource_bytes_received > resource.size() {
+                                    log::warn!(
+                                        "request: received {} bytes exceeds advertised \
+                                         transfer size {} — cancelling resource",
+                                        resource_bytes_received, resource.size(),
+                                    );
+                                    response_resource = None;
+                                    continue;
+                                }
+
                                 if resource.receive_part(payload.as_slice().to_vec()) {
                                     if resource.is_complete() {
                                         // All parts received — assemble the response
