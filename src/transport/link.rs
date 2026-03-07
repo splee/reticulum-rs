@@ -9,13 +9,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
-use crate::destination::link::{LinkInner, LinkId, LinkStatus, ResourceId};
+use crate::destination::link::{LinkEventData, LinkEvent, LinkInner, LinkId, LinkStatus, ResourceId};
 use crate::destination::request_receipt::SharedRequestReceipt;
 use crate::destination::DestinationDesc;
 use crate::error::RnsError;
 use crate::identity::{Identity, PrivateIdentity};
+use crate::packet::RETICULUM_MDU;
 use crate::resource::ResourceAdvertisement;
 
 use super::{Resource, TransportHandler};
@@ -37,6 +38,9 @@ pub struct Link {
 
     // Transport send capability — locked to send packets
     handler: Arc<Mutex<TransportHandler>>,
+
+    // Broadcast sender for out-link events (used for resource-based response handling)
+    link_out_event_tx: broadcast::Sender<LinkEventData>,
 }
 
 impl Link {
@@ -51,6 +55,7 @@ impl Link {
         id: LinkId,
         destination: DestinationDesc,
         initiator: bool,
+        link_out_event_tx: broadcast::Sender<LinkEventData>,
     ) -> Self {
         Self {
             id,
@@ -58,6 +63,7 @@ impl Link {
             initiator,
             inner,
             handler,
+            link_out_event_tx,
         }
     }
 
@@ -192,6 +198,20 @@ impl Link {
         Ok(())
     }
 
+    /// Send a resource request packet on this link.
+    pub(crate) async fn send_resource_request(&self, request_data: &[u8]) -> Result<(), RnsError> {
+        let packet = self.inner.lock().await.resource_request_packet(request_data)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
+    /// Send a resource proof packet on this link.
+    pub(crate) async fn send_resource_proof(&self, proof_data: &[u8]) -> Result<(), RnsError> {
+        let packet = self.inner.lock().await.resource_proof_packet(proof_data)?;
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
     // ========================================================================
     // Resource tracking (lock inner only, no send)
     // ========================================================================
@@ -312,9 +332,286 @@ impl Link {
         timeout: Option<Duration>,
     ) -> Result<SharedRequestReceipt, RnsError> {
         let (receipt, packet) = self.inner.lock().await.send_request(path, data, timeout)?;
+        let request_id = *receipt.lock().await.request_id();
         self.handler.lock().await.send_packet(packet).await;
+
+        // Spawn a background task that subscribes to out-link events and
+        // transparently drives Resource-based response transfers. If the
+        // response fits in a single packet, `handle_response()` resolves the
+        // receipt directly and this task exits on the `concluded()` check.
+        let events_rx = self.link_out_event_tx.subscribe();
+        tokio::spawn(drive_response_resource_receipt(
+            events_rx,
+            self.clone(),
+            request_id,
+        ));
+
         Ok(receipt)
     }
+}
+
+/// Maximum response resource size to prevent OOM (16 MiB).
+const MAX_RESPONSE_RESOURCE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Timeout for the response resource handler task (matches transport.rs).
+const RESPONSE_RESOURCE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Background task that drives a Resource-based response transfer for
+/// `Link::request()`. Subscribes to out-link events and handles the
+/// ResourceAdvertisement → ResourceData → completion flow.
+///
+/// When the resource transfer completes, the assembled data is fed to
+/// `LinkInner::handle_response()` which resolves the pending
+/// `SharedRequestReceipt` using existing parsing/resolution logic.
+///
+/// Exits early if:
+/// - The receipt is already concluded (single-packet response resolved it)
+/// - The link closes
+/// - The 120-second deadline expires
+async fn drive_response_resource_receipt(
+    mut events: broadcast::Receiver<LinkEventData>,
+    link: Link,
+    request_id: [u8; 16],
+) {
+    let deadline = tokio::time::Instant::now() + RESPONSE_RESOURCE_TIMEOUT;
+    let mut response_resource: Option<Resource> = None;
+    let mut resource_bytes_received: usize = 0;
+
+    loop {
+        // Early exit if the receipt was already resolved (single-packet response
+        // or timed out via the receipt's own timeout).
+        {
+            let inner = link.inner.lock().await;
+            if inner.get_pending_request(&request_id).is_none() {
+                return;
+            }
+        }
+
+        tokio::select! {
+            result = events.recv() => {
+                match result {
+                    Ok(event) => {
+                        if event.id != link.id {
+                            continue;
+                        }
+                        match &event.event {
+                            LinkEvent::ResourceAdvertisement(payload) => {
+                                match ResourceAdvertisement::unpack(payload.as_slice()) {
+                                    Ok(adv) => {
+                                        if !adv.is_response() {
+                                            continue;
+                                        }
+
+                                        // Verify the request_id matches our pending request
+                                        if let Some(adv_req_id) = adv.request_id {
+                                            if adv_req_id != request_id {
+                                                continue;
+                                            }
+                                        }
+
+                                        if adv.transfer_size > MAX_RESPONSE_RESOURCE_SIZE {
+                                            log::warn!(
+                                                "link({}): rejecting response resource ({} bytes \
+                                                 exceeds {} byte limit)",
+                                                link.id, adv.transfer_size, MAX_RESPONSE_RESOURCE_SIZE,
+                                            );
+                                            continue;
+                                        }
+
+                                        log::debug!(
+                                            "link({}): received response resource advertisement \
+                                             ({} parts, {} bytes)",
+                                            link.id, adv.num_parts, adv.transfer_size,
+                                        );
+
+                                        match Resource::from_advertisement(&adv, RETICULUM_MDU) {
+                                            Ok(resource) => {
+                                                // Request first batch of parts
+                                                if let Some(req_data) = resource.request_next() {
+                                                    if let Err(e) = link.send_resource_request(&req_data).await {
+                                                        log::warn!(
+                                                            "link({}): failed to send resource request: {:?}",
+                                                            link.id, e,
+                                                        );
+                                                        return;
+                                                    }
+                                                    resource.mark_request_sent(req_data.len());
+                                                }
+                                                response_resource = Some(resource);
+                                                resource_bytes_received = 0;
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "link({}): failed to create resource from advertisement: {:?}",
+                                                    link.id, e,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "link({}): failed to unpack resource advertisement: {:?}",
+                                            link.id, e,
+                                        );
+                                    }
+                                }
+                            }
+
+                            LinkEvent::ResourceData(payload) => {
+                                if let Some(ref resource) = response_resource {
+                                    // Guard against a peer sending more data than advertised
+                                    resource_bytes_received += payload.len();
+                                    if resource_bytes_received > resource.size() {
+                                        log::warn!(
+                                            "link({}): received {} bytes exceeds advertised \
+                                             transfer size {} — cancelling resource",
+                                            link.id, resource_bytes_received, resource.size(),
+                                        );
+                                        response_resource = None;
+                                        continue;
+                                    }
+
+                                    if resource.receive_part(payload.as_slice().to_vec()) {
+                                        if resource.is_complete() {
+                                            // All parts received — assemble, decrypt, finalize
+                                            finalize_and_resolve(
+                                                resource, &link, &request_id,
+                                            ).await;
+                                            return;
+                                        }
+
+                                        // Request more parts
+                                        if let Some(req_data) = resource.request_next() {
+                                            if let Err(e) = link.send_resource_request(&req_data).await {
+                                                log::warn!(
+                                                    "link({}): failed to send resource request: {:?}",
+                                                    link.id, e,
+                                                );
+                                                return;
+                                            }
+                                            resource.mark_request_sent(req_data.len());
+                                        }
+                                    }
+                                }
+                            }
+
+                            LinkEvent::ResourceHashmapUpdate(payload) => {
+                                if let Some(ref resource) = response_resource {
+                                    if let Some((_hash, segment, hashmap_data)) =
+                                        Resource::parse_hashmap_update(payload.as_slice())
+                                    {
+                                        resource.update_hashmap(segment, &hashmap_data);
+
+                                        // Request more parts after hashmap update
+                                        if let Some(req_data) = resource.request_next() {
+                                            if let Err(e) = link.send_resource_request(&req_data).await {
+                                                log::warn!(
+                                                    "link({}): failed to send resource request: {:?}",
+                                                    link.id, e,
+                                                );
+                                                return;
+                                            }
+                                            resource.mark_request_sent(req_data.len());
+                                        }
+                                    }
+                                }
+                            }
+
+                            LinkEvent::Closed => {
+                                return;
+                            }
+
+                            _ => {}
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "link({}): response resource handler lagged {} events",
+                            link.id, n,
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(deadline) => {
+                log::debug!(
+                    "link({}): response resource handler timed out for request {}",
+                    link.id, hex::encode(&request_id[..8]),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Assemble, decrypt, finalize the resource and resolve the pending request receipt.
+async fn finalize_and_resolve(
+    resource: &Resource,
+    link: &Link,
+    request_id: &[u8; 16],
+) {
+    // Get the raw assembled data (still encrypted)
+    let raw_data = match resource.get_raw_assembled_data() {
+        Some(data) => data,
+        None => {
+            log::warn!(
+                "link({}): failed to get raw assembled data for response resource",
+                link.id,
+            );
+            return;
+        }
+    };
+
+    // Decrypt if the resource was encrypted
+    let decrypted = if resource.is_encrypted() {
+        match link.decrypt(&raw_data).await {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!(
+                    "link({}): failed to decrypt response resource: {:?}",
+                    link.id, e,
+                );
+                return;
+            }
+        }
+    } else {
+        raw_data
+    };
+
+    // Finalize assembly (strips random hash, decompresses, verifies hash)
+    let assembled = match resource.finalize_assembly(decrypted) {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!(
+                "link({}): failed to finalize response resource: {:?}",
+                link.id, e,
+            );
+            return;
+        }
+    };
+
+    // Send proof to acknowledge successful receipt
+    let proof = resource.generate_proof_with_data(&assembled);
+    if let Err(e) = link.send_resource_proof(&proof).await {
+        log::warn!(
+            "link({}): failed to send resource proof: {:?}",
+            link.id, e,
+        );
+        // Continue anyway — the receipt should still be resolved
+    }
+
+    // Resolve the pending request receipt via handle_response()
+    // The assembled data is the same [request_id, response_data] msgpack
+    // that handle_response() already knows how to parse.
+    link.inner.lock().await.handle_response(&assembled);
+
+    log::debug!(
+        "link({}): response resource transfer complete for request {} ({} bytes)",
+        link.id, hex::encode(&request_id[..8]), assembled.len(),
+    );
 }
 
 impl std::fmt::Debug for Link {
