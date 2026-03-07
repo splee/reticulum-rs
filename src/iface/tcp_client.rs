@@ -215,13 +215,22 @@ impl TcpClient {
                                                     };
 
                                                     if decode_result.is_ok() {
-                                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
-                                                            if PACKET_TRACE {
-                                                                log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
+                                                        match Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
+                                                            Ok(packet) => {
+                                                                if PACKET_TRACE {
+                                                                    log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
+                                                                }
+                                                                let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
                                                             }
-                                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
-                                                        } else {
-                                                            log::warn!("tcp_client: couldn't decode packet");
+                                                            Err(e) => {
+                                                                let raw = output.as_slice();
+                                                                log::warn!(
+                                                                    "tcp_client: couldn't decode packet ({}) raw ({} bytes): {:02x?}",
+                                                                    e,
+                                                                    raw.len(),
+                                                                    &raw[..raw.len().min(64)]
+                                                                );
+                                                            }
                                                         }
                                                     } else {
                                                         let framing = if kiss_framing { "kiss" } else { "hdlc" };

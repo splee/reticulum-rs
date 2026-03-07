@@ -297,29 +297,38 @@ impl LocalClientInterface {
                                                 let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
 
                                                 if Hdlc::decode(frame_buffer, &mut output).is_ok() {
-                                                    if let Ok(packet) = Packet::deserialize(
+                                                    match Packet::deserialize(
                                                         &mut InputBuffer::new(output.as_slice())
                                                     ) {
-                                                        // Debug log for all received packets to trace IPC relay
-                                                        log::debug!(
-                                                            "local_client: rx << received {:?} packet (dst={}) from <{}>",
-                                                            packet.header.packet_type,
-                                                            packet.destination,
-                                                            peer_addr
-                                                        );
-                                                        if PACKET_TRACE {
+                                                        Ok(packet) => {
+                                                            // Debug log for all received packets to trace IPC relay
                                                             log::debug!(
-                                                                "local_client: rx << ({}) {}",
-                                                                iface_address,
+                                                                "local_client: rx << received {:?} packet (dst={}) from <{}>",
+                                                                packet.header.packet_type,
+                                                                packet.destination,
+                                                                peer_addr
+                                                            );
+                                                            if PACKET_TRACE {
+                                                                log::debug!(
+                                                                    "local_client: rx << ({}) {}",
+                                                                    iface_address,
+                                                                    packet
+                                                                );
+                                                            }
+                                                            let _ = rx_channel.send(RxMessage {
+                                                                address: iface_address,
                                                                 packet
+                                                            }).await;
+                                                        }
+                                                        Err(e) => {
+                                                            let raw = output.as_slice();
+                                                            log::warn!(
+                                                                "local_client: couldn't decode packet ({}) raw ({} bytes): {:02x?}",
+                                                                e,
+                                                                raw.len(),
+                                                                &raw[..raw.len().min(64)]
                                                             );
                                                         }
-                                                        let _ = rx_channel.send(RxMessage {
-                                                            address: iface_address,
-                                                            packet
-                                                        }).await;
-                                                    } else {
-                                                        log::warn!("local_client: couldn't decode packet");
                                                     }
                                                 } else {
                                                     log::warn!("local_client: couldn't decode hdlc frame");

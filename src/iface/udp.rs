@@ -112,13 +112,22 @@ impl UdpInterface {
                                         // Track received bytes for stats
                                         metadata.add_rx_bytes(n as u64);
 
-                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&rx_buffer[..n])) {
-                                            if PACKET_TRACE {
-                                                log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
+                                        match Packet::deserialize(&mut InputBuffer::new(&rx_buffer[..n])) {
+                                            Ok(packet) => {
+                                                if PACKET_TRACE {
+                                                    log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
+                                                }
+                                                let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
                                             }
-                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
-                                        } else {
-                                            log::warn!("udp_interface: couldn't decode packet");
+                                            Err(e) => {
+                                                let raw = &rx_buffer[..n];
+                                                log::warn!(
+                                                    "udp_interface: couldn't decode packet ({}) raw ({} bytes): {:02x?}",
+                                                    e,
+                                                    raw.len(),
+                                                    &raw[..raw.len().min(64)]
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
