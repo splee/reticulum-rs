@@ -814,7 +814,6 @@ impl Transport {
     ) {
         use crate::destination::link::LinkEvent;
         use crate::destination::request::{parse_request, pack_response};
-        use crate::resource::ResourceConfig;
 
         let dest_hash = *dest.address_hash();
         let router = dest.router().clone();
@@ -939,11 +938,9 @@ impl Transport {
                                                                     })
                                                             };
 
-                                                            let config = ResourceConfig::default();
                                                             match Resource::new_response(
                                                                 &mut OsRng,
                                                                 &packed,
-                                                                config,
                                                                 encrypt_fn.as_deref(),
                                                                 *request_id,
                                                             ) {

@@ -97,6 +97,13 @@ pub struct ResourceConfig {
     pub max_retries: u32,
     /// Maximum advertisement retries
     pub max_adv_retries: u32,
+    /// Optional request ID for request/response resource transfers.
+    /// When set together with `is_response`, the resource advertisement
+    /// carries this ID so the receiver can match it to a pending request.
+    pub request_id: Option<[u8; 16]>,
+    /// Whether this resource is a response to a request (vs. a request itself).
+    /// Only meaningful when `request_id` is `Some`.
+    pub is_response: bool,
 }
 
 impl Default for ResourceConfig {
@@ -107,6 +114,8 @@ impl Default for ResourceConfig {
             timeout: None,
             max_retries: MAX_RETRIES,
             max_adv_retries: MAX_ADV_RETRIES,
+            request_id: None,
+            is_response: false,
         }
     }
 }

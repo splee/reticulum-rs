@@ -300,7 +300,7 @@ fn main() {
                 ..ResourceConfig::default()
             };
 
-            let resource = match Resource::new(&mut rng, &data, config, None, None, None, false) {
+            let resource = match Resource::new(&mut rng, &data, config, None, None) {
                 Ok(r) => r,
                 Err(e) => {
                     log::error!("Failed to create resource: {:?}", e);

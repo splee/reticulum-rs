@@ -492,7 +492,7 @@ mod tests {
         // When adv_sent is None, should just sleep briefly
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None, None, false).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // adv_sent is None by default for outgoing resources
         let action = determine_advertised_action(&resource);
         matches!(action, WatchdogAction::Sleep(_));
@@ -502,7 +502,7 @@ mod tests {
     fn test_sender_transferring_within_timeout() {
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None, None, false).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // Resource was just created, so last_activity is recent — should sleep
         let link_rtt = Duration::from_millis(100);
         let action = determine_sender_transferring_action(&resource, link_rtt);
@@ -513,7 +513,7 @@ mod tests {
     fn test_awaiting_proof_no_last_part_sent() {
         use rand_core::OsRng;
         let config = super::super::config::ResourceConfig::default();
-        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None, None, false).unwrap();
+        let resource = ResourceInner::new(&mut OsRng, b"test data", config, None, None).unwrap();
         // last_part_sent is None — should just sleep
         let link_rtt = Duration::from_millis(100);
         let action = determine_awaiting_proof_action(&resource, link_rtt);

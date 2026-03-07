@@ -68,10 +68,8 @@ impl Resource {
         config: ResourceConfig,
         metadata: Option<&[u8]>,
         encrypt_fn: Option<&EncryptFn>,
-        request_id: Option<[u8; 16]>,
-        is_response: bool,
     ) -> Result<Self, RnsError> {
-        let inner = ResourceInner::new(rng, data, config, metadata, encrypt_fn, request_id, is_response)?;
+        let inner = ResourceInner::new(rng, data, config, metadata, encrypt_fn)?;
         let arc = Arc::new(RwLock::new(inner));
         Ok(Self::from_inner(arc))
     }
@@ -83,11 +81,15 @@ impl Resource {
     pub fn new_response<R: CryptoRngCore>(
         rng: &mut R,
         data: &[u8],
-        config: ResourceConfig,
         encrypt_fn: Option<&EncryptFn>,
         request_id: [u8; 16],
     ) -> Result<Self, RnsError> {
-        Self::new(rng, data, config, None, encrypt_fn, Some(request_id), true)
+        let config = ResourceConfig {
+            request_id: Some(request_id),
+            is_response: true,
+            ..ResourceConfig::default()
+        };
+        Self::new(rng, data, config, None, encrypt_fn)
     }
 
     /// Create an incoming resource from an advertisement.

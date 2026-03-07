@@ -637,7 +637,7 @@ async fn handle_fetch_request(
     };
 
     let mut rng = OsRng;
-    let resource = match Resource::new(&mut rng, &file_data, resource_config, Some(&metadata), None, None, false) {
+    let resource = match Resource::new(&mut rng, &file_data, resource_config, Some(&metadata), None) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Failed to create resource: {:?}", e);
