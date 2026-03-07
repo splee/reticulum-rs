@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 
+use crate::destination::link::LinkEvent;
 use crate::destination::link::LinkInner;
 use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkResult;
@@ -812,7 +813,6 @@ impl Transport {
         dest: &RegisteredDestination,
         cancel: CancellationToken,
     ) {
-        use crate::destination::link::LinkEvent;
         use crate::destination::request::{parse_request, pack_response};
 
         let dest_hash = *dest.address_hash();
@@ -1869,6 +1869,95 @@ impl Drop for Transport {
     }
 }
 
+/// Outcome of handling a single link event during an outgoing resource transfer.
+enum ResourceTransferAction {
+    /// Continue waiting for more events.
+    Continue,
+    /// Transfer completed successfully.
+    Completed,
+    /// Transfer failed — abort.
+    Failed,
+}
+
+/// Handle a single link event for an outgoing response resource transfer.
+///
+/// Processes ResourceRequest (send HMU + parts), ResourceProof (verify and
+/// complete), and Closed (abort). Returns the action the caller should take.
+async fn handle_resource_transfer_event(
+    event: &LinkEvent,
+    resource: &Resource,
+    link_handle: &Link,
+    label: &str,
+    resource_hash: &str,
+) -> ResourceTransferAction {
+    match event {
+        LinkEvent::ResourceRequest(payload) => {
+            match resource.handle_request(payload.as_slice()) {
+                Ok(result) => {
+                    // Send hashmap update if needed
+                    if let Some(ref hmu_data) = result.hashmap_update {
+                        if let Err(e) =
+                            link_handle.send_resource_hashmap_update(hmu_data).await
+                        {
+                            log::warn!(
+                                "{}: failed to send HMU for {}: {:?}",
+                                label, resource_hash, e,
+                            );
+                        }
+                    }
+
+                    // Send requested parts
+                    let parts: Vec<_> = result
+                        .parts_to_send
+                        .iter()
+                        .filter_map(|&idx| resource.get_part_data(idx).map(|d| (idx, d)))
+                        .collect();
+
+                    for (idx, part_data) in parts {
+                        if let Err(e) = link_handle.send_resource_data(&part_data).await {
+                            log::warn!(
+                                "{}: failed to send part {} of {}: {:?}",
+                                label, idx, resource_hash, e,
+                            );
+                            return ResourceTransferAction::Failed;
+                        }
+                        resource.mark_part_sent(idx);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "{}: handle_request error for {}: {:?}",
+                        label, resource_hash, e,
+                    );
+                }
+            }
+            ResourceTransferAction::Continue
+        }
+
+        LinkEvent::ResourceProof(payload) => {
+            if resource.verify_proof(payload.as_slice()) {
+                log::debug!(
+                    "{}: response resource {} proof verified, transfer complete",
+                    label, resource_hash,
+                );
+                ResourceTransferAction::Completed
+            } else {
+                ResourceTransferAction::Continue
+            }
+        }
+
+        LinkEvent::Closed => {
+            log::debug!(
+                "{}: link closed during response resource {} transfer",
+                label, resource_hash,
+            );
+            ResourceTransferAction::Failed
+        }
+
+        _ => ResourceTransferAction::Continue,
+    }
+}
+
 /// Drive a response resource transfer on an incoming link.
 ///
 /// Spawned by `start_request_dispatch()` when a response exceeds the link MDU.
@@ -1886,8 +1975,6 @@ async fn drive_response_resource(
     cancel: CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    use crate::destination::link::LinkEvent;
-
     let resource_hash = hex::encode(&resource.hash()[..8]);
 
     // Build a Link facade for this incoming link
@@ -1908,7 +1995,7 @@ async fn drive_response_resource(
         Link::new(link_arc, transport.clone(), id, destination, initiator)
     };
 
-    // Register the resource as outgoing on the link
+    // Register the resource as outgoing on the link and send advertisement
     if let Err(e) = link_handle.register_outgoing_resource(&resource).await {
         log::warn!(
             "{}: failed to register outgoing response resource {}: {:?}",
@@ -1916,8 +2003,6 @@ async fn drive_response_resource(
         );
         return;
     }
-
-    // Send the advertisement
     let advertisement = resource.create_advertisement();
     if let Err(e) = link_handle.send_resource_advertisement(&advertisement, 0).await {
         log::warn!(
@@ -1929,116 +2014,57 @@ async fn drive_response_resource(
     resource.mark_adv_sent();
     log::debug!("{}: sent response resource advertisement {}", label, resource_hash);
 
-    // Subscribe to link events and drive the transfer
+    // Drive the transfer event loop
+    let success = drive_resource_event_loop(
+        &link_in_event_tx, &link_id, &resource, &link_handle,
+        &label, &resource_hash, &cancel,
+    ).await;
+
+    link_handle
+        .resource_concluded(resource.truncated_hash(), success)
+        .await;
+}
+
+/// Event loop that drives an outgoing resource transfer to completion.
+///
+/// Returns `true` if the transfer completed successfully, `false` on
+/// timeout, cancellation, channel closure, or send failure.
+async fn drive_resource_event_loop(
+    link_in_event_tx: &broadcast::Sender<LinkEventData>,
+    link_id: &AddressHash,
+    resource: &Resource,
+    link_handle: &Link,
+    label: &str,
+    resource_hash: &str,
+    cancel: &CancellationToken,
+) -> bool {
     let mut link_events = link_in_event_tx.subscribe();
     let deadline = tokio::time::Instant::now() + RESPONSE_RESOURCE_TIMEOUT;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            log::warn!(
-                "{}: response resource {} timed out",
-                label, resource_hash,
-            );
-            link_handle.resource_concluded(resource.truncated_hash(), false).await;
-            return;
+            log::warn!("{}: response resource {} timed out", label, resource_hash);
+            return false;
         }
 
         tokio::select! {
             _ = cancel.cancelled() => {
-                log::debug!(
-                    "{}: response resource {} cancelled",
-                    label, resource_hash,
-                );
-                link_handle.resource_concluded(resource.truncated_hash(), false).await;
-                return;
+                log::debug!("{}: response resource {} cancelled", label, resource_hash);
+                return false;
             }
 
             result = link_events.recv() => {
                 match result {
-                    Ok(event) => {
-                        // Only handle events for our link
-                        if event.id != link_id {
-                            continue;
-                        }
-
-                        match &event.event {
-                            LinkEvent::ResourceRequest(payload) => {
-                                match resource.handle_request(payload.as_slice()) {
-                                    Ok(result) => {
-                                        // Send hashmap update if needed
-                                        if let Some(ref hmu_data) = result.hashmap_update {
-                                            if let Err(e) = link_handle
-                                                .send_resource_hashmap_update(hmu_data)
-                                                .await
-                                            {
-                                                log::warn!(
-                                                    "{}: failed to send HMU for {}: {:?}",
-                                                    label, resource_hash, e,
-                                                );
-                                            }
-                                        }
-
-                                        // Send requested parts
-                                        let parts: Vec<_> = result.parts_to_send
-                                            .iter()
-                                            .filter_map(|&idx| {
-                                                resource.get_part_data(idx).map(|d| (idx, d))
-                                            })
-                                            .collect();
-
-                                        for (idx, part_data) in parts {
-                                            if let Err(e) = link_handle
-                                                .send_resource_data(&part_data)
-                                                .await
-                                            {
-                                                log::warn!(
-                                                    "{}: failed to send part {} of {}: {:?}",
-                                                    label, idx, resource_hash, e,
-                                                );
-                                                link_handle.resource_concluded(
-                                                    resource.truncated_hash(), false,
-                                                ).await;
-                                                return;
-                                            }
-                                            resource.mark_part_sent(idx);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "{}: handle_request error for {}: {:?}",
-                                            label, resource_hash, e,
-                                        );
-                                    }
-                                }
-                            }
-
-                            LinkEvent::ResourceProof(payload) => {
-                                if resource.verify_proof(payload.as_slice()) {
-                                    log::debug!(
-                                        "{}: response resource {} proof verified, transfer complete",
-                                        label, resource_hash,
-                                    );
-                                    link_handle.resource_concluded(
-                                        resource.truncated_hash(), true,
-                                    ).await;
-                                    return;
-                                }
-                            }
-
-                            LinkEvent::Closed => {
-                                log::debug!(
-                                    "{}: link closed during response resource {} transfer",
-                                    label, resource_hash,
-                                );
-                                link_handle.resource_concluded(
-                                    resource.truncated_hash(), false,
-                                ).await;
-                                return;
-                            }
-
-                            _ => {} // Ignore other events
+                    Ok(event) if event.id == *link_id => {
+                        match handle_resource_transfer_event(
+                            &event.event, resource, link_handle, label, resource_hash,
+                        ).await {
+                            ResourceTransferAction::Continue => {}
+                            ResourceTransferAction::Completed => return true,
+                            ResourceTransferAction::Failed => return false,
                         }
                     }
+                    Ok(_) => {} // Event for a different link
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
                             "{}: response resource {} lagged {} events",
@@ -2050,10 +2076,7 @@ async fn drive_response_resource(
                             "{}: event channel closed for response resource {}",
                             label, resource_hash,
                         );
-                        link_handle.resource_concluded(
-                            resource.truncated_hash(), false,
-                        ).await;
-                        return;
+                        return false;
                     }
                 }
             }

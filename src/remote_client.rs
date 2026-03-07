@@ -30,6 +30,12 @@ use crate::ipc::addr::{IpcListener, ListenerAddr};
 use crate::ipc::{LocalClientInterface, LocalServerInterface};
 use crate::transport::{Transport, TransportConfig};
 
+/// Maximum size (in bytes) of a response resource the client will accept.
+/// This prevents a malicious server from sending an arbitrarily large resource
+/// to exhaust client memory. 16 MiB is generous for any management/control
+/// response while still providing a hard ceiling.
+const MAX_RESPONSE_RESOURCE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Aspect name for remote management destination (authenticated).
 pub const REMOTE_MANAGEMENT_ASPECT: &str = "rnstransport.remote.management";
 
@@ -457,6 +463,16 @@ impl RemoteClient {
                                 Ok(adv) => {
                                     if !adv.is_response() {
                                         // Not a response resource — ignore
+                                        continue;
+                                    }
+
+                                    // Guard against oversized resources to prevent OOM
+                                    if adv.transfer_size > MAX_RESPONSE_RESOURCE_SIZE {
+                                        log::warn!(
+                                            "request: rejecting response resource ({} bytes exceeds \
+                                             {} byte limit)",
+                                            adv.transfer_size, MAX_RESPONSE_RESOURCE_SIZE,
+                                        );
                                         continue;
                                     }
 
