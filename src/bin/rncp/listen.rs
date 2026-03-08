@@ -524,13 +524,26 @@ async fn finalize_received_resource(
     // Save file
     let mut save_path = output_dir.join(&filename);
 
-    // Handle file conflicts
-    if !allow_overwrite {
-        let mut counter = 0;
-        while save_path.exists() {
-            counter += 1;
-            save_path = output_dir.join(format!("{}.{}", filename, counter));
+    // Handle file conflicts: if overwrite is enabled, try to remove existing
+    // file first (matching Python behavior). Fall back to numbered variant if
+    // removal fails or overwrite is not enabled.
+    if allow_overwrite {
+        if save_path.exists() {
+            if let Err(e) = std::fs::remove_file(&save_path) {
+                log::error!(
+                    "Could not overwrite existing file {}, renaming instead: {}",
+                    save_path.display(),
+                    e
+                );
+            }
         }
+    }
+
+    // If file still exists (overwrite not requested or remove failed), use numbered variant
+    let mut counter = 0u32;
+    while save_path.exists() {
+        counter += 1;
+        save_path = output_dir.join(format!("{}.{}", filename, counter));
     }
 
     match File::create(&save_path) {
