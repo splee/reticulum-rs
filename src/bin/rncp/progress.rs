@@ -14,25 +14,31 @@ use reticulum::cli::format::{size_str, SPINNER_CHARS};
 /// transfer statistics (progress percentage, transferred/total size, speed).
 pub struct TransferProgress {
     total_size: usize,
+    transfer_size: usize,
     transferred: usize,
     start_time: Instant,
     spinner_idx: usize,
     silent: bool,
+    show_phy_rates: bool,
 }
 
 impl TransferProgress {
     /// Create a new progress tracker.
     ///
     /// # Arguments
-    /// * `total_size` - Total size of the transfer in bytes
+    /// * `total_size` - Total logical (uncompressed) size in bytes
+    /// * `transfer_size` - Wire-level transfer size in bytes (after compression/encryption)
     /// * `silent` - If true, suppress all progress output
-    pub fn new(total_size: usize, silent: bool) -> Self {
+    /// * `show_phy_rates` - If true, display physical layer transfer rates
+    pub fn new(total_size: usize, transfer_size: usize, silent: bool, show_phy_rates: bool) -> Self {
         Self {
             total_size,
+            transfer_size,
             transferred: 0,
             start_time: Instant::now(),
             spinner_idx: 0,
             silent,
+            show_phy_rates,
         }
     }
 
@@ -66,14 +72,26 @@ impl TransferProgress {
 
         let spinner = SPINNER_CHARS[self.spinner_idx];
 
+        // Compute physical layer rate string if enabled.
+        // Physical speed is derived from data speed scaled by the ratio of
+        // wire-level transfer size to logical data size.
+        let phy_str = if self.show_phy_rates && self.total_size > 0 {
+            let phy_speed = speed * (self.transfer_size as f64 / self.total_size as f64);
+            let pss = size_str(phy_speed as u64, 'b');
+            format!(" ({}ps at physical layer)", pss)
+        } else {
+            String::new()
+        };
+
         // Use carriage return to overwrite line
         print!(
-            "\r{} {:.1}%  {} / {}  {}/s   ",
+            "\r{} {:.1}%  {} / {}  {}/s{}   ",
             spinner,
             progress,
             size_str(self.transferred as u64, 'B'),
             size_str(self.total_size as u64, 'B'),
-            size_str(speed as u64, 'B')
+            size_str(speed as u64, 'B'),
+            phy_str,
         );
         std::io::stdout().flush().ok();
     }
@@ -94,11 +112,21 @@ impl TransferProgress {
         };
 
         if success {
+            // Compute physical layer rate string for final output
+            let phy_str = if self.show_phy_rates && self.total_size > 0 {
+                let phy_speed = speed * (self.transfer_size as f64 / self.total_size as f64);
+                let pss = size_str(phy_speed as u64, 'b');
+                format!(" ({}ps at physical layer)", pss)
+            } else {
+                String::new()
+            };
+
             println!(
-                "\r✓ 100%  {} transferred in {:.1}s ({}/s)   ",
+                "\r✓ 100%  {} transferred in {:.1}s ({}/s{})   ",
                 size_str(self.transferred as u64, 'B'),
                 elapsed,
-                size_str(speed as u64, 'B')
+                size_str(speed as u64, 'B'),
+                phy_str,
             );
         } else {
             println!("\r✗ Transfer failed                         ");

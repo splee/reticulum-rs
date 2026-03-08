@@ -272,11 +272,13 @@ pub async fn run_send_mode(
     let mut transfer_complete = false;
     let total_parts = resource.total_parts();
     let total_size = resource.total_size();
+    let transfer_size = resource.progress().transfer_size;
     let mut parts_sent = 0usize;
     let silent = matches.get_flag("silent");
+    let show_phy_rates = matches.get_flag("phy-rates");
 
     // Initialize progress tracker
-    let mut progress = TransferProgress::new(total_size, silent);
+    let mut progress = TransferProgress::new(total_size, transfer_size, silent, show_phy_rates);
 
     if !silent {
         println!("Transferring file...");
