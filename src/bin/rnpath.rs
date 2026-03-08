@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use std::fs;
 
-use reticulum::cli::format::{format_hash_hex, format_time};
+use reticulum::cli::format::{format_hash_hex, format_time, format_time_ago};
 use reticulum::cli::hash::parse_destination;
 use reticulum::config::{LogLevel, ReticulumConfig};
 use reticulum::hash::AddressHash;
@@ -185,6 +185,48 @@ async fn main() {
             handle_remote_path_table(&args, &config).await
         } else if args.rates {
             handle_remote_rate_table(&args, &config).await
+        } else if args.blackholed {
+            // Python line 134: unsupported in remote mode
+            if !args.json {
+                println!("Listing blackholed identities on remote instances not yet implemented");
+            }
+            255
+        } else if args.blackhole {
+            // Python line 208: unsupported in remote mode
+            if !args.json {
+                println!("Blackholing identity on remote instances not yet implemented");
+            }
+            255
+        } else if args.unblackhole {
+            // Python line 227: unsupported in remote mode (same message as blackhole)
+            if !args.json {
+                println!("Blackholing identity on remote instances not yet implemented");
+            }
+            255
+        } else if args.drop_announces {
+            // Python line 382: unsupported in remote mode
+            if !args.json {
+                println!("Dropping announce queues on remote instances not yet implemented");
+            }
+            255
+        } else if args.drop {
+            // Python line 392: unsupported in remote mode
+            if !args.json {
+                println!("Dropping path on remote instances not yet implemented");
+            }
+            255
+        } else if args.drop_via {
+            // Python line 413: unsupported in remote mode
+            if !args.json {
+                println!("Dropping all paths via specific transport instance on remote instances not yet implemented");
+            }
+            255
+        } else if args.destination.is_some() {
+            // Python line 434: unsupported in remote mode
+            if !args.json {
+                println!("Requesting paths on remote instances not implemented");
+            }
+            255
         } else {
             // No operation specified for remote mode
             if !args.json {
@@ -406,7 +448,7 @@ async fn handle_rate_table(args: &Args, config: &ReticulumConfig) -> i32 {
 
     if rates.is_empty() {
         println!();
-        println!("No rate information available");
+        println!("No information available");
         println!();
         return 1;
     }
@@ -418,45 +460,49 @@ async fn handle_rate_table(args: &Args, config: &ReticulumConfig) -> i32 {
         .unwrap_or(0.0);
 
     for rate in &rates {
+        // Use format_time_ago for last heard, matching Python's pretty_date
         let last_str = if let Some(last) = rate.last_announce {
-            let ago = now - last;
-            format_time(ago)
+            format_time_ago(last)
         } else {
             "never".to_string()
         };
 
         // Calculate hourly rate
         let hour_rate = calculate_hourly_rate(&rate.timestamps, now);
-        let span_str = calculate_span_str(&rate.timestamps, now);
+        let span_str = calculate_span_str(&rate.timestamps);
+
+        // Format rate: integer when whole, otherwise up to 3 decimal places
+        let rate_str = if hour_rate.fract() == 0.0 {
+            format!("{}", hour_rate as i64)
+        } else {
+            format!("{:.3}", hour_rate).trim_end_matches('0').to_string()
+        };
 
         let mut suffix = String::new();
 
         // Rate violations
         if rate.violations > 0 {
-            let word = if rate.violations == 1 {
-                "violation"
-            } else {
-                "violations"
-            };
-            suffix.push_str(&format!(", {} active rate {}", rate.violations, word));
+            let plural = if rate.violations == 1 { "" } else { "s" };
+            suffix.push_str(&format!(", {} active rate violation{}", rate.violations, plural));
         }
 
-        // Blocked status
+        // Blocked status: "new announces allowed in {time}"
         if let Some(blocked_until) = rate.blocked_until {
             if blocked_until > now {
-                let remaining = blocked_until - now;
+                // Python uses pretty_date(2*now - until) to show remaining time
+                let remaining_ts = 2.0 * now - blocked_until;
                 suffix.push_str(&format!(
                     ", new announces allowed in {}",
-                    format_time(remaining)
+                    format_time_ago(remaining_ts)
                 ));
             }
         }
 
         println!(
-            "<{}> last heard {} ago, {:.1} announces/hour in the last {}{}",
+            "<{}> last heard {} ago, {} announces/hour in the last {}{}",
             rate.destination,
             last_str,
-            hour_rate,
+            rate_str,
             span_str,
             suffix
         );
@@ -631,7 +677,7 @@ async fn handle_drop_path(args: &Args, config: &ReticulumConfig) -> i32 {
         0
     } else {
         if !args.json {
-            println!("No path to {} in table", pretty_hash(&dest_hash));
+            println!("Unable to drop path to {}. Does it exist?", pretty_hash(&dest_hash));
         }
         1
     }
@@ -670,20 +716,20 @@ async fn handle_drop_via(args: &Args, config: &ReticulumConfig) -> i32 {
         // Fall back to local transport
         let transport = create_transport(config).await;
         let count = transport.drop_via(&transport_hash).await;
+        if count == 0 {
+            if !args.json {
+                println!(
+                    "Unable to drop paths via {}. Does the transport instance exist?",
+                    pretty_hash(&transport_hash)
+                );
+            }
+            return 1;
+        }
         if !args.json {
-            let path_word = if count == 1 { "path" } else { "paths" };
-            println!(
-                "Dropped {} {} via {}",
-                count,
-                path_word,
-                pretty_hash(&transport_hash)
-            );
+            println!("Dropped all paths via {}", pretty_hash(&transport_hash));
         }
     } else if !args.json {
-        println!(
-            "Dropped paths via {} (via daemon)",
-            pretty_hash(&transport_hash)
-        );
+        println!("Dropped all paths via {}", pretty_hash(&transport_hash));
     }
 
     0
@@ -697,7 +743,7 @@ async fn handle_drop_announces(args: &Args, config: &ReticulumConfig) -> i32 {
     transport.drop_announce_queues().await;
 
     if !args.json {
-        println!("Dropped all queued announces");
+        println!("Dropping announce queues on all interfaces...");
     }
 
     0
@@ -824,7 +870,7 @@ async fn handle_blackhole(args: &Args, config: &ReticulumConfig) -> i32 {
 
     if manager.is_blackholed(&identity_hash) {
         if !args.json {
-            println!("{} is already blackholed", pretty_hash(&identity_hash));
+            println!("Identity {} already blackholed", format_hash_hex(&identity_hash));
         }
         return 0;
     }
@@ -841,16 +887,7 @@ async fn handle_blackhole(args: &Args, config: &ReticulumConfig) -> i32 {
     let _ = manager.save();
 
     if !args.json {
-        let duration_str = args
-            .duration
-            .map(|h| format!(" for {} hours", h))
-            .unwrap_or_else(|| " indefinitely".to_string());
-
-        println!(
-            "Blackholed {}{}",
-            pretty_hash(&identity_hash),
-            duration_str
-        );
+        println!("Blackholed identity {}", format_hash_hex(&identity_hash));
     }
 
     0
@@ -887,12 +924,12 @@ async fn handle_unblackhole(args: &Args, config: &ReticulumConfig) -> i32 {
         // Save after removing
         let _ = manager.save();
         if !args.json {
-            println!("Removed {} from blackhole", pretty_hash(&identity_hash));
+            println!("Lifted blackhole for identity {}", format_hash_hex(&identity_hash));
         }
         0
     } else {
         if !args.json {
-            println!("{} was not blackholed", pretty_hash(&identity_hash));
+            println!("Identity {} not blackholed", format_hash_hex(&identity_hash));
         }
         1
     }
@@ -1459,34 +1496,40 @@ fn display_blackhole_list(args: &Args, entries: &[RemoteBlackholeEntry]) {
         .unwrap_or(0.0);
 
     if entries.is_empty() {
-        println!("No blackholed identities");
+        println!("No blackholed identity data available");
         return;
     }
 
-    println!("Blackholed Identities:");
     for entry in entries {
+        // Show remaining duration, matching Python's "for {prettytime(remaining)}"
         let until_str = if let Some(until) = entry.until {
-            if until > now {
-                format!(" until {}", timestamp_str(until))
-            } else {
-                " (expired)".to_string()
-            }
+            let remaining = (until - now).max(0.0);
+            format!("for {}", format_time(remaining))
         } else {
-            " (indefinite)".to_string()
+            "indefinitely".to_string()
         };
 
+        // Truncate reason at 64 chars with ellipsis, matching Python's rmlen=64
         let reason_str = entry.reason.as_ref()
-            .map(|r| format!(" - {}", r))
+            .map(|r| {
+                let truncated = if r.len() > 64 {
+                    format!("{}…", &r[..63])
+                } else {
+                    r.clone()
+                };
+                format!(" ({})", truncated)
+            })
             .unwrap_or_default();
 
+        // Show source as "by <SOURCE>", matching Python line 190
         let source_str = if !entry.source.is_empty() {
-            format!(" [source: <{}>]", &entry.source)
+            format!(" by <{}>", &entry.source)
         } else {
             String::new()
         };
 
         println!(
-            "  <{}>{}{}{}",
+            "<{}> blackholed {}{}{}",
             entry.hash,
             until_str,
             reason_str,
@@ -1575,22 +1618,40 @@ fn display_rate_table(args: &Args, entries: &[RemoteRateEntry]) {
         .unwrap_or(0.0);
 
     if entries.is_empty() {
-        println!("No announce rate data");
+        println!("No information available");
         return;
     }
 
-    println!("Announce Rate Table:");
     for entry in entries {
         let rate = calculate_hourly_rate(&entry.timestamps, now);
-        let span = calculate_span_str(&entry.timestamps, now);
+        let span = calculate_span_str(&entry.timestamps);
 
+        // Format rate: integer when whole, otherwise up to 3 decimal places (trim trailing zeros)
+        let rate_str = if rate.fract() == 0.0 {
+            format!("{}", rate as i64)
+        } else {
+            format!("{:.3}", rate).trim_end_matches('0').to_string()
+        };
+
+        // Use format_time_ago for last heard, matching Python's pretty_date
         let last_str = entry.last
-            .map(timestamp_str)
+            .map(|ts| format_time_ago(ts))
             .unwrap_or_else(|| "never".to_string());
 
+        // Rate violations suffix
+        let rv_str = if entry.rate_violations > 0 {
+            let plural = if entry.rate_violations == 1 { "" } else { "s" };
+            format!(", {} active rate violation{}", entry.rate_violations, plural)
+        } else {
+            String::new()
+        };
+
+        // Blocked status: "new announces allowed in {time}"
         let blocked_str = if let Some(until) = entry.blocked_until {
             if until > now {
-                format!(" BLOCKED until {}", timestamp_str(until))
+                // Python uses pretty_date(2*now - until) to show remaining time
+                let remaining_ts = 2.0 * now - until;
+                format!(", new announces allowed in {}", format_time_ago(remaining_ts))
             } else {
                 String::new()
             }
@@ -1599,12 +1660,12 @@ fn display_rate_table(args: &Args, entries: &[RemoteRateEntry]) {
         };
 
         println!(
-            "  <{}> {:.1}/hour over {} (last: {}, violations: {}){} ",
+            "<{}> last heard {} ago, {} announces/hour in the last {}{}{}",
             entry.hash,
-            rate,
-            span,
             last_str,
-            entry.rate_violations,
+            rate_str,
+            span,
+            rv_str,
             blocked_str,
         );
     }
@@ -1640,48 +1701,27 @@ fn timestamp_str(ts: f64) -> String {
     }
 }
 
-/// Calculate hourly announce rate from timestamps
+/// Calculate hourly announce rate from timestamps.
+///
+/// Matches Python's algorithm: uses ALL timestamps, enforces minimum 1-hour span,
+/// and rounds to 3 decimal places.
 fn calculate_hourly_rate(timestamps: &[f64], now: f64) -> f64 {
     if timestamps.is_empty() {
         return 0.0;
     }
-
-    // Filter timestamps within the last hour
-    let hour_ago = now - 3600.0;
-    let recent: Vec<_> = timestamps.iter().filter(|&&ts| ts >= hour_ago).collect();
-
-    if recent.len() <= 1 {
-        return recent.len() as f64;
-    }
-
-    // Calculate span
-    let oldest = **recent.first().unwrap();
-    let newest = **recent.last().unwrap();
-    let span = newest - oldest;
-
-    if span < 1.0 {
-        return recent.len() as f64;
-    }
-
-    // Normalize to hourly rate
-    (recent.len() as f64 / span) * 3600.0
+    let first_ts = timestamps[0];
+    let span = (now - first_ts).max(3600.0);
+    let span_hours = span / 3600.0;
+    let rate = timestamps.len() as f64 / span_hours;
+    (rate * 1000.0).round() / 1000.0
 }
 
-/// Calculate the time span string for rate display
-fn calculate_span_str(timestamps: &[f64], now: f64) -> String {
+/// Calculate the time span string for rate display.
+///
+/// Matches Python: `pretty_date(int(entry["timestamps"][0]))`.
+fn calculate_span_str(timestamps: &[f64]) -> String {
     if timestamps.is_empty() {
         return "0 seconds".to_string();
     }
-
-    let hour_ago = now - 3600.0;
-    let recent: Vec<_> = timestamps.iter().filter(|&&ts| ts >= hour_ago).collect();
-
-    if recent.is_empty() {
-        return "0 seconds".to_string();
-    }
-
-    let oldest = **recent.first().unwrap();
-    let span = now - oldest;
-
-    format_time(span)
+    format_time_ago(timestamps[0])
 }
