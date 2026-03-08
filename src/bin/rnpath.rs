@@ -216,9 +216,9 @@ async fn main() {
             }
             255
         } else if args.drop_via {
-            // Python line 413: unsupported in remote mode (note: "yet not" is intentional)
+            // Python line 413: unsupported in remote mode
             if !args.json {
-                println!("Dropping all paths via specific transport instance on remote instances yet not implemented");
+                println!("Dropping all paths via specific transport instance on remote instances not yet implemented");
             }
             255
         } else if args.destination.is_some() {
