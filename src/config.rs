@@ -511,6 +511,10 @@ impl ReticulumConfig {
                     announce_rate_target,
                     announce_rate_grace,
                     announce_rate_penalty,
+                    kiss_framing: subsection.get_bool("kiss_framing").unwrap_or(false),
+                    i2p_tunneled: subsection.get_bool("i2p_tunneled").unwrap_or(false),
+                    connect_timeout: subsection.get_int("connect_timeout").filter(|&v| v > 0).map(|v| v as u64),
+                    max_reconnect_tries: subsection.get_int("max_reconnect_tries").filter(|&v| v > 0).map(|v| v as u64),
                     extra: subsection.values.clone(),
                 });
             }
@@ -558,6 +562,19 @@ pub struct InterfaceConfig {
     /// Per-interface announce rate penalty in seconds.
     /// Python: `announce_rate_penalty`
     pub announce_rate_penalty: Option<u64>,
+    /// Whether to use KISS framing instead of HDLC (default: false).
+    /// Python: `kiss_framing`
+    pub kiss_framing: bool,
+    /// Whether this is an I2P tunneled connection (default: false).
+    /// Selects I2P-specific keepalive/timeout constants.
+    /// Python: `i2p_tunneled`
+    pub i2p_tunneled: bool,
+    /// Connection timeout in seconds (None = default 5s).
+    /// Python: `connect_timeout`
+    pub connect_timeout: Option<u64>,
+    /// Maximum reconnection attempts (None = unlimited).
+    /// Python: `max_reconnect_tries`
+    pub max_reconnect_tries: Option<u64>,
     /// Additional configuration values
     pub extra: HashMap<String, String>,
 }
@@ -823,6 +840,46 @@ mod tests {
         assert!(no_limit.announce_rate_target.is_none());
         assert!(no_limit.announce_rate_grace.is_none());
         assert!(no_limit.announce_rate_penalty.is_none());
+    }
+
+    #[test]
+    fn test_tcp_config_fields_parsing() {
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[I2P Client]]
+    type = TCPClientInterface
+    target_host = 127.0.0.1
+    target_port = 7650
+    kiss_framing = true
+    i2p_tunneled = true
+    connect_timeout = 10
+    max_reconnect_tries = 5
+
+  [[Normal Client]]
+    type = TCPClientInterface
+    target_host = example.com
+    target_port = 4242
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 2);
+
+        let i2p = interfaces.iter().find(|i| i.name == "I2P Client").unwrap();
+        assert!(i2p.kiss_framing);
+        assert!(i2p.i2p_tunneled);
+        assert_eq!(i2p.connect_timeout, Some(10));
+        assert_eq!(i2p.max_reconnect_tries, Some(5));
+
+        let normal = interfaces.iter().find(|i| i.name == "Normal Client").unwrap();
+        assert!(!normal.kiss_framing);
+        assert!(!normal.i2p_tunneled);
+        assert_eq!(normal.connect_timeout, None);
+        assert_eq!(normal.max_reconnect_tries, None);
     }
 
     #[test]

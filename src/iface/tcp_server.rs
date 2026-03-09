@@ -4,10 +4,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::InterfaceConfig;
-use crate::error::RnsError;
 use crate::iface::stats::{InterfaceMetadata, InterfaceMode};
 
-use super::tcp_client::TcpClient;
+use super::tcp_client::{TcpClient, format_tcp_display_addr};
 use super::tcp_options::configure_tcp_socket;
 use super::{Interface, InterfaceContext, InterfaceManager};
 
@@ -31,6 +30,10 @@ pub struct TcpServer {
     announce_rate_grace: Option<u32>,
     /// Per-interface announce rate penalty in seconds
     announce_rate_penalty: Option<u64>,
+    /// Whether this is an I2P tunneled connection (propagated to spawned clients)
+    i2p_tunneled: bool,
+    /// User-configured fixed MTU (propagated to spawned clients)
+    fixed_mtu: Option<usize>,
 }
 
 impl TcpServer {
@@ -49,6 +52,8 @@ impl TcpServer {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            fixed_mtu: None,
         }
     }
 
@@ -68,6 +73,8 @@ impl TcpServer {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            fixed_mtu: None,
         }
     }
 
@@ -85,27 +92,33 @@ impl TcpServer {
         self.announce_rate_target = config.announce_rate_target;
         self.announce_rate_grace = config.announce_rate_grace;
         self.announce_rate_penalty = config.announce_rate_penalty;
+        self.i2p_tunneled = config.i2p_tunneled;
+        if let Some(mtu) = config.fixed_mtu {
+            self.fixed_mtu = Some(mtu);
+        }
         self
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let (addr, kiss_framing, mode, bitrate, dir_out,
-             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
+             announce_rate_target, announce_rate_grace, announce_rate_penalty,
+             i2p_tunneled, fixed_mtu) = {
             let inner = context.inner.lock().await;
             (inner.addr.clone(), inner.kiss_framing, inner.mode, inner.bitrate,
              inner.dir_out, inner.announce_rate_target, inner.announce_rate_grace,
-             inner.announce_rate_penalty)
+             inner.announce_rate_penalty, inner.i2p_tunneled, inner.fixed_mtu)
         };
         let iface_address = context.channel.address;
 
         let iface_manager = { context.inner.lock().await.iface_manager.clone() };
 
         // Create interface metadata for stats tracking.
-        // Name matches Python's TCPServerInterface.__str__() format (no framing suffix).
+        // Name matches Python's TCPServerInterface.__str__() format with IPv6 bracket handling.
         let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
         let effective_bitrate = bitrate.unwrap_or(10_000_000); // BITRATE_GUESS = 10 Mbps
+        let display_addr = format_tcp_display_addr(&addr);
         let mut meta = InterfaceMetadata::new(
-            format!("TCPServerInterface[{}]", addr),
+            format!("TCPServerInterface[{}]", display_addr),
             "TCPServer",
             "TCPServerInterface",
             addr.clone(),
@@ -146,22 +159,58 @@ impl TcpServer {
                 break;
             }
 
-            let listener = TcpListener::bind(addr.clone())
-                .await
-                .map_err(|_| RnsError::ConnectionError);
-
-            if listener.is_err() {
-                log::warn!("tcp_server: couldn't bind to <{}>", addr);
-                metadata.set_online(false);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
+            // Create listener with SO_REUSEADDR (Python: allow_reuse_address = True)
+            let listener = {
+                let sock_addr: std::net::SocketAddr = match addr.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("tcp_server: invalid address '{}': {}", addr, e);
+                        metadata.set_online(false);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+                let domain = if sock_addr.is_ipv4() {
+                    socket2::Domain::IPV4
+                } else {
+                    socket2::Domain::IPV6
+                };
+                let socket = match socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("tcp_server: couldn't create socket for <{}>: {}", addr, e);
+                        metadata.set_online(false);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = socket.set_reuse_address(true) {
+                    log::warn!("tcp_server: couldn't set SO_REUSEADDR for <{}>: {}", addr, e);
+                }
+                if let Err(e) = socket.bind(&sock_addr.into())
+                    .and_then(|_| socket.listen(128))
+                    .and_then(|_| socket.set_nonblocking(true))
+                {
+                    log::warn!("tcp_server: couldn't bind to <{}>: {}", addr, e);
+                    metadata.set_online(false);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                let std_listener: std::net::TcpListener = socket.into();
+                match TcpListener::from_std(std_listener) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        log::warn!("tcp_server: couldn't bind to <{}>: {}", addr, e);
+                        metadata.set_online(false);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+            };
 
             // Mark interface as online when listening
             metadata.set_online(true);
             log::info!("tcp_server: listen on <{}>", addr);
-
-            let listener = listener.unwrap();
 
             let tx_task = {
                 let cancel = context.cancel.clone();
@@ -208,7 +257,7 @@ impl TcpServer {
                             );
 
                             // Configure TCP socket options (keepalive, nodelay, etc.)
-                            if let Err(e) = configure_tcp_socket(&stream) {
+                            if let Err(e) = configure_tcp_socket(&stream, i2p_tunneled) {
                                 log::warn!("tcp_server: failed to configure socket options for {}: {}", peer_addr, e);
                             }
 
@@ -217,7 +266,8 @@ impl TcpServer {
                             // Spawn client with the same framing mode as the server.
                             // Propagate config from server to spawned client
                             // (Python: TCPInterface.py:576-619).
-                            let client_name = format!("TCPInterface[{}]", peer_addr);
+                            let client_display = format_tcp_display_addr(&peer_addr.to_string());
+                            let client_name = format!("TCPInterface[{}]", client_display);
                             let mut client = TcpClient::new_from_stream_with_framing(
                                 peer_addr.to_string(), stream, kiss_framing,
                             );
@@ -228,6 +278,10 @@ impl TcpServer {
                             client.announce_rate_target = announce_rate_target;
                             client.announce_rate_grace = announce_rate_grace;
                             client.announce_rate_penalty = announce_rate_penalty;
+                            client.i2p_tunneled = i2p_tunneled;
+                            if let Some(mtu) = fixed_mtu {
+                                client = client.with_fixed_mtu(mtu);
+                            }
 
                             iface_manager.spawn(
                                 client,

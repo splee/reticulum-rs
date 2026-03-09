@@ -26,6 +26,13 @@ use super::{Interface, InterfaceContext};
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 
+/// Default connection timeout in seconds (Python: INITIAL_CONNECT_TIMEOUT = 5)
+const INITIAL_CONNECT_TIMEOUT: u64 = 5;
+
+/// Minimum valid packet header size (Python: Reticulum.HEADER_MINSIZE = 2+1+16 = 19).
+/// HDLC frames at or below this size are silently discarded before deserialization.
+const HEADER_MINSIZE: usize = 19;
+
 /// TCP client interface supporting both HDLC and KISS framing.
 ///
 /// The framing mode determines how packets are encoded on the wire:
@@ -52,6 +59,12 @@ pub struct TcpClient {
     pub(crate) announce_rate_grace: Option<u32>,
     /// Per-interface announce rate penalty in seconds
     pub(crate) announce_rate_penalty: Option<u64>,
+    /// Whether this is an I2P tunneled connection (selects I2P keepalive constants)
+    pub(crate) i2p_tunneled: bool,
+    /// Connection timeout in seconds (None = use INITIAL_CONNECT_TIMEOUT)
+    pub(crate) connect_timeout: Option<u64>,
+    /// Maximum reconnection attempts (None = unlimited)
+    pub(crate) max_reconnect_tries: Option<u64>,
 }
 
 impl TcpClient {
@@ -68,6 +81,9 @@ impl TcpClient {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            connect_timeout: None,
+            max_reconnect_tries: None,
         }
     }
 
@@ -84,6 +100,9 @@ impl TcpClient {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            connect_timeout: None,
+            max_reconnect_tries: None,
         }
     }
 
@@ -104,6 +123,9 @@ impl TcpClient {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            connect_timeout: None,
+            max_reconnect_tries: None,
         }
     }
 
@@ -120,6 +142,9 @@ impl TcpClient {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            i2p_tunneled: false,
+            connect_timeout: None,
+            max_reconnect_tries: None,
         }
     }
 
@@ -143,6 +168,9 @@ impl TcpClient {
         self.announce_rate_target = config.announce_rate_target;
         self.announce_rate_grace = config.announce_rate_grace;
         self.announce_rate_penalty = config.announce_rate_penalty;
+        self.i2p_tunneled = config.i2p_tunneled;
+        self.connect_timeout = config.connect_timeout;
+        self.max_reconnect_tries = config.max_reconnect_tries;
         if let Some(mtu) = config.fixed_mtu {
             self.fixed_mtu = Some(mtu);
         }
@@ -157,21 +185,24 @@ impl TcpClient {
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
         let (addr, kiss_framing, fixed_mtu, mode, bitrate, dir_out,
-             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
+             announce_rate_target, announce_rate_grace, announce_rate_penalty,
+             i2p_tunneled, connect_timeout, max_reconnect_tries) = {
             let inner = context.inner.lock().await;
             (inner.addr.clone(), inner.kiss_framing, inner.fixed_mtu,
              inner.mode, inner.bitrate, inner.dir_out,
              inner.announce_rate_target, inner.announce_rate_grace,
-             inner.announce_rate_penalty)
+             inner.announce_rate_penalty,
+             inner.i2p_tunneled, inner.connect_timeout, inner.max_reconnect_tries)
         };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().await.stream.take() };
 
         // Create interface metadata for stats tracking.
-        // Name matches Python's TCPInterface.__str__() format (no framing suffix).
+        // Name matches Python's TCPInterface.__str__() format with IPv6 bracket handling.
         let effective_bitrate = bitrate.unwrap_or(10_000_000); // BITRATE_GUESS = 10 Mbps
+        let display_addr = format_tcp_display_addr(&addr);
         let mut meta = InterfaceMetadata::new(
-            format!("TCPInterface[{}]", addr),
+            format!("TCPInterface[{}]", display_addr),
             "TCPClient",
             "TCPClientInterface",
             addr.clone(),
@@ -212,7 +243,9 @@ impl TcpClient {
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
+        let timeout_secs = connect_timeout.unwrap_or(INITIAL_CONNECT_TIMEOUT);
         let mut running = true;
+        let mut reconnect_attempts: u64 = 0;
         loop {
             if !running || context.cancel.is_cancelled() {
                 break;
@@ -224,9 +257,24 @@ impl TcpClient {
                         running = false;
                         Ok(stream)
                     }
-                    None => TcpStream::connect(addr.clone())
-                        .await
-                        .map_err(|_| RnsError::ConnectionError),
+                    None => {
+                        // Check reconnection limit (only on reconnect, not initial connect)
+                        if let Some(max_tries) = max_reconnect_tries {
+                            reconnect_attempts += 1;
+                            if reconnect_attempts > max_tries {
+                                log::error!("tcp_client: max reconnect tries ({}) exceeded for <{}>", max_tries, addr);
+                                break;
+                            }
+                        }
+                        // Connect with timeout (Python: INITIAL_CONNECT_TIMEOUT = 5)
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_secs),
+                            TcpStream::connect(addr.clone()),
+                        ).await {
+                            Ok(Ok(stream)) => Ok(stream),
+                            Ok(Err(_)) | Err(_) => Err(RnsError::ConnectionError),
+                        }
+                    }
                 }
             };
 
@@ -243,7 +291,7 @@ impl TcpClient {
             let stream = stream.unwrap();
 
             // Configure TCP socket options (keepalive, nodelay, etc.)
-            if let Err(e) = configure_tcp_socket(&stream) {
+            if let Err(e) = configure_tcp_socket(&stream, i2p_tunneled) {
                 log::warn!("tcp_client: failed to configure socket options: {}", e);
             }
 
@@ -311,6 +359,11 @@ impl TcpClient {
                                                     };
 
                                                     if decode_result.is_ok() {
+                                                        // Discard undersized HDLC frames (Python: TCPInterface.py:392)
+                                                        // KISS mode does not check HEADER_MINSIZE
+                                                        if !kiss_framing && output.as_slice().len() <= HEADER_MINSIZE {
+                                                            continue;
+                                                        }
                                                         match Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
                                                             Ok(packet) => {
                                                                 if PACKET_TRACE {
@@ -439,6 +492,24 @@ impl TcpClient {
 
         iface_stop.cancel();
     }
+}
+
+/// Format a TCP address for display, wrapping IPv6 addresses in brackets.
+///
+/// Matches Python's TCPInterface.__str__ which wraps IPv6 hosts in brackets.
+/// Input "host:port" → output "host:port" for IPv4, "[host]:port" for IPv6.
+pub(crate) fn format_tcp_display_addr(addr: &str) -> String {
+    // The address is "host:port" — for IPv6 the host part contains colons,
+    // so we use rfind(':') to find the port separator
+    if let Some(last_colon) = addr.rfind(':') {
+        let host = &addr[..last_colon];
+        let port = &addr[last_colon + 1..];
+        // IPv6 if host contains ':' and isn't already bracketed
+        if host.contains(':') && !host.starts_with('[') {
+            return format!("[{}]:{}", host, port);
+        }
+    }
+    addr.to_string()
 }
 
 impl Interface for TcpClient {
