@@ -1065,9 +1065,9 @@ async fn get_transport_stats(transport: &Transport) -> Result<NetworkStats, Stri
             mode: s.mode as u8,
             clients: None, // TODO: Track connected local clients
             bitrate: s.bitrate,
-            incoming_announce_frequency: 0.0, // TODO: Implement announce freq tracking
-            outgoing_announce_frequency: 0.0, // TODO: Implement announce freq tracking
-            held_announces: 0, // TODO: Implement held announces tracking
+            incoming_announce_frequency: s.incoming_announce_frequency,
+            outgoing_announce_frequency: s.outgoing_announce_frequency,
+            held_announces: s.held_announces as u32,
             announce_queue: None,
             ifac_signature: None,
             ifac_size: None,

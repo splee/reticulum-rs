@@ -118,6 +118,7 @@ const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
 const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
 const INTERVAL_ANNOUNCE_QUEUE_PROCESS: Duration = Duration::from_millis(100);
+const INTERVAL_HELD_ANNOUNCE_PROCESS: Duration = Duration::from_secs(5);
 
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
@@ -2756,6 +2757,29 @@ async fn handle_announce<'a>(
         }
     }
 
+    // Record incoming announce frequency on the receiving interface.
+    // Python: Interface.received_announce() — propagates to parent.
+    handler.interface_registry.record_incoming_announce(&iface).await;
+
+    // Ingress control: for unknown destinations from non-local clients,
+    // check if the interface is in burst mode and hold the announce if so.
+    // Python: Transport.py checks should_ingress_limit() before processing.
+    if !from_local_client {
+        let path_known = handler.path_manager.has_path(&packet.destination);
+        if !path_known {
+            if let Some(metadata) = handler.interface_registry.get(&iface).await {
+                if metadata.check_ingress_and_hold(packet.destination, *packet, iface) {
+                    log::debug!(
+                        "handle_announce: held announce for {} on {} (ingress limiting)",
+                        packet.destination,
+                        iface
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     let destination_known = handler.has_destination(&packet.destination);
     log::debug!(
         "handle_announce: destination_known={} for {}",
@@ -2922,6 +2946,13 @@ async fn handle_announce<'a>(
                         retransmit_packet.destination,
                         hops
                     );
+                    // Record outgoing announce on all network interfaces
+                    let net_ifaces = handler.iface_manager.lock().await.network_interface_addresses();
+                    for addr in &net_ifaces {
+                        if *addr != recv_from {
+                            handler.interface_registry.record_outgoing_announce(addr).await;
+                        }
+                    }
                     handler.send(TxMessage {
                         tx_type: TxMessageType::Broadcast(Some(recv_from)),
                         packet: retransmit_packet
@@ -2949,6 +2980,9 @@ async fn handle_announce<'a>(
                             // Estimate packet size for timing calculation (100 bytes is reasonable)
                             let packet_size = 100;
                             handler.announce_queue_manager.record_transmit(&iface_addr, packet_size);
+
+                            // Record outgoing announce frequency
+                            handler.interface_registry.record_outgoing_announce(&iface_addr).await;
 
                             handler.send(TxMessage {
                                 tx_type: TxMessageType::Direct(iface_addr),
@@ -3290,11 +3324,50 @@ async fn process_announce_queues<'a>(mut handler: MutexGuard<'a, TransportHandle
         let packet_size = 100; // Estimate packet size
         handler.announce_queue_manager.record_transmit(&iface_addr, packet_size);
 
+        // Record outgoing announce frequency
+        handler.interface_registry.record_outgoing_announce(&iface_addr).await;
+
         // Send to the specific interface
         handler.send(TxMessage {
             tx_type: TxMessageType::Direct(iface_addr),
             packet: queued.packet,
         }).await;
+    }
+}
+
+/// Release held announces from interfaces that are no longer ingress-limiting.
+///
+/// Iterates over all interfaces and releases at most one held announce per
+/// interface per call. Released announces are re-injected into the announce
+/// processing pipeline via `handle_announce`.
+///
+/// Python: `Interface.process_held_announces()` — spawns thread calling
+/// `Transport.inbound()` for each released announce.
+async fn process_held_announces<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
+    let addresses = handler.interface_registry.all_addresses().await;
+
+    for iface_hash in addresses {
+        if let Some(metadata) = handler.interface_registry.get(&iface_hash).await {
+            if let Some((_dest, held)) = metadata.try_release_held_announce() {
+                log::debug!(
+                    "Releasing held announce for {} from {} (hops={})",
+                    _dest,
+                    iface_hash,
+                    held.packet.header.hops
+                );
+                // Re-process the announce through the normal pipeline.
+                // Use the original receiving interface from when the announce was held.
+                handle_announce(
+                    &held.packet,
+                    handler,
+                    held.receiving_interface,
+                    false,
+                ).await;
+                // handler has been moved into handle_announce — we can't continue
+                // the loop after this. Release one announce per periodic tick.
+                return;
+            }
+        }
     }
 }
 
@@ -3564,6 +3637,29 @@ async fn manage_transport(
                     },
                     _ = time::sleep(INTERVAL_ANNOUNCE_QUEUE_PROCESS) => {
                         process_announce_queues(handler.lock().await).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Process held announces (release announces held during ingress limiting)
+    if retransmit && !client_mode {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(INTERVAL_HELD_ANNOUNCE_PROCESS) => {
+                        process_held_announces(handler.lock().await).await;
                     }
                 }
             }
