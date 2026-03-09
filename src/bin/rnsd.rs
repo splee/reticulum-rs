@@ -325,8 +325,14 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
 
                     log::info!("  TCP Server listening on {}", addr);
 
+                    let mut server = TcpServer::new(&addr, transport.iface_manager());
+                    if iface_config.kiss_framing {
+                        server = server.with_kiss_framing();
+                    }
+                    server = server.with_config(&iface_config);
+
                     transport.spawn_interface(
-                        TcpServer::new(&addr, transport.iface_manager()),
+                        server,
                         TcpServer::spawn,
                         &name,
                     ).await;
@@ -341,9 +347,10 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
                         log::info!("  TCP Client connecting to {}", addr);
 
                         let mut client = TcpClient::new(&addr);
-                        if let Some(mtu) = iface_config.fixed_mtu {
-                            client = client.with_fixed_mtu(mtu);
+                        if iface_config.kiss_framing {
+                            client = client.with_kiss_framing();
                         }
+                        client = client.with_config(&iface_config);
 
                         transport.spawn_interface(
                             client,
@@ -420,8 +427,13 @@ fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBo
                         let listen_port = iface_config.listen_port.unwrap_or(4242);
                         let addr = format!("{}:{}", listen_ip, listen_port);
                         let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
+                        let mut server = TcpServer::new(&addr, transport.iface_manager());
+                        if iface_config.kiss_framing {
+                            server = server.with_kiss_framing();
+                        }
+                        server = server.with_config(&iface_config);
                         transport.spawn_interface(
-                            TcpServer::new(&addr, transport.iface_manager()),
+                            server,
                             TcpServer::spawn,
                             &name,
                         ).await;
@@ -433,9 +445,10 @@ fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBo
                             let addr = format!("{}:{}", host, port);
                             let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
                             let mut client = TcpClient::new(&addr);
-                            if let Some(mtu) = iface_config.fixed_mtu {
-                                client = client.with_fixed_mtu(mtu);
+                            if iface_config.kiss_framing {
+                                client = client.with_kiss_framing();
                             }
+                            client = client.with_config(&iface_config);
                             transport.spawn_interface(
                                 client,
                                 TcpClient::spawn,

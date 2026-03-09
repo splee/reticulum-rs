@@ -900,6 +900,10 @@ mod tests {
                 announce_rate_target: None,
                 announce_rate_grace: None,
                 announce_rate_penalty: None,
+                kiss_framing: false,
+                i2p_tunneled: false,
+                connect_timeout: None,
+                max_reconnect_tries: None,
                 extra,
             }
         }
