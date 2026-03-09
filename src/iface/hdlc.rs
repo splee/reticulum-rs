@@ -116,6 +116,136 @@ impl Hdlc {
     }
 }
 
+// =============================================================================
+// Streaming HDLC parser
+// =============================================================================
+
+/// Result of feeding a byte to the HDLC streaming parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdlcParseResult {
+    /// No complete frame yet; keep feeding bytes.
+    Pending,
+    /// A complete HDLC frame is available; call `take_frame()` or `frame_data()`.
+    DataFrame,
+}
+
+/// Byte-at-a-time HDLC stream parser for serial interfaces.
+///
+/// Mirrors the Python `SerialInterface.readLoop()` state machine:
+/// - Tracks `in_frame` and `escape` state
+/// - Uses 0x7E as frame flag and 0x7D as escape byte
+/// - Returns `HdlcParseResult` on each byte fed
+///
+/// The caller is responsible for tracking the 100ms timeout and calling
+/// `reset()` when no data has been received for that duration.
+pub struct HdlcStreamParser {
+    /// Accumulated payload bytes
+    buffer: Vec<u8>,
+    /// Maximum payload size (HW_MTU, typically 564)
+    max_size: usize,
+    /// True while inside a FLAG-delimited frame
+    in_frame: bool,
+    /// True when ESC has been seen and next byte is escaped
+    escape: bool,
+}
+
+impl HdlcStreamParser {
+    /// Create a new parser with default max_size of 564 (Reticulum HW_MTU).
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(564),
+            max_size: 564,
+            in_frame: false,
+            escape: false,
+        }
+    }
+
+    /// Create a new parser with a custom max payload size.
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(max_size),
+            max_size,
+            in_frame: false,
+            escape: false,
+        }
+    }
+
+    /// Feed a single byte into the parser.
+    ///
+    /// State machine (matches Python `SerialInterface.readLoop()`):
+    /// 1. FLAG while not in_frame → start frame, clear buffer
+    /// 2. FLAG while in_frame → end frame, return DataFrame
+    /// 3. ESC while in_frame → set escape flag
+    /// 4. Any byte after ESC → push byte ^ ESC_MASK, clear escape
+    /// 5. Normal byte while in_frame and under max_size → push to buffer
+    /// 6. Bytes after max_size → silently dropped
+    pub fn feed(&mut self, byte: u8) -> HdlcParseResult {
+        if byte == HDLC_FRAME_FLAG {
+            if self.in_frame {
+                // End of frame
+                self.in_frame = false;
+                self.escape = false;
+                return HdlcParseResult::DataFrame;
+            } else {
+                // Start of frame
+                self.in_frame = true;
+                self.buffer.clear();
+                self.escape = false;
+                return HdlcParseResult::Pending;
+            }
+        }
+
+        if self.in_frame {
+            if self.escape {
+                self.escape = false;
+                if self.buffer.len() < self.max_size {
+                    self.buffer.push(byte ^ HDLC_ESCAPE_MASK);
+                }
+            } else if byte == HDLC_ESCAPE_BYTE {
+                self.escape = true;
+            } else if self.buffer.len() < self.max_size {
+                self.buffer.push(byte);
+            }
+        }
+
+        HdlcParseResult::Pending
+    }
+
+    /// Take the completed frame data, leaving the parser buffer empty.
+    pub fn take_frame(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    /// Borrow the current frame data.
+    pub fn frame_data(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Reset parser state. Called by the consumer after a timeout (e.g., 100ms
+    /// of no data) to prevent hung frames from corrupted data.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.in_frame = false;
+        self.escape = false;
+    }
+
+    /// Returns true if currently inside a frame.
+    pub fn in_frame(&self) -> bool {
+        self.in_frame
+    }
+
+    /// Returns true if the buffer contains data.
+    pub fn has_data(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+}
+
+impl Default for HdlcStreamParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +582,142 @@ mod tests {
             let decoded_len = Hdlc::decode(&encode_buf[..encoded_len], &mut decode_output).unwrap();
 
             assert_eq!(decoded_len, 0);
+        }
+    }
+
+    mod stream_parser {
+        use super::*;
+
+        #[test]
+        fn test_simple_data_frame() {
+            let mut parser = HdlcStreamParser::new();
+            // FLAG, payload, FLAG
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x01), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x02), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x03), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &[0x01, 0x02, 0x03]);
+        }
+
+        #[test]
+        fn test_escaped_bytes() {
+            let mut parser = HdlcStreamParser::new();
+            // FLAG, ESC 0x5E (=FLAG), ESC 0x5D (=ESC), FLAG
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_ESCAPE_BYTE), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x5e), HdlcParseResult::Pending); // FLAG ^ MASK
+            assert_eq!(parser.feed(HDLC_ESCAPE_BYTE), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x5d), HdlcParseResult::Pending); // ESC ^ MASK
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &[HDLC_FRAME_FLAG, HDLC_ESCAPE_BYTE]);
+        }
+
+        #[test]
+        fn test_garbage_before_frame() {
+            let mut parser = HdlcStreamParser::new();
+            // Garbage before frame should be ignored
+            assert_eq!(parser.feed(0xFF), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0xAA), HdlcParseResult::Pending);
+            // Now a real frame
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x42), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &[0x42]);
+        }
+
+        #[test]
+        fn test_consecutive_frames() {
+            let mut parser = HdlcStreamParser::new();
+            // First frame
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x01), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            let frame1 = parser.take_frame();
+            assert_eq!(frame1, vec![0x01]);
+
+            // Second frame
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x02), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &[0x02]);
+        }
+
+        #[test]
+        fn test_empty_frame() {
+            let mut parser = HdlcStreamParser::new();
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert!(parser.frame_data().is_empty());
+        }
+
+        #[test]
+        fn test_max_size_enforcement() {
+            let mut parser = HdlcStreamParser::with_max_size(3);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            // Feed 5 bytes — only 3 should be accepted
+            for i in 0..5u8 {
+                parser.feed(i);
+            }
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data().len(), 3);
+            assert_eq!(parser.frame_data(), &[0, 1, 2]);
+        }
+
+        #[test]
+        fn test_timeout_reset() {
+            let mut parser = HdlcStreamParser::new();
+            // Start a frame
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x01), HdlcParseResult::Pending);
+            assert!(parser.in_frame());
+            assert!(parser.has_data());
+
+            // Simulate timeout
+            parser.reset();
+            assert!(!parser.in_frame());
+            assert!(!parser.has_data());
+
+            // Should parse a new frame cleanly
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(0x02), HdlcParseResult::Pending);
+            assert_eq!(parser.feed(HDLC_FRAME_FLAG), HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &[0x02]);
+        }
+
+        #[test]
+        fn test_take_frame_clears_buffer() {
+            let mut parser = HdlcStreamParser::new();
+            for &b in &[HDLC_FRAME_FLAG, 0x01, 0x02, HDLC_FRAME_FLAG] {
+                parser.feed(b);
+            }
+            let frame = parser.take_frame();
+            assert_eq!(frame, vec![0x01, 0x02]);
+            assert!(parser.frame_data().is_empty());
+        }
+
+        #[test]
+        fn test_round_trip_with_encode() {
+            // Encode some data with Hdlc::encode, then parse byte-by-byte
+            let original = [0x01, HDLC_FRAME_FLAG, 0x42, HDLC_ESCAPE_BYTE, 0x03];
+            let mut encode_buf = [0u8; 64];
+            let mut encode_output = OutputBuffer::new(&mut encode_buf);
+            let encoded_len = Hdlc::encode(&original, &mut encode_output).unwrap();
+
+            let mut parser = HdlcStreamParser::new();
+            let mut result = HdlcParseResult::Pending;
+            for &byte in &encode_buf[..encoded_len] {
+                result = parser.feed(byte);
+            }
+            assert_eq!(result, HdlcParseResult::DataFrame);
+            assert_eq!(parser.frame_data(), &original);
+        }
+
+        #[test]
+        fn test_default_trait() {
+            let parser = HdlcStreamParser::default();
+            assert!(!parser.in_frame());
+            assert!(!parser.has_data());
         }
     }
 }
