@@ -889,7 +889,7 @@ impl AutoInterface {
 
     /// Get current lifecycle state.
     pub fn state(&self) -> AutoInterfaceState {
-        *self.state.read().unwrap()
+        *self.state.read().expect("state lock poisoned")
     }
 
     /// Whether the interface has completed initialization and is online.
@@ -909,17 +909,17 @@ impl AutoInterface {
 
     /// Get snapshot of all discovered peers.
     pub fn peers(&self) -> Vec<Peer> {
-        self.peers.read().unwrap().values().cloned().collect()
+        self.peers.read().expect("peers lock poisoned").values().cloned().collect()
     }
 
     /// Get peer count.
     pub fn peer_count(&self) -> usize {
-        self.peers.read().unwrap().len()
+        self.peers.read().expect("peers lock poisoned").len()
     }
 
     /// Check if a peer exists by address string.
     pub fn has_peer(&self, addr: &str) -> bool {
-        self.peers.read().unwrap().contains_key(addr)
+        self.peers.read().expect("peers lock poisoned").contains_key(addr)
     }
 
     /// Get the multicast discovery socket address.
@@ -929,12 +929,12 @@ impl AutoInterface {
 
     /// Get all link-local addresses (descoped).
     pub fn link_local_addresses(&self) -> Vec<String> {
-        self.link_local_addresses.read().unwrap().clone()
+        self.link_local_addresses.read().expect("link_local_addresses lock poisoned").clone()
     }
 
     /// Check if an address is one of our own.
     pub fn is_local_address(&self, addr: &str) -> bool {
-        self.link_local_addresses.read().unwrap().contains(&addr.to_string())
+        self.link_local_addresses.read().expect("link_local_addresses lock poisoned").contains(&addr.to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -949,42 +949,44 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py add_peer() lines 513-571.
     fn add_peer(&self, addr: &str, ifname: &str) {
         // Check if this is our own multicast echo
-        {
-            let link_locals = self.link_local_addresses.read().unwrap();
-            if link_locals.iter().any(|a| a == addr) {
-                drop(link_locals);
+        let is_own_echo = {
+            let link_locals = self.link_local_addresses.read()
+                .expect("link_local_addresses lock poisoned");
+            link_locals.iter().any(|a| a == addr)
+        };
 
-                // Find which adopted interface this address belongs to
-                let echo_ifname = {
-                    let adopted = self.adopted_interfaces.read().unwrap();
-                    adopted
-                        .iter()
-                        .find(|(_, ai)| ai.link_local_addr == addr)
-                        .map(|(name, _)| name.clone())
-                };
+        if is_own_echo {
+            // Find which adopted interface this address belongs to
+            let echo_ifname = {
+                let adopted = self.adopted_interfaces.read()
+                    .expect("adopted_interfaces lock poisoned");
+                adopted
+                    .iter()
+                    .find(|(_, ai)| ai.link_local_addr == addr)
+                    .map(|(name, _)| name.clone())
+            };
 
-                if let Some(echo_ifname) = echo_ifname {
-                    self.multicast_echoes
-                        .write()
-                        .unwrap()
-                        .insert(echo_ifname.clone(), Instant::now());
-                    self.initial_echoes
-                        .write()
-                        .unwrap()
-                        .entry(echo_ifname)
-                        .or_insert_with(Instant::now);
-                } else {
-                    log::warn!(
-                        "AutoInterface: received echo from own address {} but no matching interface",
-                        addr
-                    );
-                }
-                return;
+            if let Some(echo_ifname) = echo_ifname {
+                self.multicast_echoes
+                    .write()
+                    .expect("multicast_echoes lock poisoned")
+                    .insert(echo_ifname.clone(), Instant::now());
+                self.initial_echoes
+                    .write()
+                    .expect("initial_echoes lock poisoned")
+                    .entry(echo_ifname)
+                    .or_insert_with(Instant::now);
+            } else {
+                log::warn!(
+                    "AutoInterface: received echo from own address {} but no matching interface",
+                    addr
+                );
             }
+            return;
         }
 
         // Remote peer — add or refresh
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().expect("peers lock poisoned");
         if let Some(peer) = peers.get_mut(addr) {
             peer.last_heard = Instant::now();
         } else {
@@ -1004,7 +1006,7 @@ impl AutoInterface {
 
     /// Refresh a peer's last_heard timestamp (for data traffic).
     fn refresh_peer(&self, addr: &str) {
-        if let Some(peer) = self.peers.write().unwrap().get_mut(addr) {
+        if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(addr) {
             peer.last_heard = Instant::now();
         }
     }
@@ -1019,7 +1021,7 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py peer_announce() lines 491-507.
     fn peer_announce(&self, ifname: &str) -> std::io::Result<()> {
         let (link_local_addr, scope_id) = {
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
             let ai = adopted.get(ifname).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
             })?;
@@ -1052,7 +1054,7 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py reverse_announce() lines 477-489.
     fn reverse_announce(&self, ifname: &str, peer_addr: &str) -> std::io::Result<()> {
         let (link_local_addr, scope_id) = {
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
             let ai = adopted.get(ifname).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
             })?;
@@ -1100,7 +1102,7 @@ impl AutoInterface {
 
         // 1. Expire stale peers and send teardown commands for spawned interfaces
         {
-            let mut peers = self.peers.write().unwrap();
+            let mut peers = self.peers.write().expect("peers lock poisoned");
             let before = peers.len();
             let mut expired_addrs = Vec::new();
             peers.retain(|addr, peer| {
@@ -1132,7 +1134,7 @@ impl AutoInterface {
         // 2. Reverse peering — send announces to peers we haven't contacted recently
         let reverse_interval = self.config.reverse_peering_interval();
         let peers_needing_reverse: Vec<(String, String)> = {
-            let peers = self.peers.read().unwrap();
+            let peers = self.peers.read().expect("peers lock poisoned");
             peers
                 .iter()
                 .filter(|(_, peer)| now.duration_since(peer.last_outbound) > reverse_interval)
@@ -1150,17 +1152,17 @@ impl AutoInterface {
                 );
             }
             // Update last_outbound regardless of success (avoid tight retry loops)
-            if let Some(peer) = self.peers.write().unwrap().get_mut(peer_addr.as_str()) {
+            if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(peer_addr.as_str()) {
                 peer.last_outbound = Instant::now();
             }
         }
 
         // 3. Multicast echo check — carrier detection
         {
-            let echoes = self.multicast_echoes.read().unwrap();
-            let initial = self.initial_echoes.read().unwrap();
-            let mut timed_out = self.timed_out_interfaces.write().unwrap();
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let echoes = self.multicast_echoes.read().expect("multicast_echoes lock poisoned");
+            let initial = self.initial_echoes.read().expect("initial_echoes lock poisoned");
+            let mut timed_out = self.timed_out_interfaces.write().expect("timed_out_interfaces lock poisoned");
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
 
             for ifname in adopted.keys() {
                 let was_timed_out = timed_out.get(ifname).copied().unwrap_or(false);
@@ -1302,7 +1304,7 @@ impl AutoInterface {
         cancel: CancellationToken,
         iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
     ) -> std::io::Result<()> {
-        *self.state.write().unwrap() = AutoInterfaceState::Starting;
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Starting;
 
         // 1. Enumerate and adopt interfaces
         let interfaces = enumerate_interfaces(
@@ -1312,13 +1314,13 @@ impl AutoInterface {
 
         if interfaces.is_empty() {
             log::warn!("AutoInterface: no suitable network interfaces found");
-            *self.state.write().unwrap() = AutoInterfaceState::Error;
+            *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Error;
             return Ok(());
         }
 
         {
-            let mut adopted = self.adopted_interfaces.write().unwrap();
-            let mut link_locals = self.link_local_addresses.write().unwrap();
+            let mut adopted = self.adopted_interfaces.write().expect("adopted_interfaces lock poisoned");
+            let mut link_locals = self.link_local_addresses.write().expect("link_local_addresses lock poisoned");
             for iface in &interfaces {
                 let descoped = descope_linklocal(&iface.link_local_addr.to_string());
                 log::info!(
@@ -1348,10 +1350,12 @@ impl AutoInterface {
         let interface_registry: Option<Arc<InterfaceRegistry>>;
 
         if let Some(ref mgr) = iface_manager {
-            let mgr_locked = mgr.lock().await;
-            rx_sender = Some(mgr_locked.rx_sender());
-            interface_registry = mgr_locked.interface_registry();
-            drop(mgr_locked);
+            // Extract transport integration handles from InterfaceManager
+            {
+                let mgr_locked = mgr.lock().await;
+                rx_sender = Some(mgr_locked.rx_sender());
+                interface_registry = mgr_locked.interface_registry();
+            }
 
             // Register parent metadata (IN=true, OUT=false — parent receives but doesn't transmit)
             if let Some(ref reg) = interface_registry {
@@ -1485,7 +1489,7 @@ impl AutoInterface {
         tokio::select! {
             _ = cancel.cancelled() => {
                 // Cancelled during init — clean up
-                *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+                *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Stopped;
                 for handle in task_handles {
                     let _ = handle.await;
                 }
@@ -1496,7 +1500,7 @@ impl AutoInterface {
 
         self.final_init_done.store(true, Ordering::SeqCst);
         self.online.store(true, Ordering::SeqCst);
-        *self.state.write().unwrap() = AutoInterfaceState::Running;
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Running;
         log::info!(
             "AutoInterface: online, {} interfaces adopted",
             interfaces.len()
@@ -1507,11 +1511,11 @@ impl AutoInterface {
 
         // 7. Shutdown
         self.online.store(false, Ordering::SeqCst);
-        *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Stopped;
 
         // Teardown all spawned peers
         {
-            let spawned = self.spawned_interfaces.read().unwrap();
+            let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
             for (_, info) in spawned.iter() {
                 info.stop.cancel();
                 info.metadata.set_online(false);
@@ -1552,7 +1556,7 @@ impl AutoInterface {
                         Some(PeerCommand::Spawn { addr, ifname }) => {
                             // Check if already spawned
                             {
-                                let spawned = self.spawned_interfaces.read().unwrap();
+                                let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
                                 if spawned.contains_key(&addr) {
                                     continue;
                                 }
@@ -1560,7 +1564,7 @@ impl AutoInterface {
 
                             // Look up scope_id from adopted interfaces
                             let scope_id = {
-                                let adopted = self.adopted_interfaces.read().unwrap();
+                                let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
                                 match adopted.get(&ifname) {
                                     Some(ai) => ai.scope_id,
                                     None => {
@@ -1624,7 +1628,7 @@ impl AutoInterface {
 
                             // Store tracking info
                             {
-                                let mut spawned = self.spawned_interfaces.write().unwrap();
+                                let mut spawned = self.spawned_interfaces.write().expect("spawned_interfaces lock poisoned");
                                 spawned.insert(
                                     addr.clone(),
                                     SpawnedPeerInfo {
@@ -1644,7 +1648,7 @@ impl AutoInterface {
                         }
                         Some(PeerCommand::Teardown { addr }) => {
                             let info = {
-                                let mut spawned = self.spawned_interfaces.write().unwrap();
+                                let mut spawned = self.spawned_interfaces.write().expect("spawned_interfaces lock poisoned");
                                 spawned.remove(&addr)
                             };
 
@@ -1821,7 +1825,7 @@ impl AutoInterface {
                             // Deduplicate via MifDeque
                             let data_hash = Hash::new_from_slice(data);
                             {
-                                let mut deque = self.mif_deque.lock().unwrap();
+                                let mut deque = self.mif_deque.lock().expect("mif_deque lock poisoned");
                                 if deque.is_duplicate(&data_hash) {
                                     continue;
                                 }
@@ -1842,7 +1846,7 @@ impl AutoInterface {
                                 // Look up the peer's interface address hash and
                                 // update RX stats — all done synchronously before await
                                 let source_address = {
-                                    let spawned = self.spawned_interfaces.read().unwrap();
+                                    let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
                                     if let Some(info) = spawned.get(&sender_addr) {
                                         info.metadata.add_rx_bytes(len as u64);
                                         info.address
