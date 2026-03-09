@@ -3,18 +3,20 @@
 //! This module provides serial port communication with HDLC framing
 //! for interfacing with hardware devices.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::buffer::{InputBuffer, OutputBuffer};
+use crate::config::InterfaceConfig;
 use crate::error::RnsError;
 use crate::hash::AddressHash;
 use crate::iface::hdlc::Hdlc;
+use crate::iface::kiss::{self, Kiss, FEND, FESC, TFEND, TFESC, CMD_DATA};
 use crate::iface::Interface;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
-/// Default baud rate for serial interfaces
-pub const DEFAULT_BAUD_RATE: u32 = 115200;
+/// Default baud rate for serial interfaces (9600 matches Python KISS TNC default)
+pub const DEFAULT_BAUD_RATE: u32 = 9600;
 
 /// Default read timeout in milliseconds
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
@@ -241,48 +243,228 @@ impl Interface for SerialInterface {
     }
 }
 
-/// KISS interface constants
-pub mod kiss {
-    /// KISS frame start/end marker
-    pub const FEND: u8 = 0xC0;
-    /// KISS frame escape
-    pub const FESC: u8 = 0xDB;
-    /// Escaped FEND
-    pub const TFEND: u8 = 0xDC;
-    /// Escaped FESC
-    pub const TFESC: u8 = 0xDD;
-    /// Data frame command
-    pub const CMD_DATA: u8 = 0x00;
-    /// TX delay command
-    pub const CMD_TXDELAY: u8 = 0x01;
-    /// Persistence command
-    pub const CMD_P: u8 = 0x02;
-    /// Slot time command
-    pub const CMD_SLOTTIME: u8 = 0x03;
-    /// TX tail command
-    pub const CMD_TXTAIL: u8 = 0x04;
-    /// Full duplex command
-    pub const CMD_FULLDUPLEX: u8 = 0x05;
-    /// Set hardware command
-    pub const CMD_SETHW: u8 = 0x06;
-    /// Return (exit KISS mode) command
-    pub const CMD_RETURN: u8 = 0xFF;
+// =============================================================================
+// KISS TNC configuration and flow control
+// =============================================================================
+
+/// Default preamble in milliseconds (matches Python KISSInterface default)
+pub const DEFAULT_PREAMBLE_MS: u32 = 350;
+/// Default TX tail in milliseconds
+pub const DEFAULT_TXTAIL_MS: u32 = 20;
+/// Default persistence value (0-255)
+pub const DEFAULT_PERSISTENCE: u8 = 64;
+/// Default slot time in milliseconds
+pub const DEFAULT_SLOTTIME_MS: u32 = 20;
+/// Flow control timeout in seconds before auto-unlock
+pub const DEFAULT_FLOW_CONTROL_TIMEOUT_SECS: u64 = 5;
+/// Frame timeout in milliseconds — reset parser state after this much silence
+pub const DEFAULT_FRAME_TIMEOUT_MS: u64 = 100;
+/// Assumed bitrate for KISS TNCs (bps)
+pub const KISS_BITRATE_GUESS: u64 = 1200;
+/// Minimum beacon frame length in bytes (padded with 0x00)
+pub const MIN_BEACON_LENGTH: usize = 15;
+
+/// KISS TNC configuration parameters.
+///
+/// Sent as KISS command frames to the TNC hardware on startup.
+#[derive(Debug, Clone)]
+pub struct KissTncConfig {
+    /// Preamble / TX delay in milliseconds
+    pub preamble_ms: u32,
+    /// TX tail in milliseconds
+    pub txtail_ms: u32,
+    /// CSMA persistence value (0-255)
+    pub persistence: u8,
+    /// CSMA slot time in milliseconds
+    pub slottime_ms: u32,
+    /// Enable hardware flow control (CMD_READY signaling)
+    pub flow_control: bool,
 }
 
-/// KISS interface for TNC communication
+impl Default for KissTncConfig {
+    fn default() -> Self {
+        Self {
+            preamble_ms: DEFAULT_PREAMBLE_MS,
+            txtail_ms: DEFAULT_TXTAIL_MS,
+            persistence: DEFAULT_PERSISTENCE,
+            slottime_ms: DEFAULT_SLOTTIME_MS,
+            flow_control: false,
+        }
+    }
+}
+
+impl KissTncConfig {
+    /// Generate the sequence of KISS command frames to configure the TNC.
+    /// These should be written to the serial port on startup.
+    pub fn command_frames(&self) -> Vec<[u8; 4]> {
+        let mut frames = vec![
+            Kiss::preamble_frame(self.preamble_ms),
+            Kiss::txtail_frame(self.txtail_ms),
+            Kiss::persistence_frame(self.persistence),
+            Kiss::slottime_frame(self.slottime_ms),
+        ];
+        if self.flow_control {
+            frames.push(Kiss::flow_control_frame());
+        }
+        frames
+    }
+}
+
+/// KISS hardware flow control state.
+///
+/// When enabled, `interface_ready` is cleared after each TX. The TNC
+/// signals readiness by sending CMD_READY, at which point queued packets
+/// are drained. A timeout auto-unlocks after `DEFAULT_FLOW_CONTROL_TIMEOUT_SECS`.
+pub struct KissFlowControl {
+    /// Whether the interface is ready to transmit
+    interface_ready: bool,
+    /// Whether flow control is enabled
+    enabled: bool,
+    /// Timeout duration before auto-unlock
+    timeout: Duration,
+    /// When the interface was locked (for timeout tracking)
+    locked_at: Option<Instant>,
+    /// Packets queued while the interface is locked
+    packet_queue: Vec<Vec<u8>>,
+}
+
+impl KissFlowControl {
+    /// Create a new flow control instance.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            interface_ready: true,
+            enabled,
+            timeout: Duration::from_secs(DEFAULT_FLOW_CONTROL_TIMEOUT_SECS),
+            locked_at: None,
+            packet_queue: Vec::new(),
+        }
+    }
+
+    /// Returns true if the interface is ready to transmit.
+    /// Always true when flow control is disabled.
+    pub fn is_ready(&self) -> bool {
+        !self.enabled || self.interface_ready
+    }
+
+    /// Lock the interface after a transmission (called when flow control is enabled).
+    pub fn lock(&mut self) {
+        if self.enabled {
+            self.interface_ready = false;
+            self.locked_at = Some(Instant::now());
+        }
+    }
+
+    /// Signal that the TNC is ready (CMD_READY received).
+    /// Unlocks the interface and returns any queued packets to be sent.
+    pub fn signal_ready(&mut self) -> Vec<Vec<u8>> {
+        self.interface_ready = true;
+        self.locked_at = None;
+        std::mem::take(&mut self.packet_queue)
+    }
+
+    /// Queue a packet while the interface is locked.
+    pub fn queue(&mut self, data: Vec<u8>) {
+        self.packet_queue.push(data);
+    }
+
+    /// Check if the flow control timeout has expired.
+    /// Returns true if auto-unlocked (caller should log a warning).
+    pub fn check_timeout(&mut self) -> bool {
+        if !self.enabled || self.interface_ready {
+            return false;
+        }
+        if let Some(locked_at) = self.locked_at {
+            if locked_at.elapsed() >= self.timeout {
+                log::warn!(
+                    "Flow control timeout ({:?}) expired, auto-unlocking interface",
+                    self.timeout
+                );
+                self.interface_ready = true;
+                self.locked_at = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if flow control is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the number of queued packets.
+    pub fn queue_len(&self) -> usize {
+        self.packet_queue.len()
+    }
+}
+
+/// Beacon / ID configuration for periodic station identification.
+#[derive(Debug, Clone)]
+pub struct BeaconConfig {
+    /// Beacon interval in seconds (None = disabled)
+    pub interval: Option<u64>,
+    /// Beacon data (callsign/ID as UTF-8 bytes)
+    pub data: Vec<u8>,
+}
+
+impl BeaconConfig {
+    /// Build a beacon frame, padded to MIN_BEACON_LENGTH (15 bytes) with 0x00.
+    pub fn make_frame(&self) -> Vec<u8> {
+        let mut frame = self.data.clone();
+        while frame.len() < MIN_BEACON_LENGTH {
+            frame.push(0x00);
+        }
+        frame
+    }
+}
+
+/// KISS interface for TNC communication.
+///
+/// Wraps a `SerialInterface` with KISS-specific TNC configuration,
+/// flow control, and beacon support.
 pub struct KissInterface {
     /// Base serial interface
     serial: SerialInterface,
-    /// Port number (0-15 for multi-port TNCs)
+    /// TNC port number (0-15 for multi-port TNCs)
     port: u8,
+    /// TNC configuration parameters (preamble, persistence, etc.)
+    tnc_config: KissTncConfig,
+    /// Hardware flow control state
+    flow_control: KissFlowControl,
+    /// Optional beacon / station ID configuration
+    beacon: Option<BeaconConfig>,
+    /// Timestamp of first TX (for beacon interval tracking)
+    first_tx: Option<Instant>,
 }
 
 impl KissInterface {
-    /// Create a new KISS interface
+    /// Create a new KISS interface with default TNC settings.
     pub fn new(config: SerialConfig, port: u8) -> Self {
         Self {
             serial: SerialInterface::new(config),
             port: port.min(15),
+            tnc_config: KissTncConfig::default(),
+            flow_control: KissFlowControl::new(false),
+            beacon: None,
+            first_tx: None,
+        }
+    }
+
+    /// Create a KISS interface with full TNC configuration.
+    pub fn with_tnc_config(
+        config: SerialConfig,
+        port: u8,
+        tnc_config: KissTncConfig,
+        beacon: Option<BeaconConfig>,
+    ) -> Self {
+        let flow_control_enabled = tnc_config.flow_control;
+        Self {
+            serial: SerialInterface::new(config),
+            port: port.min(15),
+            tnc_config,
+            flow_control: KissFlowControl::new(flow_control_enabled),
+            beacon,
+            first_tx: None,
         }
     }
 
@@ -291,21 +473,21 @@ impl KissInterface {
         let mut encoded = Vec::with_capacity(data.len() * 2 + 3);
 
         // Start frame
-        encoded.push(kiss::FEND);
+        encoded.push(FEND);
 
         // Command byte (port << 4 | command)
-        encoded.push((self.port << 4) | kiss::CMD_DATA);
+        encoded.push((self.port << 4) | CMD_DATA);
 
         // Escape and add data
         for &byte in data {
             match byte {
-                kiss::FEND => {
-                    encoded.push(kiss::FESC);
-                    encoded.push(kiss::TFEND);
+                FEND => {
+                    encoded.push(FESC);
+                    encoded.push(TFEND);
                 }
-                kiss::FESC => {
-                    encoded.push(kiss::FESC);
-                    encoded.push(kiss::TFESC);
+                FESC => {
+                    encoded.push(FESC);
+                    encoded.push(TFESC);
                 }
                 _ => {
                     encoded.push(byte);
@@ -314,7 +496,7 @@ impl KissInterface {
         }
 
         // End frame
-        encoded.push(kiss::FEND);
+        encoded.push(FEND);
 
         encoded
     }
@@ -326,7 +508,7 @@ impl KissInterface {
         let mut in_frame = false;
 
         for &byte in data {
-            if byte == kiss::FEND {
+            if byte == FEND {
                 if in_frame && !decoded.is_empty() {
                     // Remove command byte and return
                     if !decoded.is_empty() {
@@ -345,12 +527,12 @@ impl KissInterface {
 
             if escape {
                 match byte {
-                    kiss::TFEND => decoded.push(kiss::FEND),
-                    kiss::TFESC => decoded.push(kiss::FESC),
+                    TFEND => decoded.push(FEND),
+                    TFESC => decoded.push(FESC),
                     _ => decoded.push(byte),
                 }
                 escape = false;
-            } else if byte == kiss::FESC {
+            } else if byte == FESC {
                 escape = true;
             } else {
                 decoded.push(byte);
@@ -369,6 +551,132 @@ impl KissInterface {
     pub fn serial_mut(&mut self) -> &mut SerialInterface {
         &mut self.serial
     }
+
+    /// Get the TNC configuration
+    pub fn tnc_config(&self) -> &KissTncConfig {
+        &self.tnc_config
+    }
+
+    /// Get mutable reference to flow control state
+    pub fn flow_control_mut(&mut self) -> &mut KissFlowControl {
+        &mut self.flow_control
+    }
+
+    /// Get the beacon configuration
+    pub fn beacon(&self) -> Option<&BeaconConfig> {
+        self.beacon.as_ref()
+    }
+
+    /// Get the TNC port number
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+
+    /// Get/set the first TX timestamp (for beacon interval tracking)
+    pub fn first_tx(&self) -> Option<Instant> {
+        self.first_tx
+    }
+
+    /// Set the first TX timestamp
+    pub fn set_first_tx(&mut self, instant: Option<Instant>) {
+        self.first_tx = instant;
+    }
+
+    /// Create a KISS interface from an `InterfaceConfig`.
+    ///
+    /// Reads KISS-specific fields from the config's `extra` map:
+    /// - `port` (required): serial port path
+    /// - `speed`: baud rate (default 9600)
+    /// - `databits`: data bits (default 8)
+    /// - `parity`: "N", "E", or "O" (default "N")
+    /// - `stopbits`: stop bits (default 1)
+    /// - `preamble`: TX delay in ms (default 350)
+    /// - `txtail`: TX tail in ms (default 20)
+    /// - `persistence`: CSMA persistence 0-255 (default 64)
+    /// - `slottime`: CSMA slot time in ms (default 20)
+    /// - `flow_control`: enable hardware flow control (default false)
+    /// - `id_interval`: beacon interval in seconds (optional)
+    /// - `id_callsign`: beacon callsign string (optional)
+    pub fn from_config(iface_config: &InterfaceConfig) -> Result<Self, RnsError> {
+        let extra = &iface_config.extra;
+
+        let port_path = extra.get("port")
+            .ok_or(RnsError::InvalidArgument)?;
+
+        let speed: u32 = extra.get("speed")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_BAUD_RATE);
+
+        let databits: u8 = extra.get("databits")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+
+        let parity = match extra.get("parity").map(|s| s.to_lowercase()).as_deref() {
+            Some("e") | Some("even") => Parity::Even,
+            Some("o") | Some("odd") => Parity::Odd,
+            _ => Parity::None,
+        };
+
+        let stopbits: u8 = extra.get("stopbits")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        let serial_config = SerialConfig {
+            port: port_path.clone(),
+            baud_rate: speed,
+            data_bits: databits,
+            stop_bits: stopbits,
+            parity,
+            ..Default::default()
+        };
+
+        let preamble_ms: u32 = extra.get("preamble")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PREAMBLE_MS);
+
+        let txtail_ms: u32 = extra.get("txtail")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_TXTAIL_MS);
+
+        let persistence: u8 = extra.get("persistence")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PERSISTENCE);
+
+        let slottime_ms: u32 = extra.get("slottime")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_SLOTTIME_MS);
+
+        let flow_control: bool = extra.get("flow_control")
+            .map(|s| s == "true" || s == "True" || s == "1" || s == "yes")
+            .unwrap_or(false);
+
+        let tnc_config = KissTncConfig {
+            preamble_ms,
+            txtail_ms,
+            persistence,
+            slottime_ms,
+            flow_control,
+        };
+
+        let id_interval: Option<u64> = extra.get("id_interval")
+            .and_then(|s| s.parse().ok());
+
+        let id_callsign: Option<String> = extra.get("id_callsign").cloned();
+
+        let beacon = match (id_interval, id_callsign) {
+            (Some(interval), Some(callsign)) => Some(BeaconConfig {
+                interval: Some(interval),
+                data: callsign.into_bytes(),
+            }),
+            (Some(interval), None) => Some(BeaconConfig {
+                interval: Some(interval),
+                data: Vec::new(),
+            }),
+            _ => None,
+        };
+
+        Ok(Self::with_tnc_config(serial_config, 0, tnc_config, beacon))
+    }
 }
 
 impl Interface for KissInterface {
@@ -383,47 +691,53 @@ mod tests {
 
     #[test]
     fn test_serial_config() {
-        let config = SerialConfig::new("/dev/ttyUSB0").with_baud_rate(9600);
+        let config = SerialConfig::new("/dev/ttyUSB0").with_baud_rate(19200);
         assert_eq!(config.port, "/dev/ttyUSB0");
+        assert_eq!(config.baud_rate, 19200);
+    }
+
+    #[test]
+    fn test_default_baud_rate_9600() {
+        let config = SerialConfig::default();
         assert_eq!(config.baud_rate, 9600);
     }
 
     #[test]
     fn test_kiss_encode() {
         let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss = KissInterface::new(config, 0);
+        let kiss_iface = KissInterface::new(config, 0);
 
         let data = vec![0x01, 0x02, 0x03];
-        let encoded = kiss.encode_kiss(&data);
+        let encoded = kiss_iface.encode_kiss(&data);
 
-        assert_eq!(encoded[0], kiss::FEND);
-        assert_eq!(encoded[1], kiss::CMD_DATA);
-        assert_eq!(encoded[encoded.len() - 1], kiss::FEND);
+        assert_eq!(encoded[0], FEND);
+        assert_eq!(encoded[1], CMD_DATA);
+        assert_eq!(encoded[encoded.len() - 1], FEND);
     }
 
     #[test]
     fn test_kiss_encode_escape() {
         let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss = KissInterface::new(config, 0);
+        let kiss_iface = KissInterface::new(config, 0);
 
         // Data containing FEND and FESC bytes
-        let data = vec![kiss::FEND, kiss::FESC, 0x42];
-        let encoded = kiss.encode_kiss(&data);
+        let data = vec![FEND, FESC, 0x42];
+        let encoded = kiss_iface.encode_kiss(&data);
 
         // Should have escape sequences
-        assert!(encoded.contains(&kiss::FESC));
-        assert!(encoded.contains(&kiss::TFEND));
-        assert!(encoded.contains(&kiss::TFESC));
+        assert!(encoded.contains(&FESC));
+        assert!(encoded.contains(&TFEND));
+        assert!(encoded.contains(&TFESC));
     }
 
     #[test]
     fn test_kiss_decode() {
         let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss = KissInterface::new(config, 0);
+        let kiss_iface = KissInterface::new(config, 0);
 
         // Valid KISS frame
-        let frame = vec![kiss::FEND, kiss::CMD_DATA, 0x01, 0x02, 0x03, kiss::FEND];
-        let decoded = kiss.decode_kiss(&frame).unwrap();
+        let frame = vec![FEND, CMD_DATA, 0x01, 0x02, 0x03, FEND];
+        let decoded = kiss_iface.decode_kiss(&frame).unwrap();
 
         assert_eq!(decoded, vec![0x01, 0x02, 0x03]);
     }
@@ -455,5 +769,195 @@ mod tests {
     fn test_kiss_mtu_564() {
         // Verify KISS interface MTU also matches Python implementation
         assert_eq!(KissInterface::mtu(), 564);
+    }
+
+    #[test]
+    fn test_kiss_with_tnc_config() {
+        let config = SerialConfig::new("/dev/ttyUSB0");
+        let tnc = KissTncConfig {
+            preamble_ms: 500,
+            txtail_ms: 30,
+            persistence: 128,
+            slottime_ms: 40,
+            flow_control: true,
+        };
+        let kiss_iface = KissInterface::with_tnc_config(config, 2, tnc, None);
+        assert_eq!(kiss_iface.port(), 2);
+        assert_eq!(kiss_iface.tnc_config().preamble_ms, 500);
+        assert!(kiss_iface.beacon().is_none());
+    }
+
+    #[test]
+    fn test_tnc_config_defaults() {
+        let tnc = KissTncConfig::default();
+        assert_eq!(tnc.preamble_ms, 350);
+        assert_eq!(tnc.txtail_ms, 20);
+        assert_eq!(tnc.persistence, 64);
+        assert_eq!(tnc.slottime_ms, 20);
+        assert!(!tnc.flow_control);
+    }
+
+    #[test]
+    fn test_tnc_config_command_frames() {
+        let tnc = KissTncConfig::default();
+        let frames = tnc.command_frames();
+        // preamble, txtail, persistence, slottime (no flow control)
+        assert_eq!(frames.len(), 4);
+        // Verify preamble frame: 350/10 = 35
+        assert_eq!(frames[0], [FEND, kiss::CMD_TXDELAY, 35, FEND]);
+    }
+
+    #[test]
+    fn test_tnc_config_command_frames_with_flow_control() {
+        let tnc = KissTncConfig {
+            flow_control: true,
+            ..Default::default()
+        };
+        let frames = tnc.command_frames();
+        // preamble, txtail, persistence, slottime, flow_control
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[4], [FEND, kiss::CMD_READY, 0x01, FEND]);
+    }
+
+    #[test]
+    fn test_flow_control_disabled() {
+        let fc = KissFlowControl::new(false);
+        assert!(fc.is_ready());
+        assert!(!fc.is_enabled());
+    }
+
+    #[test]
+    fn test_flow_control_lock_unlock() {
+        let mut fc = KissFlowControl::new(true);
+        assert!(fc.is_ready());
+
+        fc.lock();
+        assert!(!fc.is_ready());
+
+        let queued = fc.signal_ready();
+        assert!(fc.is_ready());
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn test_flow_control_queue() {
+        let mut fc = KissFlowControl::new(true);
+        fc.lock();
+
+        fc.queue(vec![0x01, 0x02]);
+        fc.queue(vec![0x03, 0x04]);
+        assert_eq!(fc.queue_len(), 2);
+
+        let queued = fc.signal_ready();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0], vec![0x01, 0x02]);
+        assert_eq!(queued[1], vec![0x03, 0x04]);
+        assert_eq!(fc.queue_len(), 0);
+    }
+
+    #[test]
+    fn test_beacon_config_make_frame() {
+        let beacon = BeaconConfig {
+            interval: Some(600),
+            data: b"N0CALL".to_vec(),
+        };
+        let frame = beacon.make_frame();
+        // "N0CALL" = 6 bytes, padded to 15
+        assert_eq!(frame.len(), 15);
+        assert_eq!(&frame[..6], b"N0CALL");
+        assert!(frame[6..].iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn test_beacon_config_no_padding_needed() {
+        let beacon = BeaconConfig {
+            interval: Some(300),
+            data: vec![0x42; 20], // already > 15 bytes
+        };
+        let frame = beacon.make_frame();
+        assert_eq!(frame.len(), 20);
+    }
+
+    mod from_config {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn make_iface_config(extra: HashMap<String, String>) -> InterfaceConfig {
+            InterfaceConfig {
+                name: "test_kiss".to_string(),
+                interface_type: "KISSInterface".to_string(),
+                enabled: true,
+                mode: None,
+                network_name: None,
+                passphrase: None,
+                target_host: None,
+                target_port: None,
+                listen_ip: None,
+                listen_port: None,
+                outgoing: false,
+                bitrate: None,
+                fixed_mtu: None,
+                announce_rate_target: None,
+                announce_rate_grace: None,
+                announce_rate_penalty: None,
+                extra,
+            }
+        }
+
+        #[test]
+        fn test_from_config_defaults() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
+            let config = make_iface_config(extra);
+
+            let kiss = KissInterface::from_config(&config).unwrap();
+            assert_eq!(kiss.serial().config().port, "/dev/ttyUSB0");
+            assert_eq!(kiss.serial().config().baud_rate, 9600);
+            assert_eq!(kiss.tnc_config().preamble_ms, 350);
+            assert_eq!(kiss.tnc_config().persistence, 64);
+            assert!(!kiss.tnc_config().flow_control);
+            assert!(kiss.beacon().is_none());
+        }
+
+        #[test]
+        fn test_from_config_overrides() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyS0".to_string());
+            extra.insert("speed".to_string(), "19200".to_string());
+            extra.insert("preamble".to_string(), "500".to_string());
+            extra.insert("persistence".to_string(), "128".to_string());
+            extra.insert("flow_control".to_string(), "true".to_string());
+            extra.insert("id_interval".to_string(), "600".to_string());
+            extra.insert("id_callsign".to_string(), "N0CALL".to_string());
+            let config = make_iface_config(extra);
+
+            let kiss = KissInterface::from_config(&config).unwrap();
+            assert_eq!(kiss.serial().config().baud_rate, 19200);
+            assert_eq!(kiss.tnc_config().preamble_ms, 500);
+            assert_eq!(kiss.tnc_config().persistence, 128);
+            assert!(kiss.tnc_config().flow_control);
+
+            let beacon = kiss.beacon().unwrap();
+            assert_eq!(beacon.interval, Some(600));
+            assert_eq!(beacon.data, b"N0CALL");
+        }
+
+        #[test]
+        fn test_from_config_missing_port() {
+            let extra = HashMap::new();
+            let config = make_iface_config(extra);
+            assert!(KissInterface::from_config(&config).is_err());
+        }
+
+        #[test]
+        fn test_from_config_parity() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
+            extra.insert("parity".to_string(), "E".to_string());
+            let config = make_iface_config(extra);
+
+            let kiss = KissInterface::from_config(&config).unwrap();
+            assert_eq!(kiss.serial().config().parity, Parity::Even);
+        }
     }
 }
