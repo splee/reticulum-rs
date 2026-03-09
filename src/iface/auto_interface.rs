@@ -3,14 +3,30 @@
 //! AutoInterface automatically discovers peers on local network segments
 //! using IPv6 multicast and link-local addressing. It enumerates local network
 //! interfaces, computes a multicast discovery address from the group ID, and
-//! manages peer state.
+//! manages peer state via a background async task architecture.
+//!
+//! ## Wire Protocol
+//!
+//! Discovery packets are exactly 32 bytes: `SHA-256(group_id_bytes + link_local_addr_string_bytes)`.
+//! This matches Python's `AutoInterface.py` peer_announce/discovery_handler.
+//!
+//! ## Architecture
+//!
+//! `AutoInterface::run()` spawns per-OS-interface tasks for:
+//! - Multicast discovery (send + recv on `discovery_port`)
+//! - Unicast discovery (recv on `discovery_port + 1`)
+//! - Data receive (recv on `data_port`, with MifDeque deduplication)
+//! - A single peer job task for expiry, reverse peering, and echo checks.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{Ipv6Addr, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use sha2::Digest;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::InterfaceConfig;
 use crate::hash::{AddressHash, Hash};
@@ -26,7 +42,7 @@ pub const HW_MTU: usize = 1196;
 /// Default discovery (multicast beacon) port (Python: DEFAULT_DISCOVERY_PORT = 29716)
 pub const DEFAULT_DISCOVERY_PORT: u16 = 29716;
 
-/// Default data port for peer-to-peer TCP connections (Python: DEFAULT_DATA_PORT = 42671)
+/// Default data port for peer-to-peer UDP connections (Python: DEFAULT_DATA_PORT = 42671)
 pub const DEFAULT_DATA_PORT: u16 = 42671;
 
 /// Default group identifier — peers must share the same group_id to discover
@@ -66,6 +82,10 @@ pub const MULTI_IF_DEQUE_LEN: usize = 48;
 /// Multi-interface deque time-to-live.
 /// (Python: MULTI_IF_DEQUE_TTL = 0.75)
 pub const MULTI_IF_DEQUE_TTL: Duration = Duration::from_millis(750);
+
+/// Multiplier applied to announce_interval to compute reverse peering interval.
+/// (Python: peer[2] checked against ANNOUNCE_INTERVAL * 3.25)
+const REVERSE_PEERING_MULTIPLIER: f64 = 3.25;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -255,7 +275,7 @@ pub struct AutoInterfaceConfig {
     /// (Python: DEFAULT_DISCOVERY_PORT = 29716)
     pub discovery_port: u16,
 
-    /// TCP port used for peer data connections.
+    /// UDP port used for peer data connections.
     /// (Python: DEFAULT_DATA_PORT = 42671)
     pub data_port: u16,
 
@@ -400,6 +420,18 @@ impl AutoInterfaceConfig {
     pub fn multicast_group(&self) -> SocketAddrV6 {
         SocketAddrV6::new(self.multicast_discovery_address(), self.discovery_port, 0, 0)
     }
+
+    /// Unicast discovery port — one higher than the multicast discovery port.
+    /// (Python: self.discovery_port + 1)
+    pub fn unicast_discovery_port(&self) -> u16 {
+        self.discovery_port + 1
+    }
+
+    /// Compute the reverse peering interval.
+    /// (Python: checks `peer[2]` against `ANNOUNCE_INTERVAL * 3.25`)
+    pub fn reverse_peering_interval(&self) -> Duration {
+        Duration::from_secs_f64(self.announce_interval.as_secs_f64() * REVERSE_PEERING_MULTIPLIER)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,51 +473,163 @@ fn parse_comma_list(s: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Discovery token — wire format compatible with Python AutoInterface.py
+// ---------------------------------------------------------------------------
+
+/// Create a 32-byte discovery token: SHA-256(group_id_bytes + link_local_addr_string_bytes).
+///
+/// Matches Python AutoInterface.py:494:
+///   `discovery_token = RNS.Identity.full_hash(self.group_id + link_local_address.encode("utf-8"))`
+///
+/// Python's `group_id` is `"reticulum".encode("utf-8")` (bytes). In Rust, `group_id` is
+/// a `String`, so `.as_bytes()` produces identical UTF-8 bytes.
+pub fn create_discovery_token(group_id: &str, link_local_addr: &str) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(group_id.as_bytes());
+    hasher.update(link_local_addr.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Validate a received discovery token against the expected hash for a sender address.
+///
+/// Matches Python AutoInterface.py discovery_handler:
+///   `expected_hash = RNS.Identity.full_hash(self.group_id + ipv6_src[0].encode("utf-8"))`
+///   `if peering_hash == expected_hash: self.add_peer(...)`
+pub fn validate_discovery_token(group_id: &str, received: &[u8], sender_addr: &str) -> bool {
+    if received.len() < 32 {
+        return false;
+    }
+    let expected = create_discovery_token(group_id, sender_addr);
+    received[..32] == expected
+}
+
+// ---------------------------------------------------------------------------
+// Address normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize a link-local IPv6 address by removing scope identifiers.
+///
+/// Matches Python `AutoInterface.descope_linklocal()`:
+///   1. Strip `%ifname` suffix (macOS: `fe80::1%en0` → `fe80::1`)
+///   2. Strip embedded scope bits (NetBSD/OpenBSD: `fe80:4::1234` → `fe80::1234`)
+pub fn descope_linklocal(addr: &str) -> String {
+    // Step 1: strip %ifname suffix (macOS)
+    let addr = addr.split('%').next().unwrap_or(addr);
+
+    // Step 2: strip embedded scope bits (NetBSD/OpenBSD)
+    // Python regex: re.sub(r"fe80:[0-9a-f]*::", "fe80::", addr)
+    if let Some(rest) = addr.strip_prefix("fe80:") {
+        if let Some(pos) = rest.find("::") {
+            let between = &rest[..pos];
+            if !between.is_empty() && between.chars().all(|c| c.is_ascii_hexdigit()) {
+                return format!("fe80::{}", &rest[pos + 2..]);
+            }
+        }
+    }
+
+    addr.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Multi-interface deduplication deque
+// ---------------------------------------------------------------------------
+
+/// Ring buffer for cross-interface packet deduplication.
+///
+/// When the same packet arrives on multiple OS interfaces, only the first
+/// copy should be processed. MifDeque stores recent packet hashes with
+/// timestamps and rejects duplicates within the TTL window.
+///
+/// (Python: MULTI_IF_DEQUE_LEN = 48, MULTI_IF_DEQUE_TTL = 0.75s)
+pub struct MifDeque {
+    entries: VecDeque<(Hash, Instant)>,
+}
+
+impl MifDeque {
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(MULTI_IF_DEQUE_LEN),
+        }
+    }
+
+    /// Check if a packet hash was recently seen (within TTL window).
+    pub fn is_duplicate(&self, hash: &Hash) -> bool {
+        let cutoff = Instant::now() - MULTI_IF_DEQUE_TTL;
+        self.entries
+            .iter()
+            .any(|(h, t)| h == hash && *t > cutoff)
+    }
+
+    /// Insert a packet hash into the deque, evicting oldest entries if at capacity.
+    pub fn insert(&mut self, hash: Hash) {
+        // Evict expired entries
+        let cutoff = Instant::now() - MULTI_IF_DEQUE_TTL;
+        while let Some((_, t)) = self.entries.front() {
+            if *t <= cutoff {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Evict oldest if at capacity
+        while self.entries.len() >= MULTI_IF_DEQUE_LEN {
+            self.entries.pop_front();
+        }
+
+        self.entries.push_back((hash, Instant::now()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adopted interface — per-OS-interface state
+// ---------------------------------------------------------------------------
+
+/// State for a network interface that has been adopted for peering.
+#[derive(Debug, Clone)]
+pub struct AdoptedInterface {
+    /// OS interface name (e.g. "en0")
+    pub name: String,
+    /// Descoped link-local address as string (used for hash computation)
+    pub link_local_addr: String,
+    /// Parsed IPv6 address (for socket binding)
+    pub link_local_ipv6: Ipv6Addr,
+    /// OS-level scope/interface index
+    pub scope_id: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Peer
 // ---------------------------------------------------------------------------
 
-/// Discovered peer information
+/// Discovered peer information, matching Python's `self.peers[addr] = [ifname, last_heard, last_outbound]`.
 #[derive(Debug, Clone)]
 pub struct Peer {
-    /// Peer address
-    pub address: SocketAddrV6,
-    /// Interface address hash
-    pub interface_hash: AddressHash,
-    /// When peer was discovered
-    pub discovered_at: Instant,
-    /// Last activity time
-    pub last_seen: Instant,
-    /// Whether peer is reachable
-    pub reachable: bool,
+    /// Peer IPv6 address string (descoped, e.g. "fe80::1234:5678")
+    pub addr: String,
+    /// OS interface this peer was discovered on
+    pub ifname: String,
+    /// When this peer was last heard from (for expiry)
+    pub last_heard: Instant,
+    /// When we last sent a reverse announce to this peer
+    pub last_outbound: Instant,
 }
 
 impl Peer {
-    /// Create a new peer
-    pub fn new(address: SocketAddrV6, interface_hash: AddressHash) -> Self {
+    /// Create a new peer with current timestamps.
+    pub fn new(addr: &str, ifname: &str) -> Self {
         let now = Instant::now();
         Self {
-            address,
-            interface_hash,
-            discovered_at: now,
-            last_seen: now,
-            reachable: true,
+            addr: addr.to_string(),
+            ifname: ifname.to_string(),
+            last_heard: now,
+            last_outbound: now,
         }
     }
 
     /// Check if peer has expired based on the given timeout.
     pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.last_seen.elapsed() > timeout
-    }
-
-    /// Update last seen time
-    pub fn touch(&mut self) {
-        self.last_seen = Instant::now();
-        self.reachable = true;
-    }
-
-    /// Mark peer as unreachable
-    pub fn mark_unreachable(&mut self) {
-        self.reachable = false;
+        self.last_heard.elapsed() > timeout
     }
 }
 
@@ -511,180 +655,339 @@ pub enum AutoInterfaceState {
 // ---------------------------------------------------------------------------
 
 /// AutoInterface for automatic peer discovery using IPv6 multicast.
+///
+/// Uses `Arc<Self>` with interior mutability for shared access across
+/// async tasks. All `RwLock`/`Mutex` fields are held only in synchronous
+/// blocks, never across `.await` points.
 pub struct AutoInterface {
-    /// Configuration
+    /// Configuration (immutable after construction)
     config: AutoInterfaceConfig,
-    /// Current state
-    state: AutoInterfaceState,
-    /// Discovered peers (unbounded — matches Python's dict)
-    peers: RwLock<HashMap<SocketAddrV6, Peer>>,
-    /// Last discovery time
-    last_discovery: RwLock<Instant>,
-    /// Local addresses
-    local_addresses: RwLock<Vec<Ipv6Addr>>,
+    /// Lifecycle state
+    state: RwLock<AutoInterfaceState>,
+    /// Discovered peers, keyed by descoped IPv6 address string
+    peers: RwLock<HashMap<String, Peer>>,
+    /// Adopted OS interfaces, keyed by interface name
+    adopted_interfaces: RwLock<HashMap<String, AdoptedInterface>>,
+    /// All local link-local addresses (descoped strings) for self-echo detection
+    link_local_addresses: RwLock<Vec<String>>,
+    /// Last multicast echo timestamp per interface — carrier detection
+    multicast_echoes: RwLock<HashMap<String, Instant>>,
+    /// First multicast echo per interface — used to avoid false positive on startup
+    initial_echoes: RwLock<HashMap<String, Instant>>,
+    /// Interfaces that have timed out (carrier lost)
+    timed_out_interfaces: RwLock<HashMap<String, bool>>,
+    /// Cross-interface packet deduplication
+    mif_deque: std::sync::Mutex<MifDeque>,
+    /// True after initial peering delay has elapsed
+    final_init_done: AtomicBool,
+    /// True when the interface is fully online
+    online: AtomicBool,
+    /// Set when carrier state changes (for external polling)
+    carrier_changed: AtomicBool,
 }
 
 impl AutoInterface {
-    /// Create a new AutoInterface
+    /// Create a new AutoInterface with the given configuration.
     pub fn new(config: AutoInterfaceConfig) -> Self {
         Self {
             config,
-            state: AutoInterfaceState::Stopped,
+            state: RwLock::new(AutoInterfaceState::Stopped),
             peers: RwLock::new(HashMap::new()),
-            last_discovery: RwLock::new(Instant::now()),
-            local_addresses: RwLock::new(Vec::new()),
+            adopted_interfaces: RwLock::new(HashMap::new()),
+            link_local_addresses: RwLock::new(Vec::new()),
+            multicast_echoes: RwLock::new(HashMap::new()),
+            initial_echoes: RwLock::new(HashMap::new()),
+            timed_out_interfaces: RwLock::new(HashMap::new()),
+            mif_deque: std::sync::Mutex::new(MifDeque::new()),
+            final_init_done: AtomicBool::new(false),
+            online: AtomicBool::new(false),
+            carrier_changed: AtomicBool::new(false),
         }
     }
 
-    /// Get current state
+    /// Get current lifecycle state.
     pub fn state(&self) -> AutoInterfaceState {
-        self.state
+        *self.state.read().unwrap()
     }
 
-    /// Get configuration
+    /// Whether the interface has completed initialization and is online.
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::SeqCst)
+    }
+
+    /// Whether the initial peering delay has elapsed.
+    pub fn is_final_init_done(&self) -> bool {
+        self.final_init_done.load(Ordering::SeqCst)
+    }
+
+    /// Get configuration.
     pub fn config(&self) -> &AutoInterfaceConfig {
         &self.config
     }
 
-    /// Get discovered peers
+    /// Get snapshot of all discovered peers.
     pub fn peers(&self) -> Vec<Peer> {
         self.peers.read().unwrap().values().cloned().collect()
     }
 
-    /// Get peer count
+    /// Get peer count.
     pub fn peer_count(&self) -> usize {
         self.peers.read().unwrap().len()
     }
 
-    /// Add or update a peer. No upper limit on peer count (matches Python).
-    pub fn add_peer(&self, address: SocketAddrV6, interface_hash: AddressHash) {
-        let mut peers = self.peers.write().unwrap();
-
-        if let Some(peer) = peers.get_mut(&address) {
-            peer.touch();
-            peer.interface_hash = interface_hash;
-        } else {
-            peers.insert(address, Peer::new(address, interface_hash));
-        }
+    /// Check if a peer exists by address string.
+    pub fn has_peer(&self, addr: &str) -> bool {
+        self.peers.read().unwrap().contains_key(addr)
     }
 
-    /// Remove a peer
-    pub fn remove_peer(&self, address: &SocketAddrV6) {
-        self.peers.write().unwrap().remove(address);
-    }
-
-    /// Mark a peer as unreachable
-    pub fn mark_peer_unreachable(&self, address: &SocketAddrV6) {
-        if let Some(peer) = self.peers.write().unwrap().get_mut(address) {
-            peer.mark_unreachable();
-        }
-    }
-
-    /// Clean up expired peers using the configured peering timeout.
-    pub fn cleanup_peers(&self) {
-        let timeout = self.config.peering_timeout;
-        self.peers
-            .write()
-            .unwrap()
-            .retain(|_, p| !p.is_expired(timeout));
-    }
-
-    /// Check if a peer exists
-    pub fn has_peer(&self, address: &SocketAddrV6) -> bool {
-        self.peers.read().unwrap().contains_key(address)
-    }
-
-    /// Get a specific peer
-    pub fn get_peer(&self, address: &SocketAddrV6) -> Option<Peer> {
-        self.peers.read().unwrap().get(address).cloned()
-    }
-
-    /// Check if discovery should be performed
-    pub fn should_discover(&self) -> bool {
-        self.last_discovery.read().unwrap().elapsed() > self.config.announce_interval
-    }
-
-    /// Mark discovery as performed
-    pub fn mark_discovered(&self) {
-        *self.last_discovery.write().unwrap() = Instant::now();
-    }
-
-    /// Get the multicast discovery socket address for this interface.
+    /// Get the multicast discovery socket address.
     pub fn multicast_group(&self) -> SocketAddrV6 {
         self.config.multicast_group()
     }
 
-    /// Create a discovery announcement packet
-    pub fn create_discovery_packet(&self) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(64);
-
-        // Magic bytes
-        packet.extend_from_slice(b"RNS\x00");
-
-        // Version
-        packet.push(0x01);
-
-        // Interface hash
-        packet.extend_from_slice(self.config.address.as_slice());
-
-        // Group ID hash (always present — group_id defaults to "reticulum")
-        let group_hash = Hash::new(
-            sha2::Sha256::digest(self.config.group_id.as_bytes()).into(),
-        );
-        packet.extend_from_slice(&group_hash.as_bytes()[..8]);
-
-        packet
+    /// Get all link-local addresses (descoped).
+    pub fn link_local_addresses(&self) -> Vec<String> {
+        self.link_local_addresses.read().unwrap().clone()
     }
 
-    /// Parse a discovery packet
-    pub fn parse_discovery_packet(&self, data: &[u8]) -> Option<AddressHash> {
-        // Check magic
-        if data.len() < 5 || &data[..4] != b"RNS\x00" {
-            return None;
-        }
-
-        // Check version
-        if data[4] != 0x01 {
-            return None;
-        }
-
-        // Check minimum length for interface hash
-        if data.len() < 5 + 16 {
-            return None;
-        }
-
-        // Extract interface hash
-        let interface_hash = AddressHash::new_from_slice(&data[5..21]);
-
-        // Verify group ID hash
-        if data.len() < 5 + 16 + 8 {
-            return None;
-        }
-
-        let expected_group_hash = Hash::new(
-            sha2::Sha256::digest(self.config.group_id.as_bytes()).into(),
-        );
-
-        if data[21..29] != expected_group_hash.as_bytes()[..8] {
-            return None;
-        }
-
-        Some(interface_hash)
+    /// Check if an address is one of our own.
+    pub fn is_local_address(&self, addr: &str) -> bool {
+        self.link_local_addresses.read().unwrap().contains(&addr.to_string())
     }
 
-    /// Set local addresses
-    pub fn set_local_addresses(&self, addresses: Vec<Ipv6Addr>) {
-        *self.local_addresses.write().unwrap() = addresses;
+    // -----------------------------------------------------------------------
+    // Peer management — matches Python AutoInterface.add_peer / refresh_peer
+    // -----------------------------------------------------------------------
+
+    /// Add a new peer or update an existing one.
+    ///
+    /// If `addr` is one of our own link-local addresses, this is a multicast echo
+    /// and we update the echo tracking instead of the peer table.
+    ///
+    /// Matches Python AutoInterface.py add_peer() lines 513-571.
+    fn add_peer(&self, addr: &str, ifname: &str) {
+        // Check if this is our own multicast echo
+        {
+            let link_locals = self.link_local_addresses.read().unwrap();
+            if link_locals.iter().any(|a| a == addr) {
+                drop(link_locals);
+
+                // Find which adopted interface this address belongs to
+                let echo_ifname = {
+                    let adopted = self.adopted_interfaces.read().unwrap();
+                    adopted
+                        .iter()
+                        .find(|(_, ai)| ai.link_local_addr == addr)
+                        .map(|(name, _)| name.clone())
+                };
+
+                if let Some(echo_ifname) = echo_ifname {
+                    self.multicast_echoes
+                        .write()
+                        .unwrap()
+                        .insert(echo_ifname.clone(), Instant::now());
+                    self.initial_echoes
+                        .write()
+                        .unwrap()
+                        .entry(echo_ifname)
+                        .or_insert_with(Instant::now);
+                } else {
+                    log::warn!(
+                        "AutoInterface: received echo from own address {} but no matching interface",
+                        addr
+                    );
+                }
+                return;
+            }
+        }
+
+        // Remote peer — add or refresh
+        let mut peers = self.peers.write().unwrap();
+        if let Some(peer) = peers.get_mut(addr) {
+            peer.last_heard = Instant::now();
+        } else {
+            log::debug!("AutoInterface: added peer {} on {}", addr, ifname);
+            peers.insert(addr.to_string(), Peer::new(addr, ifname));
+            // TODO: Create AutoInterfacePeer spawned interface for transport integration
+        }
     }
 
-    /// Get local addresses
-    pub fn local_addresses(&self) -> Vec<Ipv6Addr> {
-        self.local_addresses.read().unwrap().clone()
+    /// Refresh a peer's last_heard timestamp (for data traffic).
+    fn refresh_peer(&self, addr: &str) {
+        if let Some(peer) = self.peers.write().unwrap().get_mut(addr) {
+            peer.last_heard = Instant::now();
+        }
     }
 
-    /// Check if an address is local
-    pub fn is_local_address(&self, addr: &Ipv6Addr) -> bool {
-        self.local_addresses.read().unwrap().contains(addr)
+    // -----------------------------------------------------------------------
+    // Announce methods — send discovery tokens
+    // -----------------------------------------------------------------------
+
+    /// Send a multicast discovery announcement on the given interface.
+    ///
+    /// Creates a fresh UDP socket per call (matching Python behavior).
+    /// Matches Python AutoInterface.py peer_announce() lines 491-507.
+    fn peer_announce(&self, ifname: &str) -> std::io::Result<()> {
+        let (link_local_addr, scope_id) = {
+            let adopted = self.adopted_interfaces.read().unwrap();
+            let ai = adopted.get(ifname).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
+            })?;
+            (ai.link_local_addr.clone(), ai.scope_id)
+        };
+
+        let token = create_discovery_token(&self.config.group_id, &link_local_addr);
+        let mcast_addr = self.config.multicast_discovery_address();
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_multicast_if_v6(scope_id)?;
+
+        let dest = socket2::SockAddr::from(SocketAddrV6::new(
+            mcast_addr,
+            self.config.discovery_port,
+            0,
+            scope_id,
+        ));
+        socket.send_to(&token, &dest)?;
+
+        Ok(())
+    }
+
+    /// Send a unicast reverse discovery announcement to a specific peer.
+    ///
+    /// Matches Python AutoInterface.py reverse_announce() lines 477-489.
+    fn reverse_announce(&self, ifname: &str, peer_addr: &str) -> std::io::Result<()> {
+        let (link_local_addr, scope_id) = {
+            let adopted = self.adopted_interfaces.read().unwrap();
+            let ai = adopted.get(ifname).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
+            })?;
+            (ai.link_local_addr.clone(), ai.scope_id)
+        };
+
+        let token = create_discovery_token(&self.config.group_id, &link_local_addr);
+
+        let peer_ipv6: Ipv6Addr = peer_addr.parse().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid IPv6 address '{}': {}", peer_addr, e),
+            )
+        })?;
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+
+        let dest = socket2::SockAddr::from(SocketAddrV6::new(
+            peer_ipv6,
+            self.config.unicast_discovery_port(),
+            0,
+            scope_id,
+        ));
+        socket.send_to(&token, &dest)?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer job — periodic maintenance
+    // -----------------------------------------------------------------------
+
+    /// Run periodic peer management tasks.
+    ///
+    /// Matches Python AutoInterface.py peer_jobs() lines 371-468:
+    /// 1. Expire stale peers
+    /// 2. Send reverse announces to peers that haven't heard from us recently
+    /// 3. Check multicast echo status for carrier detection
+    fn run_peer_jobs(&self) {
+        let now = Instant::now();
+
+        // 1. Expire stale peers
+        {
+            let mut peers = self.peers.write().unwrap();
+            let before = peers.len();
+            peers.retain(|addr, peer| {
+                if now.duration_since(peer.last_heard) > self.config.peering_timeout {
+                    log::debug!("AutoInterface: peer {} on {} timed out", addr, peer.ifname);
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed = before - peers.len();
+            if removed > 0 {
+                log::debug!(
+                    "AutoInterface: {} peers removed, {} remaining",
+                    removed,
+                    peers.len()
+                );
+            }
+        }
+
+        // 2. Reverse peering — send announces to peers we haven't contacted recently
+        let reverse_interval = self.config.reverse_peering_interval();
+        let peers_needing_reverse: Vec<(String, String)> = {
+            let peers = self.peers.read().unwrap();
+            peers
+                .iter()
+                .filter(|(_, peer)| now.duration_since(peer.last_outbound) > reverse_interval)
+                .map(|(addr, peer)| (addr.clone(), peer.ifname.clone()))
+                .collect()
+        };
+
+        for (peer_addr, ifname) in &peers_needing_reverse {
+            if let Err(e) = self.reverse_announce(ifname, peer_addr) {
+                log::debug!(
+                    "AutoInterface: reverse announce to {} on {} failed: {}",
+                    peer_addr,
+                    ifname,
+                    e
+                );
+            }
+            // Update last_outbound regardless of success (avoid tight retry loops)
+            if let Some(peer) = self.peers.write().unwrap().get_mut(peer_addr.as_str()) {
+                peer.last_outbound = Instant::now();
+            }
+        }
+
+        // 3. Multicast echo check — carrier detection
+        {
+            let echoes = self.multicast_echoes.read().unwrap();
+            let initial = self.initial_echoes.read().unwrap();
+            let mut timed_out = self.timed_out_interfaces.write().unwrap();
+            let adopted = self.adopted_interfaces.read().unwrap();
+
+            for ifname in adopted.keys() {
+                let was_timed_out = timed_out.get(ifname).copied().unwrap_or(false);
+
+                if let Some(last_echo) = echoes.get(ifname) {
+                    if now.duration_since(*last_echo) > MCAST_ECHO_TIMEOUT {
+                        // Only report carrier loss if we've received at least one echo before
+                        if !was_timed_out && initial.contains_key(ifname) {
+                            log::warn!(
+                                "AutoInterface: multicast echo timeout on {}, carrier lost",
+                                ifname
+                            );
+                            timed_out.insert(ifname.clone(), true);
+                            self.carrier_changed.store(true, Ordering::SeqCst);
+                        }
+                    } else if was_timed_out {
+                        log::info!(
+                            "AutoInterface: multicast echo resumed on {}, carrier recovered",
+                            ifname
+                        );
+                        timed_out.insert(ifname.clone(), false);
+                        self.carrier_changed.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -695,12 +998,432 @@ impl Interface for AutoInterface {
 }
 
 // ---------------------------------------------------------------------------
+// Socket setup helpers
+// ---------------------------------------------------------------------------
+
+/// Create a multicast discovery socket bound to the multicast group on a specific interface.
+///
+/// Matches Python AutoInterface.py lines 275-297.
+fn create_multicast_socket(
+    mcast_addr: &Ipv6Addr,
+    port: u16,
+    scope_id: u32,
+    scope: DiscoveryScope,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_multicast_if_v6(scope_id)?;
+    socket.join_multicast_v6(mcast_addr, scope_id)?;
+
+    // Bind address: for link scope, include scope_id; for other scopes, omit it.
+    // This matches Python's getaddrinfo behavior with/without %ifname.
+    let bind_addr = if scope == DiscoveryScope::Link {
+        SocketAddrV6::new(*mcast_addr, port, 0, scope_id)
+    } else {
+        SocketAddrV6::new(*mcast_addr, port, 0, 0)
+    };
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    socket.set_nonblocking(true)?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
+
+/// Create a unicast UDP socket bound to a link-local address on a specific interface.
+///
+/// Used for both the unicast discovery socket and the data socket.
+/// Matches Python AutoInterface.py lines 256-269 (unicast) and 332-342 (data).
+fn create_udp_socket(
+    link_local_addr: &Ipv6Addr,
+    port: u16,
+    scope_id: u32,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    let bind_addr = SocketAddrV6::new(*link_local_addr, port, 0, scope_id);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    socket.set_nonblocking(true)?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
+
+// ---------------------------------------------------------------------------
+// Async task architecture
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+impl AutoInterface {
+    /// Main entry point — enumerate interfaces, set up sockets, and run discovery.
+    ///
+    /// This method spawns per-interface discovery tasks and a shared peer job task,
+    /// waits for the initial peering delay, then marks the interface online.
+    ///
+    /// Follows the TCP server's async pattern: takes a CancellationToken for
+    /// graceful shutdown and joins all spawned tasks on exit.
+    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> std::io::Result<()> {
+        *self.state.write().unwrap() = AutoInterfaceState::Starting;
+
+        // 1. Enumerate and adopt interfaces
+        let interfaces = enumerate_interfaces(
+            &self.config.allowed_interfaces,
+            &self.config.ignored_interfaces,
+        );
+
+        if interfaces.is_empty() {
+            log::warn!("AutoInterface: no suitable network interfaces found");
+            *self.state.write().unwrap() = AutoInterfaceState::Error;
+            return Ok(());
+        }
+
+        {
+            let mut adopted = self.adopted_interfaces.write().unwrap();
+            let mut link_locals = self.link_local_addresses.write().unwrap();
+            for iface in &interfaces {
+                let descoped = descope_linklocal(&iface.link_local_addr.to_string());
+                log::info!(
+                    "AutoInterface: adopting {} ({}, scope_id={})",
+                    iface.name,
+                    descoped,
+                    iface.scope_id
+                );
+                adopted.insert(
+                    iface.name.clone(),
+                    AdoptedInterface {
+                        name: iface.name.clone(),
+                        link_local_addr: descoped.clone(),
+                        link_local_ipv6: iface.link_local_addr,
+                        scope_id: iface.scope_id,
+                    },
+                );
+                link_locals.push(descoped);
+            }
+        }
+
+        let mcast_addr = self.config.multicast_discovery_address();
+        let mut task_handles = Vec::new();
+
+        // 2. Create sockets and spawn per-interface tasks
+        for iface in &interfaces {
+            // Multicast discovery socket
+            match create_multicast_socket(
+                &mcast_addr,
+                self.config.discovery_port,
+                iface.scope_id,
+                self.config.discovery_scope,
+            ) {
+                Ok(sock) => {
+                    let auto = Arc::clone(&self);
+                    let cancel = cancel.clone();
+                    let ifname = iface.name.clone();
+                    task_handles.push(tokio::spawn(async move {
+                        auto.discovery_task(&ifname, sock, &cancel).await;
+                    }));
+                }
+                Err(e) => {
+                    log::error!(
+                        "AutoInterface: failed to create multicast socket for {}: {}",
+                        iface.name,
+                        e
+                    );
+                }
+            }
+
+            // Unicast discovery socket
+            match create_udp_socket(
+                &iface.link_local_addr,
+                self.config.unicast_discovery_port(),
+                iface.scope_id,
+            ) {
+                Ok(sock) => {
+                    let auto = Arc::clone(&self);
+                    let cancel = cancel.clone();
+                    let ifname = iface.name.clone();
+                    task_handles.push(tokio::spawn(async move {
+                        auto.unicast_discovery_task(&ifname, sock, &cancel).await;
+                    }));
+                }
+                Err(e) => {
+                    log::error!(
+                        "AutoInterface: failed to create unicast socket for {}: {}",
+                        iface.name,
+                        e
+                    );
+                }
+            }
+
+            // Data socket
+            match create_udp_socket(&iface.link_local_addr, self.config.data_port, iface.scope_id)
+            {
+                Ok(sock) => {
+                    let auto = Arc::clone(&self);
+                    let cancel = cancel.clone();
+                    let ifname = iface.name.clone();
+                    task_handles.push(tokio::spawn(async move {
+                        auto.data_recv_task(&ifname, sock, &cancel).await;
+                    }));
+                }
+                Err(e) => {
+                    log::error!(
+                        "AutoInterface: failed to create data socket for {}: {}",
+                        iface.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 3. Spawn shared peer job task
+        {
+            let auto = Arc::clone(&self);
+            let cancel = cancel.clone();
+            task_handles.push(tokio::spawn(async move {
+                auto.peer_job_task(&cancel).await;
+            }));
+        }
+
+        // 4. Initial peering delay — matches Python's final_init()
+        let init_delay =
+            Duration::from_secs_f64(self.config.announce_interval.as_secs_f64() * 1.2);
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                // Cancelled during init — clean up
+                *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+                for handle in task_handles {
+                    let _ = handle.await;
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(init_delay) => {}
+        }
+
+        self.final_init_done.store(true, Ordering::SeqCst);
+        self.online.store(true, Ordering::SeqCst);
+        *self.state.write().unwrap() = AutoInterfaceState::Running;
+        log::info!(
+            "AutoInterface: online, {} interfaces adopted",
+            interfaces.len()
+        );
+
+        // 5. Wait for cancellation
+        cancel.cancelled().await;
+
+        // 6. Shutdown
+        self.online.store(false, Ordering::SeqCst);
+        *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+
+        for handle in task_handles {
+            let _ = handle.await;
+        }
+
+        log::info!("AutoInterface: shut down");
+        Ok(())
+    }
+
+    /// Multicast discovery task — sends periodic announces and processes incoming
+    /// discovery tokens on the multicast socket.
+    ///
+    /// Matches Python AutoInterface.py discovery_handler() + announce_handler().
+    async fn discovery_task(
+        &self,
+        ifname: &str,
+        socket: tokio::net::UdpSocket,
+        cancel: &CancellationToken,
+    ) {
+        let mut buf = [0u8; 1024];
+        let mut announce_interval = tokio::time::interval(self.config.announce_interval);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = announce_interval.tick() => {
+                    if let Err(e) = self.peer_announce(ifname) {
+                        log::debug!("AutoInterface: announce failed on {}: {}", ifname, e);
+                    }
+                }
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, addr)) => {
+                            if !self.final_init_done.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if let std::net::SocketAddr::V6(v6) = addr {
+                                let sender_addr = descope_linklocal(&v6.ip().to_string());
+                                let data = &buf[..len];
+                                if validate_discovery_token(
+                                    &self.config.group_id,
+                                    data,
+                                    &sender_addr,
+                                ) {
+                                    self.add_peer(&sender_addr, ifname);
+                                } else {
+                                    log::debug!(
+                                        "AutoInterface: invalid discovery token on {} from {}",
+                                        ifname,
+                                        sender_addr
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            log::debug!("AutoInterface: recv error on {}: {}", ifname, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unicast discovery task — listens for unicast reverse announces.
+    ///
+    /// Same validation as multicast discovery, but no outgoing announces.
+    /// Matches Python's unicast discovery_handler (announce=False).
+    async fn unicast_discovery_task(
+        &self,
+        ifname: &str,
+        socket: tokio::net::UdpSocket,
+        cancel: &CancellationToken,
+    ) {
+        let mut buf = [0u8; 1024];
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, addr)) => {
+                            if !self.final_init_done.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if let std::net::SocketAddr::V6(v6) = addr {
+                                let sender_addr = descope_linklocal(&v6.ip().to_string());
+                                let data = &buf[..len];
+                                if validate_discovery_token(
+                                    &self.config.group_id,
+                                    data,
+                                    &sender_addr,
+                                ) {
+                                    self.add_peer(&sender_addr, ifname);
+                                } else {
+                                    log::debug!(
+                                        "AutoInterface: invalid unicast token on {} from {}",
+                                        ifname,
+                                        sender_addr
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            log::debug!("AutoInterface: unicast recv error on {}: {}", ifname, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Data receive task — receives data packets, deduplicates via MifDeque,
+    /// refreshes peer timestamps, and forwards to transport.
+    ///
+    /// Matches Python AutoInterface.py data handler lines 603-619.
+    async fn data_recv_task(
+        &self,
+        ifname: &str,
+        socket: tokio::net::UdpSocket,
+        cancel: &CancellationToken,
+    ) {
+        // Extra headroom beyond MTU for potential framing
+        let mut buf = vec![0u8; HW_MTU + 128];
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, addr)) => {
+                            if !self.final_init_done.load(Ordering::SeqCst) {
+                                continue;
+                            }
+
+                            let data = &buf[..len];
+
+                            // Deduplicate via MifDeque
+                            let data_hash = Hash::new_from_slice(data);
+                            {
+                                let mut deque = self.mif_deque.lock().unwrap();
+                                if deque.is_duplicate(&data_hash) {
+                                    continue;
+                                }
+                                deque.insert(data_hash);
+                            }
+
+                            // Refresh peer timestamp
+                            if let std::net::SocketAddr::V6(v6) = addr {
+                                let sender_addr = descope_linklocal(&v6.ip().to_string());
+                                self.refresh_peer(&sender_addr);
+                            }
+
+                            // TODO: Forward data to transport layer via rx_channel.
+                            // This will be implemented when integrating with InterfaceContext.
+                        }
+                        Err(e) => {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            log::debug!("AutoInterface: data recv error on {}: {}", ifname, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Peer job task — runs periodic maintenance on the peer table.
+    ///
+    /// Matches Python AutoInterface.py peer_jobs thread.
+    async fn peer_job_task(&self, cancel: &CancellationToken) {
+        let mut interval = tokio::time::interval(PEER_JOB_INTERVAL);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    self.run_peer_jobs();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Config tests (unchanged from #71) --
 
     #[test]
     fn test_auto_interface_config_defaults() {
@@ -745,15 +1468,10 @@ mod tests {
 
     #[test]
     fn test_multicast_discovery_address_default() {
-        // Default config: group_id = "reticulum", scope = Link (0x2), type = Temporary (0x1)
         let config = AutoInterfaceConfig::new();
         let addr = config.multicast_discovery_address();
-
-        // First segment should be ff12 (ff + temporary:1 + link:2)
         assert_eq!(addr.segments()[0], 0xff12);
-        // Second segment should be 0
         assert_eq!(addr.segments()[1], 0);
-        // Remaining segments derived from SHA-256("reticulum") — verify non-trivial
         let non_zero = addr.segments()[2..].iter().any(|&s| s != 0);
         assert!(non_zero, "hash-derived segments should not all be zero");
     }
@@ -774,7 +1492,6 @@ mod tests {
         assert_eq!(config_admin.multicast_discovery_address().segments()[0], 0xff14);
         assert_eq!(config_global.multicast_discovery_address().segments()[0], 0xff1e);
 
-        // Hash-derived segments should be identical (same group_id)
         assert_eq!(
             config_link.multicast_discovery_address().segments()[2..],
             config_admin.multicast_discovery_address().segments()[2..],
@@ -789,9 +1506,7 @@ mod tests {
         let addr_a = config_a.multicast_discovery_address();
         let addr_b = config_b.multicast_discovery_address();
 
-        // Same scope prefix
         assert_eq!(addr_a.segments()[0], addr_b.segments()[0]);
-        // Different hash-derived segments
         assert_ne!(addr_a.segments()[2..], addr_b.segments()[2..]);
     }
 
@@ -804,7 +1519,6 @@ mod tests {
         assert_eq!(parse_scope("organization"), DiscoveryScope::Organisation);
         assert_eq!(parse_scope("global"), DiscoveryScope::Global);
         assert_eq!(parse_scope("  Link  "), DiscoveryScope::Link);
-        // Unknown defaults to Link
         assert_eq!(parse_scope("bogus"), DiscoveryScope::Link);
     }
 
@@ -853,6 +1567,10 @@ mod tests {
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
+            kiss_framing: false,
+            i2p_tunneled: false,
+            connect_timeout: None,
+            max_reconnect_tries: None,
             extra,
         };
 
@@ -868,79 +1586,288 @@ mod tests {
         assert_eq!(config.configured_bitrate, Some(1_000_000));
     }
 
+    // -- Config derived methods --
+
+    #[test]
+    fn test_unicast_discovery_port() {
+        let config = AutoInterfaceConfig::new();
+        assert_eq!(config.unicast_discovery_port(), DEFAULT_DISCOVERY_PORT + 1);
+        assert_eq!(config.unicast_discovery_port(), 29717);
+    }
+
+    #[test]
+    fn test_reverse_peering_interval() {
+        let config = AutoInterfaceConfig::new();
+        let expected = Duration::from_secs_f64(1.6 * 3.25);
+        let actual = config.reverse_peering_interval();
+        // Compare as millis to avoid floating-point precision issues
+        assert_eq!(actual.as_millis(), expected.as_millis());
+    }
+
+    // -- Discovery token tests --
+
+    #[test]
+    fn test_discovery_token_deterministic() {
+        let token1 = create_discovery_token("reticulum", "fe80::1");
+        let token2 = create_discovery_token("reticulum", "fe80::1");
+        assert_eq!(token1, token2);
+        assert_eq!(token1.len(), 32);
+    }
+
+    #[test]
+    fn test_discovery_token_matches_manual_sha256() {
+        // Verify that our token matches a direct SHA-256 of the concatenated bytes.
+        // This is the same computation Python performs:
+        //   full_hash(group_id + link_local_address.encode("utf-8"))
+        let token = create_discovery_token("reticulum", "fe80::1");
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"reticulum");
+        hasher.update(b"fe80::1");
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(token, expected);
+    }
+
+    #[test]
+    fn test_discovery_token_different_inputs() {
+        let token_a = create_discovery_token("reticulum", "fe80::1");
+        let token_b = create_discovery_token("reticulum", "fe80::2");
+        let token_c = create_discovery_token("other_group", "fe80::1");
+        assert_ne!(token_a, token_b);
+        assert_ne!(token_a, token_c);
+        assert_ne!(token_b, token_c);
+    }
+
+    #[test]
+    fn test_validate_discovery_token_valid() {
+        let token = create_discovery_token("reticulum", "fe80::1");
+        assert!(validate_discovery_token("reticulum", &token, "fe80::1"));
+    }
+
+    #[test]
+    fn test_validate_discovery_token_wrong_sender() {
+        let token = create_discovery_token("reticulum", "fe80::1");
+        assert!(!validate_discovery_token("reticulum", &token, "fe80::2"));
+    }
+
+    #[test]
+    fn test_validate_discovery_token_wrong_group() {
+        let token = create_discovery_token("reticulum", "fe80::1");
+        assert!(!validate_discovery_token("other_group", &token, "fe80::1"));
+    }
+
+    #[test]
+    fn test_validate_discovery_token_too_short() {
+        assert!(!validate_discovery_token("reticulum", &[0u8; 31], "fe80::1"));
+        assert!(!validate_discovery_token("reticulum", &[], "fe80::1"));
+    }
+
+    #[test]
+    fn test_validate_discovery_token_extra_data_ignored() {
+        // Python only checks first HASHLENGTH//8 = 32 bytes
+        let mut data = create_discovery_token("reticulum", "fe80::1").to_vec();
+        data.extend_from_slice(b"extra garbage");
+        assert!(validate_discovery_token("reticulum", &data, "fe80::1"));
+    }
+
+    // -- descope_linklocal tests --
+
+    #[test]
+    fn test_descope_linklocal_clean_passthrough() {
+        assert_eq!(descope_linklocal("fe80::1"), "fe80::1");
+        assert_eq!(
+            descope_linklocal("fe80::abcd:ef01:2345:6789"),
+            "fe80::abcd:ef01:2345:6789"
+        );
+    }
+
+    #[test]
+    fn test_descope_linklocal_strip_ifname() {
+        // macOS format: fe80::1%en0
+        assert_eq!(descope_linklocal("fe80::1%en0"), "fe80::1");
+        assert_eq!(
+            descope_linklocal("fe80::abcd:1234%wlan0"),
+            "fe80::abcd:1234"
+        );
+    }
+
+    #[test]
+    fn test_descope_linklocal_strip_embedded_scope() {
+        // NetBSD/OpenBSD: fe80:SCOPE:: embedded in address
+        assert_eq!(descope_linklocal("fe80:4::1234"), "fe80::1234");
+        assert_eq!(descope_linklocal("fe80:ff::abcd"), "fe80::abcd");
+        assert_eq!(descope_linklocal("fe80:0::1"), "fe80::1");
+    }
+
+    #[test]
+    fn test_descope_linklocal_both() {
+        // Both %ifname and embedded scope — %ifname stripped first
+        assert_eq!(descope_linklocal("fe80:4::1234%en0"), "fe80::1234");
+    }
+
+    // -- MifDeque tests --
+
+    #[test]
+    fn test_mif_deque_basic() {
+        let mut deque = MifDeque::new();
+        let hash1 = Hash::new_from_slice(b"test1");
+        let hash2 = Hash::new_from_slice(b"test2");
+
+        assert!(!deque.is_duplicate(&hash1));
+        deque.insert(hash1);
+        assert!(deque.is_duplicate(&hash1));
+        assert!(!deque.is_duplicate(&hash2));
+    }
+
+    #[test]
+    fn test_mif_deque_capacity() {
+        let mut deque = MifDeque::new();
+
+        // Fill beyond capacity
+        for i in 0..(MULTI_IF_DEQUE_LEN + 10) {
+            let data = format!("packet_{}", i);
+            deque.insert(Hash::new_from_slice(data.as_bytes()));
+        }
+
+        // Should not exceed capacity
+        assert!(deque.entries.len() <= MULTI_IF_DEQUE_LEN);
+    }
+
+    #[test]
+    fn test_mif_deque_different_hashes_not_duplicate() {
+        let mut deque = MifDeque::new();
+        let hash1 = Hash::new_from_slice(b"data_a");
+        let hash2 = Hash::new_from_slice(b"data_b");
+
+        deque.insert(hash1);
+        assert!(!deque.is_duplicate(&hash2));
+    }
+
+    // -- Peer tests --
+
+    #[test]
+    fn test_peer_creation() {
+        let peer = Peer::new("fe80::1", "en0");
+        assert_eq!(peer.addr, "fe80::1");
+        assert_eq!(peer.ifname, "en0");
+        assert!(!peer.is_expired(PEERING_TIMEOUT));
+    }
+
     #[test]
     fn test_peer_expiry() {
-        let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 12345, 0, 0);
-        let hash = AddressHash::new_from_slice(&[1u8; 32]);
-
-        let peer = Peer::new(addr, hash);
+        let peer = Peer::new("fe80::1", "en0");
         assert!(!peer.is_expired(PEERING_TIMEOUT));
         // With a zero timeout, the peer should be expired immediately
         assert!(peer.is_expired(Duration::ZERO));
     }
 
     #[test]
+    fn test_auto_interface_add_peer() {
+        let config = AutoInterfaceConfig::new();
+        let iface = AutoInterface::new(config);
+
+        iface.add_peer("fe80::1", "en0");
+        assert!(iface.has_peer("fe80::1"));
+        assert_eq!(iface.peer_count(), 1);
+
+        // Adding same peer again should just refresh, not duplicate
+        iface.add_peer("fe80::1", "en0");
+        assert_eq!(iface.peer_count(), 1);
+    }
+
+    #[test]
+    fn test_auto_interface_add_peer_own_address_is_echo() {
+        let config = AutoInterfaceConfig::new();
+        let iface = AutoInterface::new(config);
+
+        // Set up link-local addresses and adopted interfaces
+        iface
+            .link_local_addresses
+            .write()
+            .unwrap()
+            .push("fe80::1".to_string());
+        iface.adopted_interfaces.write().unwrap().insert(
+            "en0".to_string(),
+            AdoptedInterface {
+                name: "en0".to_string(),
+                link_local_addr: "fe80::1".to_string(),
+                link_local_ipv6: "fe80::1".parse().unwrap(),
+                scope_id: 1,
+            },
+        );
+
+        // Adding our own address should NOT create a peer
+        iface.add_peer("fe80::1", "en0");
+        assert_eq!(iface.peer_count(), 0);
+
+        // But should update multicast echoes
+        let echoes = iface.multicast_echoes.read().unwrap();
+        assert!(echoes.contains_key("en0"));
+
+        let initial = iface.initial_echoes.read().unwrap();
+        assert!(initial.contains_key("en0"));
+    }
+
+    #[test]
     fn test_auto_interface_peers_no_limit() {
-        // Verify that peer count is unbounded (no MAX_PEERS)
         let config = AutoInterfaceConfig::new();
         let iface = AutoInterface::new(config);
 
         for i in 0..100u16 {
-            let addr = SocketAddrV6::new(
-                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, i + 1),
-                12345,
-                0,
-                0,
-            );
-            let hash = AddressHash::new_from_slice(&[i as u8; 32]);
-            iface.add_peer(addr, hash);
+            let addr = format!("fe80::{:x}", i + 1);
+            iface.add_peer(&addr, "en0");
         }
 
         assert_eq!(iface.peer_count(), 100);
     }
 
     #[test]
-    fn test_auto_interface_peers_basic() {
+    fn test_auto_interface_peer_refresh() {
         let config = AutoInterfaceConfig::new();
         let iface = AutoInterface::new(config);
 
-        let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 12345, 0, 0);
-        let hash = AddressHash::new_from_slice(&[1u8; 32]);
+        iface.add_peer("fe80::1", "en0");
+        let original_time = iface.peers.read().unwrap().get("fe80::1").unwrap().last_heard;
 
-        iface.add_peer(addr, hash);
-        assert!(iface.has_peer(&addr));
-        assert_eq!(iface.peer_count(), 1);
+        // Small sleep to ensure time advances
+        std::thread::sleep(Duration::from_millis(10));
 
-        iface.remove_peer(&addr);
-        assert!(!iface.has_peer(&addr));
+        iface.refresh_peer("fe80::1");
+        let refreshed_time = iface.peers.read().unwrap().get("fe80::1").unwrap().last_heard;
+
+        assert!(refreshed_time > original_time);
     }
 
     #[test]
-    fn test_discovery_packet() {
-        let config = AutoInterfaceConfig::new()
-            .with_address(AddressHash::new_from_slice(&[1u8; 32]));
-
+    fn test_auto_interface_peer_expiry_in_job() {
+        let config = AutoInterfaceConfig {
+            peering_timeout: Duration::ZERO, // Expire immediately
+            ..AutoInterfaceConfig::new()
+        };
         let iface = AutoInterface::new(config);
-        let packet = iface.create_discovery_packet();
 
-        assert!(packet.starts_with(b"RNS\x00"));
-        assert_eq!(packet[4], 0x01);
+        iface.add_peer("fe80::1", "en0");
+        iface.add_peer("fe80::2", "en0");
+        assert_eq!(iface.peer_count(), 2);
 
-        // Parse should succeed
-        let parsed = iface.parse_discovery_packet(&packet);
-        assert!(parsed.is_some());
+        // run_peer_jobs should expire all peers (timeout = 0)
+        iface.run_peer_jobs();
+        assert_eq!(iface.peer_count(), 0);
     }
+
+    // -- Multicast group test --
 
     #[test]
     fn test_multicast_group() {
         let config = AutoInterfaceConfig::new();
         let iface = AutoInterface::new(config);
-
         let group = iface.multicast_group();
         assert_eq!(group.port(), DEFAULT_DISCOVERY_PORT);
-        // Address should start with ff12 (temporary + link scope)
         assert_eq!(group.ip().segments()[0], 0xff12);
     }
+
+    // -- MTU test --
 
     #[test]
     fn test_mtu() {
@@ -948,13 +1875,13 @@ mod tests {
         assert_eq!(AutoInterface::mtu(), 1196);
     }
 
+    // -- Interface enumeration test --
+
     #[test]
     fn test_enumerate_interfaces_smoke() {
-        // Smoke test: verify it doesn't panic and returns valid results
         let interfaces = enumerate_interfaces(&[], &[]);
         for iface in &interfaces {
             assert!(!iface.name.is_empty());
-            // All returned addresses should be link-local
             assert_eq!(
                 iface.link_local_addr.segments()[0] & 0xffc0,
                 0xfe80,
@@ -962,5 +1889,26 @@ mod tests {
                 iface.name,
             );
         }
+    }
+
+    // -- IPv6 address string format test --
+
+    #[test]
+    fn test_ipv6_canonical_form() {
+        // Verify that Rust's Ipv6Addr::to_string() produces the same canonical
+        // form as Python for common link-local patterns. Both should follow RFC 5952.
+        let addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert_eq!(addr.to_string(), "fe80::1");
+
+        let addr: Ipv6Addr = "fe80::abcd:ef01:2345:6789".parse().unwrap();
+        assert_eq!(addr.to_string(), "fe80::abcd:ef01:2345:6789");
+
+        // Zero-compression: longest run of zeros gets ::
+        let addr: Ipv6Addr = "fe80:0:0:0:0:0:0:1".parse().unwrap();
+        assert_eq!(addr.to_string(), "fe80::1");
+
+        // Lowercase hex
+        let addr: Ipv6Addr = "FE80::ABCD".parse().unwrap();
+        assert_eq!(addr.to_string(), "fe80::abcd");
     }
 }
