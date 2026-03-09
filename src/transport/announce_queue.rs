@@ -26,8 +26,9 @@ pub const MAX_QUEUED_ANNOUNCES: usize = 16384;
 /// Maximum age of a queued announce before it's considered stale (24 hours)
 pub const QUEUED_ANNOUNCE_LIFE: Duration = Duration::from_secs(86400);
 
-/// Default interface bitrate assumption (10 Mbps) when bitrate is unknown
-pub const DEFAULT_BITRATE: u64 = 10_000_000;
+/// Default interface bitrate assumption (62,500 bps) when bitrate is unknown.
+/// Python: `Interface.py` line 84 — `self.bitrate = 62500`
+pub const DEFAULT_BITRATE: u64 = 62_500;
 
 /// A queued announce waiting to be transmitted.
 #[derive(Debug, Clone)]
