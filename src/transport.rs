@@ -3435,13 +3435,6 @@ async fn manage_transport(
                         }
 
                         if !handler.filter_duplicate_packets(&packet).await {
-                            log::debug!(
-                                "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
-                                handler.config.name,
-                                packet.destination,
-                                packet.context,
-                                packet.header.packet_type
-                            );
                             continue;
                         }
 

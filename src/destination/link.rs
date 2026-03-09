@@ -18,8 +18,8 @@ use crate::{
     hash::{AddressHash, Hash, ADDRESS_HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
-        MAX_SUPPORTED_LINK_MTU, RETICULUM_MTU,
+        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType,
+        MAX_SUPPORTED_LINK_MTU, PACKET_DATA_MAX, PACKET_MDU,
     },
     resource::{ResourceInner, ResourceAdvertisement},
 };
@@ -111,7 +111,10 @@ pub type LinkId = AddressHash;
 
 #[derive(Clone)]
 pub struct LinkPayload {
-    buffer: [u8; PACKET_MDU],
+    /// Sized to PACKET_DATA_MAX (not PACKET_MDU) because resource data packets
+    /// are NOT link-encrypted and can use the full interface payload capacity,
+    /// which exceeds PACKET_MDU on interfaces with MTUs larger than 500 bytes.
+    buffer: [u8; PACKET_DATA_MAX],
     len: usize,
 }
 
@@ -124,13 +127,13 @@ impl Default for LinkPayload {
 impl LinkPayload {
     pub fn new() -> Self {
         Self {
-            buffer: [0u8; PACKET_MDU],
+            buffer: [0u8; PACKET_DATA_MAX],
             len: 0,
         }
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
-        let mut buffer = [0u8; PACKET_MDU];
+        let mut buffer = [0u8; PACKET_DATA_MAX];
 
         let len = min(data.len(), buffer.len());
 
@@ -140,14 +143,11 @@ impl LinkPayload {
     }
 
     pub fn new_from_vec(data: &[u8]) -> Self {
-        let mut buffer = [0u8; PACKET_MDU];
+        let mut buffer = [0u8; PACKET_DATA_MAX];
         let len = min(buffer.len(), data.len());
         buffer[..len].copy_from_slice(&data[..len]);
 
-        Self {
-            buffer,
-            len: data.len(),
-        }
+        Self { buffer, len }
     }
 
     pub fn len(&self) -> usize {
@@ -543,7 +543,7 @@ impl LinkInner {
 
         match packet.context {
             PacketContext::None => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -567,7 +567,7 @@ impl LinkInner {
             }
             // Resource packet types - decrypt and post event for higher-level handling
             PacketContext::ResourceAdvrtisement => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): resource advertisement {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -585,7 +585,7 @@ impl LinkInner {
                 self.post_event(LinkEvent::ResourceData(LinkPayload::new_from_slice(packet.data.as_slice())));
             }
             PacketContext::ResourceRequest => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): resource request {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -595,7 +595,7 @@ impl LinkInner {
                 }
             }
             PacketContext::ResourceHashUpdate => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): resource hashmap update {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -612,7 +612,7 @@ impl LinkInner {
                 self.post_event(LinkEvent::ResourceProof(LinkPayload::new_from_slice(packet.data.as_slice())));
             }
             PacketContext::ResourceInitiatorCancel => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): resource initiator cancel {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -622,7 +622,7 @@ impl LinkInner {
                 }
             }
             PacketContext::ResourceReceiverCancel => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): resource receiver cancel {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -632,7 +632,7 @@ impl LinkInner {
                 }
             }
             PacketContext::Channel => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): channel data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -642,7 +642,7 @@ impl LinkInner {
                 }
             }
             PacketContext::Request => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): request {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -661,7 +661,7 @@ impl LinkInner {
                 }
             }
             PacketContext::Response => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): response {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -680,7 +680,7 @@ impl LinkInner {
                     return LinkResult::None;
                 }
 
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     // Proof format: [public_key (32 bytes) | verifying_key (32 bytes) | signature (64 bytes)]
                     const EXPECTED_LEN: usize = PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH;
@@ -723,7 +723,7 @@ impl LinkInner {
                 }
             }
             PacketContext::LinkClose => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = [0u8; PACKET_DATA_MAX];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     // Verify decrypted content matches our link ID
                     if plain_text == self.id.as_slice() {
@@ -2122,12 +2122,12 @@ mod tests {
 
         #[test]
         fn test_new_from_slice_truncates_overflow() {
-            // Create data larger than PACKET_MDU
-            let data = vec![0xABu8; PACKET_MDU + 100];
+            // Create data larger than PACKET_DATA_MAX
+            let data = vec![0xABu8; PACKET_DATA_MAX + 100];
             let payload = LinkPayload::new_from_slice(&data);
-            // Should truncate to PACKET_MDU
-            assert_eq!(payload.len(), PACKET_MDU);
-            assert_eq!(payload.as_slice().len(), PACKET_MDU);
+            // Should truncate to PACKET_DATA_MAX
+            assert_eq!(payload.len(), PACKET_DATA_MAX);
+            assert_eq!(payload.as_slice().len(), PACKET_DATA_MAX);
         }
 
         #[test]
@@ -2140,9 +2140,9 @@ mod tests {
 
         #[test]
         fn test_new_from_vec_max_size() {
-            let data = vec![0x42u8; PACKET_MDU];
+            let data = vec![0x42u8; PACKET_DATA_MAX];
             let payload = LinkPayload::new_from_vec(&data);
-            assert_eq!(payload.len(), PACKET_MDU);
+            assert_eq!(payload.len(), PACKET_DATA_MAX);
         }
 
         #[test]
