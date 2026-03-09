@@ -677,11 +677,53 @@ impl Reticulum {
                         }
                     });
                 }
+                "SerialInterface" | "serial" => {
+                    use crate::iface::serial::SerialInterface;
+
+                    match SerialInterface::from_config(&iface_config) {
+                        Ok(serial) => {
+                            let serial = serial.with_config(&iface_config);
+                            let port_path = serial.config().port.clone();
+                            let name = format!(
+                                "SerialInterface[{}/{}]",
+                                iface_config.name, port_path
+                            );
+
+                            transport
+                                .spawn_interface(serial, SerialInterface::spawn, &name)
+                                .await;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "SerialInterface '{}' config error: {}",
+                                iface_config.name, e
+                            );
+                        }
+                    }
+                }
                 "KISSInterface" | "kiss" => {
-                    log::info!(
-                        "KISSInterface '{}' recognized but serial I/O not yet implemented (see #58)",
-                        iface_config.name
-                    );
+                    use crate::iface::serial::KissInterface;
+
+                    match KissInterface::from_config(&iface_config) {
+                        Ok(kiss) => {
+                            let kiss = kiss.with_config(&iface_config);
+                            let port_path = kiss.serial().config().port.clone();
+                            let name = format!(
+                                "KISSInterface[{}/{}]",
+                                iface_config.name, port_path
+                            );
+
+                            transport
+                                .spawn_interface(kiss, KissInterface::spawn, &name)
+                                .await;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "KISSInterface '{}' config error: {}",
+                                iface_config.name, e
+                            );
+                        }
+                    }
                 }
                 other => {
                     log::warn!("Unknown interface type: {}", other);

@@ -1,28 +1,50 @@
 //! Serial interface implementation for Reticulum.
 //!
-//! This module provides serial port communication with HDLC framing
-//! for interfacing with hardware devices.
+//! This module provides serial port communication for two interface types:
+//! - `SerialInterface`: HDLC-framed serial I/O (Python: `SerialInterface.py`)
+//! - `KissInterface`: KISS-framed serial I/O for TNC hardware (Python: `KISSInterface.py`)
+//!
+//! Both follow the `TcpClient::spawn()` pattern: register with the interface
+//! registry, run RX/TX tasks, and reconnect on failure.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::config::InterfaceConfig;
 use crate::error::RnsError;
 use crate::hash::AddressHash;
-use crate::iface::hdlc::Hdlc;
-use crate::iface::kiss::{self, Kiss, FEND, FESC, TFEND, TFESC, CMD_DATA};
-use crate::iface::Interface;
+use crate::iface::hdlc::{Hdlc, HdlcParseResult, HdlcStreamParser, MIN_FRAME_PAYLOAD};
+use crate::iface::kiss::{self, Kiss, KissParseResult, KissStreamParser, FEND};
+use crate::iface::stats::{InterfaceMetadata, InterfaceMode};
+use crate::iface::{Interface, InterfaceContext, RxMessage};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
-/// Default baud rate for serial interfaces (9600 matches Python KISS TNC default)
+/// Default baud rate for serial interfaces (9600 matches Python default)
 pub const DEFAULT_BAUD_RATE: u32 = 9600;
 
 /// Default read timeout in milliseconds
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
 
-/// Maximum frame size
+/// Maximum frame size for stack-allocated encode/decode buffers
 pub const MAX_FRAME_SIZE: usize = 2048;
+
+/// Reconnect delay after serial port error/disconnect (Python: 5 seconds)
+const RECONNECT_DELAY_SECS: u64 = 5;
+
+/// Device initialization delay after opening port (Python: 0.5 seconds)
+const CONFIGURE_DEVICE_DELAY_MS: u64 = 500;
+
+/// TNC initialization delay after opening port (Python: 2 seconds)
+const KISS_CONFIGURE_DELAY_MS: u64 = 2000;
+
+// =============================================================================
+// Serial port configuration types
+// =============================================================================
 
 /// Serial interface configuration
 #[derive(Debug, Clone)]
@@ -92,7 +114,6 @@ pub enum Parity {
     Even,
 }
 
-
 /// Flow control setting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -102,7 +123,6 @@ pub enum FlowControl {
     Hardware,
     Software,
 }
-
 
 /// Serial interface state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +156,13 @@ pub struct SerialStats {
     pub crc_errors: u64,
 }
 
-/// Serial interface for hardware communication
+// =============================================================================
+// SerialInterface — HDLC-framed serial I/O
+// =============================================================================
+
+/// Serial interface for hardware communication using HDLC framing.
+///
+/// Python reference: `RNS/Interfaces/SerialInterface.py`
 pub struct SerialInterface {
     /// Configuration
     config: SerialConfig,
@@ -144,6 +170,18 @@ pub struct SerialInterface {
     state: SerialState,
     /// Statistics
     stats: SerialStats,
+    /// Interface operating mode from config
+    mode: Option<InterfaceMode>,
+    /// Whether interface can transmit packets
+    dir_out: Option<bool>,
+    /// Interface bitrate from config (overrides baud_rate for metadata)
+    bitrate: Option<u64>,
+    /// Per-interface announce rate target in seconds
+    announce_rate_target: Option<u64>,
+    /// Per-interface announce rate grace violations
+    announce_rate_grace: Option<u32>,
+    /// Per-interface announce rate penalty in seconds
+    announce_rate_penalty: Option<u64>,
 }
 
 impl SerialInterface {
@@ -153,6 +191,12 @@ impl SerialInterface {
             config,
             state: SerialState::Disconnected,
             stats: SerialStats::default(),
+            mode: None,
+            dir_out: None,
+            bitrate: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -169,44 +213,6 @@ impl SerialInterface {
     /// Get the configuration
     pub fn config(&self) -> &SerialConfig {
         &self.config
-    }
-
-    /// Encode a packet for transmission
-    pub fn encode_packet(&mut self, packet: &Packet) -> Result<Vec<u8>, RnsError> {
-        let mut buffer = [0u8; MAX_FRAME_SIZE];
-        let mut output = OutputBuffer::new(&mut buffer);
-
-        packet.serialize(&mut output)?;
-        let data_len = output.offset();
-
-        // Now encode with HDLC
-        let mut hdlc_buffer = [0u8; MAX_FRAME_SIZE * 2 + 4];
-        let mut hdlc_output = OutputBuffer::new(&mut hdlc_buffer);
-        let len = Hdlc::encode(&buffer[..data_len], &mut hdlc_output)?;
-
-        Ok(hdlc_buffer[..len].to_vec())
-    }
-
-    /// Decode received data into a packet
-    pub fn decode_packet(&mut self, data: &[u8]) -> Result<Option<Packet>, RnsError> {
-        let mut decoded = [0u8; MAX_FRAME_SIZE];
-        let mut output = OutputBuffer::new(&mut decoded);
-
-        match Hdlc::decode(data, &mut output) {
-            Ok(len) => {
-                if len > 0 {
-                    let mut buffer = InputBuffer::new(&decoded[..len]);
-                    let packet = Packet::deserialize(&mut buffer)?;
-                    Ok(Some(packet))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(e) => {
-                self.stats.rx_errors += 1;
-                Err(e)
-            }
-        }
     }
 
     /// Record a successful transmission
@@ -234,6 +240,160 @@ impl SerialInterface {
     /// Record a CRC error
     pub fn record_crc_error(&mut self) {
         self.stats.crc_errors += 1;
+    }
+
+    /// Create a SerialInterface from an `InterfaceConfig`.
+    ///
+    /// Reads serial-specific fields from the config's `extra` map:
+    /// - `port` (required): serial port path
+    /// - `speed`: baud rate (default 9600)
+    /// - `databits`: data bits (default 8)
+    /// - `parity`: "N", "E", or "O" (default "N")
+    /// - `stopbits`: stop bits (default 1)
+    pub fn from_config(iface_config: &InterfaceConfig) -> Result<Self, RnsError> {
+        let serial_config = parse_serial_config(&iface_config.extra)?;
+        Ok(Self::new(serial_config))
+    }
+
+    /// Apply common interface config (mode, bitrate, announce rates, etc.).
+    /// Follows the same builder pattern as `TcpClient::with_config()`.
+    pub fn with_config(mut self, config: &InterfaceConfig) -> Self {
+        self.mode = config.mode;
+        self.bitrate = config.bitrate;
+        self.dir_out = Some(config.outgoing);
+        self.announce_rate_target = config.announce_rate_target;
+        self.announce_rate_grace = config.announce_rate_grace;
+        self.announce_rate_penalty = config.announce_rate_penalty;
+        self
+    }
+
+    /// Spawn the serial interface I/O loop.
+    ///
+    /// Follows `TcpClient::spawn()` pattern:
+    /// 1. Create and register InterfaceMetadata
+    /// 2. Run reconnect loop: open port → spawn RX/TX tasks → await disconnect
+    /// 3. On exit, unregister from registry
+    pub async fn spawn(context: InterfaceContext<SerialInterface>) {
+        let iface_stop = context.channel.stop.clone();
+        let (port_path, serial_config, mode, bitrate, dir_out,
+             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
+            let inner = context.inner.lock().await;
+            (inner.config.port.clone(),
+             inner.config.clone(), inner.mode, inner.bitrate, inner.dir_out,
+             inner.announce_rate_target, inner.announce_rate_grace,
+             inner.announce_rate_penalty)
+        };
+        let iface_address = context.channel.address;
+
+        // Build InterfaceMetadata (matches Python SerialInterface.__str__ format)
+        let effective_bitrate = bitrate.unwrap_or(serial_config.baud_rate as u64);
+        let mut meta = InterfaceMetadata::new(
+            format!("SerialInterface[{}]", port_path),
+            "Serial",
+            "SerialInterface",
+            port_path.clone(),
+        )
+        .with_bitrate(effective_bitrate)
+        .with_direction(true, dir_out.unwrap_or(true))
+        .with_hw_mtu(564)
+        .with_ingress_control_disabled(); // Python: should_ingress_limit() returns False
+
+        if let Some(m) = mode {
+            meta = meta.with_mode(m);
+        }
+        if let Some(target) = announce_rate_target {
+            meta = meta.with_announce_rate(
+                target,
+                announce_rate_grace.unwrap_or(0),
+                announce_rate_penalty.unwrap_or(0),
+            );
+        }
+
+        let metadata = Arc::new(meta);
+
+        // Register with interface registry
+        let registry = context.interface_registry.clone();
+        if let Some(ref reg) = registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
+
+        let (rx_channel, tx_channel) = context.channel.split();
+        let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+
+        // Reconnection loop (matches Python reconnect_port())
+        loop {
+            if context.cancel.is_cancelled() {
+                break;
+            }
+
+            match build_serial_port(&serial_config) {
+                Ok(stream) => {
+                    // Device initialization delay (Python: configure_device sleeps 0.5s)
+                    tokio::time::sleep(Duration::from_millis(CONFIGURE_DEVICE_DELAY_MS)).await;
+
+                    let (reader, writer) = tokio::io::split(stream);
+                    metadata.set_online(true);
+                    log::info!("serial: connected to {}", port_path);
+
+                    let stop = CancellationToken::new();
+
+                    // Spawn RX task
+                    let rx_task = {
+                        let cancel = context.cancel.clone();
+                        let stop = stop.clone();
+                        let rx_channel = rx_channel.clone();
+                        let metadata = metadata.clone();
+                        let port_path = port_path.clone();
+
+                        tokio::spawn(serial_hdlc_rx_task(
+                            reader, cancel, stop, rx_channel, metadata, iface_address, port_path,
+                        ))
+                    };
+
+                    // Spawn TX task
+                    let tx_task = {
+                        let cancel = context.cancel.clone();
+                        let stop = stop.clone();
+                        let tx_channel = tx_channel.clone();
+                        let metadata = metadata.clone();
+                        let port_path = port_path.clone();
+
+                        tokio::spawn(serial_hdlc_tx_task(
+                            writer, cancel, stop, tx_channel, metadata, iface_address, port_path,
+                        ))
+                    };
+
+                    // Wait for tasks to finish (port error or shutdown)
+                    let _ = rx_task.await;
+                    let _ = tx_task.await;
+
+                    metadata.set_online(false);
+                    log::info!("serial: disconnected from {}", port_path);
+                }
+                Err(e) => {
+                    log::info!("serial: couldn't open {}: {}", port_path, e);
+                    metadata.set_online(false);
+                }
+            }
+
+            // Check for shutdown before sleeping
+            if context.cancel.is_cancelled() {
+                break;
+            }
+
+            // Reconnect delay (Python: sleep(5))
+            tokio::select! {
+                _ = context.cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {},
+            }
+        }
+
+        // Unregister from interface registry on exit
+        if let Some(ref reg) = registry {
+            reg.unregister(&iface_address).await;
+        }
+
+        iface_stop.cancel();
     }
 }
 
@@ -418,10 +578,16 @@ impl BeaconConfig {
     }
 }
 
+// =============================================================================
+// KissInterface — KISS-framed serial I/O for TNC hardware
+// =============================================================================
+
 /// KISS interface for TNC communication.
 ///
 /// Wraps a `SerialInterface` with KISS-specific TNC configuration,
 /// flow control, and beacon support.
+///
+/// Python reference: `RNS/Interfaces/KISSInterface.py`
 pub struct KissInterface {
     /// Base serial interface
     serial: SerialInterface,
@@ -466,80 +632,6 @@ impl KissInterface {
             beacon,
             first_tx: None,
         }
-    }
-
-    /// Encode a packet in KISS format
-    pub fn encode_kiss(&self, data: &[u8]) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(data.len() * 2 + 3);
-
-        // Start frame
-        encoded.push(FEND);
-
-        // Command byte (port << 4 | command)
-        encoded.push((self.port << 4) | CMD_DATA);
-
-        // Escape and add data
-        for &byte in data {
-            match byte {
-                FEND => {
-                    encoded.push(FESC);
-                    encoded.push(TFEND);
-                }
-                FESC => {
-                    encoded.push(FESC);
-                    encoded.push(TFESC);
-                }
-                _ => {
-                    encoded.push(byte);
-                }
-            }
-        }
-
-        // End frame
-        encoded.push(FEND);
-
-        encoded
-    }
-
-    /// Decode a KISS frame
-    pub fn decode_kiss(&self, data: &[u8]) -> Result<Vec<u8>, RnsError> {
-        let mut decoded = Vec::with_capacity(data.len());
-        let mut escape = false;
-        let mut in_frame = false;
-
-        for &byte in data {
-            if byte == FEND {
-                if in_frame && !decoded.is_empty() {
-                    // Remove command byte and return
-                    if !decoded.is_empty() {
-                        let _cmd = decoded.remove(0);
-                        return Ok(decoded);
-                    }
-                }
-                in_frame = true;
-                decoded.clear();
-                continue;
-            }
-
-            if !in_frame {
-                continue;
-            }
-
-            if escape {
-                match byte {
-                    TFEND => decoded.push(FEND),
-                    TFESC => decoded.push(FESC),
-                    _ => decoded.push(byte),
-                }
-                escape = false;
-            } else if byte == FESC {
-                escape = true;
-            } else {
-                decoded.push(byte);
-            }
-        }
-
-        Err(RnsError::InvalidArgument)
     }
 
     /// Get the underlying serial interface
@@ -600,35 +692,7 @@ impl KissInterface {
     pub fn from_config(iface_config: &InterfaceConfig) -> Result<Self, RnsError> {
         let extra = &iface_config.extra;
 
-        let port_path = extra.get("port")
-            .ok_or(RnsError::InvalidArgument)?;
-
-        let speed: u32 = extra.get("speed")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_BAUD_RATE);
-
-        let databits: u8 = extra.get("databits")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
-
-        let parity = match extra.get("parity").map(|s| s.to_lowercase()).as_deref() {
-            Some("e") | Some("even") => Parity::Even,
-            Some("o") | Some("odd") => Parity::Odd,
-            _ => Parity::None,
-        };
-
-        let stopbits: u8 = extra.get("stopbits")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-
-        let serial_config = SerialConfig {
-            port: port_path.clone(),
-            baud_rate: speed,
-            data_bits: databits,
-            stop_bits: stopbits,
-            parity,
-            ..Default::default()
-        };
+        let serial_config = parse_serial_config(extra)?;
 
         let preamble_ms: u32 = extra.get("preamble")
             .and_then(|s| s.parse().ok())
@@ -677,6 +741,177 @@ impl KissInterface {
 
         Ok(Self::with_tnc_config(serial_config, 0, tnc_config, beacon))
     }
+
+    /// Apply common interface config (mode, bitrate, announce rates, etc.).
+    pub fn with_config(mut self, config: &InterfaceConfig) -> Self {
+        self.serial.mode = config.mode;
+        self.serial.bitrate = config.bitrate;
+        self.serial.dir_out = Some(config.outgoing);
+        self.serial.announce_rate_target = config.announce_rate_target;
+        self.serial.announce_rate_grace = config.announce_rate_grace;
+        self.serial.announce_rate_penalty = config.announce_rate_penalty;
+        self
+    }
+
+    /// Spawn the KISS interface I/O loop.
+    ///
+    /// Similar to `SerialInterface::spawn()` but uses KISS framing,
+    /// sends TNC configuration on connect, and supports flow control + beacons.
+    pub async fn spawn(context: InterfaceContext<KissInterface>) {
+        let iface_stop = context.channel.stop.clone();
+        let (port_path, baud_rate, serial_config, tnc_config, tnc_port,
+             flow_control_enabled, beacon, mode, bitrate, dir_out,
+             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
+            let inner = context.inner.lock().await;
+            (inner.serial.config.port.clone(), inner.serial.config.baud_rate,
+             inner.serial.config.clone(), inner.tnc_config.clone(), inner.port,
+             inner.tnc_config.flow_control, inner.beacon.clone(),
+             inner.serial.mode, inner.serial.bitrate, inner.serial.dir_out,
+             inner.serial.announce_rate_target, inner.serial.announce_rate_grace,
+             inner.serial.announce_rate_penalty)
+        };
+        let iface_address = context.channel.address;
+
+        // Build InterfaceMetadata
+        let effective_bitrate = bitrate.unwrap_or(KISS_BITRATE_GUESS);
+        let mut meta = InterfaceMetadata::new(
+            format!("KISSInterface[{}]", port_path),
+            "KISS",
+            "KISSInterface",
+            port_path.clone(),
+        )
+        .with_bitrate(effective_bitrate)
+        .with_direction(true, dir_out.unwrap_or(true))
+        .with_hw_mtu(564)
+        .with_ingress_control_disabled(); // Python: should_ingress_limit() returns False
+
+        if let Some(m) = mode {
+            meta = meta.with_mode(m);
+        }
+        if let Some(target) = announce_rate_target {
+            meta = meta.with_announce_rate(
+                target,
+                announce_rate_grace.unwrap_or(0),
+                announce_rate_penalty.unwrap_or(0),
+            );
+        }
+
+        let metadata = Arc::new(meta);
+
+        // Register with interface registry
+        let registry = context.interface_registry.clone();
+        if let Some(ref reg) = registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
+
+        let (rx_channel, tx_channel) = context.channel.split();
+        let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+
+        // Reconnection loop
+        loop {
+            if context.cancel.is_cancelled() {
+                break;
+            }
+
+            match build_serial_port(&serial_config) {
+                Ok(mut stream) => {
+                    // Send TNC configuration frames
+                    let config_frames = tnc_config.command_frames();
+                    let mut tnc_init_ok = true;
+                    for frame in &config_frames {
+                        if let Err(e) = stream.write_all(frame).await {
+                            log::warn!("kiss: failed to send TNC config to {}: {}", port_path, e);
+                            tnc_init_ok = false;
+                            break;
+                        }
+                    }
+                    if tnc_init_ok {
+                        let _ = stream.flush().await;
+                    }
+
+                    // TNC initialization delay (Python: 2 seconds)
+                    tokio::time::sleep(Duration::from_millis(KISS_CONFIGURE_DELAY_MS)).await;
+
+                    if !tnc_init_ok {
+                        metadata.set_online(false);
+                        // Fall through to reconnect
+                    } else {
+                        let (reader, writer) = tokio::io::split(stream);
+                        // Shared writer behind Arc<Mutex> for flow control (RX task
+                        // needs to drain queued packets on CMD_READY)
+                        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                        let flow_control = Arc::new(std::sync::Mutex::new(
+                            KissFlowControl::new(flow_control_enabled),
+                        ));
+
+                        metadata.set_online(true);
+                        log::info!("kiss: connected to {}", port_path);
+
+                        let stop = CancellationToken::new();
+
+                        // Spawn RX task
+                        let rx_task = {
+                            let cancel = context.cancel.clone();
+                            let stop = stop.clone();
+                            let rx_channel = rx_channel.clone();
+                            let metadata = metadata.clone();
+                            let port_path = port_path.clone();
+                            let writer = writer.clone();
+                            let flow_control = flow_control.clone();
+
+                            tokio::spawn(kiss_rx_task(
+                                reader, cancel, stop, rx_channel, metadata,
+                                iface_address, port_path, writer, flow_control,
+                            ))
+                        };
+
+                        // Spawn TX task
+                        let tx_task = {
+                            let cancel = context.cancel.clone();
+                            let stop = stop.clone();
+                            let tx_channel = tx_channel.clone();
+                            let metadata = metadata.clone();
+                            let port_path = port_path.clone();
+                            let writer = writer.clone();
+                            let flow_control = flow_control.clone();
+                            let beacon = beacon.clone();
+
+                            tokio::spawn(kiss_tx_task(
+                                cancel, stop, tx_channel, metadata,
+                                iface_address, port_path, writer, flow_control,
+                                tnc_port, beacon,
+                            ))
+                        };
+
+                        let _ = rx_task.await;
+                        let _ = tx_task.await;
+
+                        metadata.set_online(false);
+                        log::info!("kiss: disconnected from {}", port_path);
+                    }
+                }
+                Err(e) => {
+                    log::info!("kiss: couldn't open {}: {}", port_path, e);
+                    metadata.set_online(false);
+                }
+            }
+
+            if context.cancel.is_cancelled() {
+                break;
+            }
+
+            tokio::select! {
+                _ = context.cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {},
+            }
+        }
+
+        if let Some(ref reg) = registry {
+            reg.unregister(&iface_address).await;
+        }
+
+        iface_stop.cancel();
+    }
 }
 
 impl Interface for KissInterface {
@@ -684,6 +919,416 @@ impl Interface for KissInterface {
         564 // Reticulum serial MTU (matches Python implementation)
     }
 }
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+/// Parse serial port configuration from a config extra map.
+///
+/// Shared between `SerialInterface::from_config()` and `KissInterface::from_config()`.
+fn parse_serial_config(extra: &std::collections::HashMap<String, String>) -> Result<SerialConfig, RnsError> {
+    let port_path = extra.get("port")
+        .ok_or(RnsError::InvalidArgument)?;
+
+    let speed: u32 = extra.get("speed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BAUD_RATE);
+
+    let databits: u8 = extra.get("databits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+
+    let parity = match extra.get("parity").map(|s| s.to_lowercase()).as_deref() {
+        Some("e") | Some("even") => Parity::Even,
+        Some("o") | Some("odd") => Parity::Odd,
+        _ => Parity::None,
+    };
+
+    let stopbits: u8 = extra.get("stopbits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    Ok(SerialConfig {
+        port: port_path.clone(),
+        baud_rate: speed,
+        data_bits: databits,
+        stop_bits: stopbits,
+        parity,
+        ..Default::default()
+    })
+}
+
+/// Map our `Parity` enum to `tokio_serial::Parity`.
+fn map_parity(parity: Parity) -> tokio_serial::Parity {
+    match parity {
+        Parity::None => tokio_serial::Parity::None,
+        Parity::Odd => tokio_serial::Parity::Odd,
+        Parity::Even => tokio_serial::Parity::Even,
+    }
+}
+
+/// Map our data bits value to `tokio_serial::DataBits`.
+fn map_data_bits(bits: u8) -> tokio_serial::DataBits {
+    match bits {
+        5 => tokio_serial::DataBits::Five,
+        6 => tokio_serial::DataBits::Six,
+        7 => tokio_serial::DataBits::Seven,
+        _ => tokio_serial::DataBits::Eight,
+    }
+}
+
+/// Map our stop bits value to `tokio_serial::StopBits`.
+fn map_stop_bits(bits: u8) -> tokio_serial::StopBits {
+    match bits {
+        2 => tokio_serial::StopBits::Two,
+        _ => tokio_serial::StopBits::One,
+    }
+}
+
+/// Open a serial port using tokio-serial.
+///
+/// Configures all serial port parameters and sets flow control to None
+/// (matching Python: xonxoff=False, rtscts=False, dsrdtr=False).
+fn build_serial_port(config: &SerialConfig) -> Result<tokio_serial::SerialStream, RnsError> {
+    let builder = tokio_serial::new(&config.port, config.baud_rate)
+        .data_bits(map_data_bits(config.data_bits))
+        .stop_bits(map_stop_bits(config.stop_bits))
+        .parity(map_parity(config.parity))
+        .flow_control(tokio_serial::FlowControl::None)
+        .timeout(Duration::from_millis(0)); // Non-blocking
+
+    tokio_serial::SerialStream::open(&builder).map_err(|e| {
+        log::error!("Failed to open serial port {}: {}", config.port, e);
+        RnsError::ConnectionError
+    })
+}
+
+// =============================================================================
+// HDLC RX/TX tasks for SerialInterface
+// =============================================================================
+
+/// HDLC receive task: reads bytes from serial port, parses HDLC frames,
+/// deserializes packets, and sends them to the transport layer.
+///
+/// Matches Python `SerialInterface.readLoop()` behavior.
+async fn serial_hdlc_rx_task(
+    mut reader: tokio::io::ReadHalf<tokio_serial::SerialStream>,
+    cancel: CancellationToken,
+    stop: CancellationToken,
+    rx_channel: crate::iface::InterfaceRxSender,
+    metadata: Arc<InterfaceMetadata>,
+    iface_address: AddressHash,
+    port_path: String,
+) {
+    let mut parser = HdlcStreamParser::new();
+    let mut read_buf = [0u8; 256];
+    let mut last_read = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = stop.cancelled() => break,
+            result = reader.read(&mut read_buf) => {
+                match result {
+                    Ok(0) => {
+                        log::warn!("serial[{}]: read returned 0 bytes (EOF)", port_path);
+                        stop.cancel();
+                        break;
+                    }
+                    Ok(n) => {
+                        last_read = Instant::now();
+                        metadata.add_rx_bytes(n as u64);
+
+                        for &byte in &read_buf[..n] {
+                            if let HdlcParseResult::DataFrame = parser.feed(byte) {
+                                let data = parser.take_frame();
+                                if data.len() >= MIN_FRAME_PAYLOAD {
+                                    match Packet::deserialize(&mut InputBuffer::new(&data)) {
+                                        Ok(packet) => {
+                                            let _ = rx_channel.send(RxMessage {
+                                                address: iface_address,
+                                                packet,
+                                            }).await;
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "serial[{}]: packet decode error: {}",
+                                                port_path, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("serial[{}]: read error: {}", port_path, e);
+                        stop.cancel();
+                        break;
+                    }
+                }
+            }
+            // Timeout: reset parser if partial data and no bytes for 100ms
+            _ = tokio::time::sleep(Duration::from_millis(DEFAULT_READ_TIMEOUT_MS)) => {
+                if parser.has_data() && last_read.elapsed() >= Duration::from_millis(DEFAULT_READ_TIMEOUT_MS) {
+                    parser.reset();
+                }
+            }
+        }
+    }
+}
+
+/// HDLC transmit task: receives packets from transport, serializes them,
+/// wraps in HDLC framing, and writes to serial port.
+///
+/// Matches Python `SerialInterface.processOutgoing()`.
+async fn serial_hdlc_tx_task(
+    mut writer: tokio::io::WriteHalf<tokio_serial::SerialStream>,
+    cancel: CancellationToken,
+    stop: CancellationToken,
+    tx_channel: Arc<tokio::sync::Mutex<crate::iface::InterfaceTxReceiver>>,
+    metadata: Arc<InterfaceMetadata>,
+    _iface_address: AddressHash,
+    port_path: String,
+) {
+    let mut tx_buffer = [0u8; MAX_FRAME_SIZE];
+    let mut hdlc_buffer = [0u8; MAX_FRAME_SIZE * 2 + 4];
+
+    loop {
+        let mut tx_channel = tx_channel.lock().await;
+
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = stop.cancelled() => break,
+            Some(message) = tx_channel.recv() => {
+                let packet = message.packet;
+                let mut output = OutputBuffer::new(&mut tx_buffer);
+
+                if packet.serialize(&mut output).is_ok() {
+                    let mut hdlc_output = OutputBuffer::new(&mut hdlc_buffer);
+                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
+                        let data = hdlc_output.as_slice();
+                        metadata.add_tx_bytes(data.len() as u64);
+
+                        if let Err(e) = writer.write_all(data).await {
+                            log::warn!("serial[{}]: write error: {}", port_path, e);
+                            stop.cancel();
+                            break;
+                        }
+                        let _ = writer.flush().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// KISS RX/TX tasks for KissInterface
+// =============================================================================
+
+/// KISS receive task: reads bytes from serial port, parses KISS frames,
+/// handles flow control CMD_READY signals, deserializes packets.
+async fn kiss_rx_task(
+    mut reader: tokio::io::ReadHalf<tokio_serial::SerialStream>,
+    cancel: CancellationToken,
+    stop: CancellationToken,
+    rx_channel: crate::iface::InterfaceRxSender,
+    metadata: Arc<InterfaceMetadata>,
+    iface_address: AddressHash,
+    port_path: String,
+    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_serial::SerialStream>>>,
+    flow_control: Arc<std::sync::Mutex<KissFlowControl>>,
+) {
+    let mut parser = KissStreamParser::new();
+    let mut read_buf = [0u8; 256];
+    let mut last_read = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = stop.cancelled() => break,
+            result = reader.read(&mut read_buf) => {
+                match result {
+                    Ok(0) => {
+                        log::warn!("kiss[{}]: read returned 0 bytes (EOF)", port_path);
+                        stop.cancel();
+                        break;
+                    }
+                    Ok(n) => {
+                        last_read = Instant::now();
+                        metadata.add_rx_bytes(n as u64);
+
+                        for &byte in &read_buf[..n] {
+                            match parser.feed(byte) {
+                                KissParseResult::DataFrame => {
+                                    let data = parser.take_frame();
+                                    if data.len() >= MIN_FRAME_PAYLOAD {
+                                        match Packet::deserialize(&mut InputBuffer::new(&data)) {
+                                            Ok(packet) => {
+                                                let _ = rx_channel.send(RxMessage {
+                                                    address: iface_address,
+                                                    packet,
+                                                }).await;
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "kiss[{}]: packet decode error: {}",
+                                                    port_path, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                KissParseResult::ReadySignal => {
+                                    // TNC is ready — drain queued packets
+                                    let queued = {
+                                        flow_control.lock().expect("flow_control lock").signal_ready()
+                                    };
+                                    if !queued.is_empty() {
+                                        let mut w = writer.lock().await;
+                                        for data in queued {
+                                            metadata.add_tx_bytes(data.len() as u64);
+                                            if let Err(e) = w.write_all(&data).await {
+                                                log::warn!("kiss[{}]: write error draining queue: {}", port_path, e);
+                                                stop.cancel();
+                                                break;
+                                            }
+                                        }
+                                        let _ = w.flush().await;
+                                    }
+                                }
+                                KissParseResult::CommandFrame(cmd) => {
+                                    log::debug!("kiss[{}]: received command frame 0x{:02x}", port_path, cmd);
+                                }
+                                KissParseResult::Pending => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("kiss[{}]: read error: {}", port_path, e);
+                        stop.cancel();
+                        break;
+                    }
+                }
+            }
+            // Timeout: reset parser if partial data and no bytes for 100ms
+            _ = tokio::time::sleep(Duration::from_millis(DEFAULT_READ_TIMEOUT_MS)) => {
+                if parser.has_data() && last_read.elapsed() >= Duration::from_millis(DEFAULT_READ_TIMEOUT_MS) {
+                    parser.reset();
+                }
+                // Check flow control timeout
+                flow_control.lock().expect("flow_control lock").check_timeout();
+            }
+        }
+    }
+}
+
+/// KISS transmit task: receives packets from transport, serializes them,
+/// wraps in KISS framing, and writes to serial port (with flow control).
+///
+/// Also handles periodic beacon transmission when configured.
+async fn kiss_tx_task(
+    cancel: CancellationToken,
+    stop: CancellationToken,
+    tx_channel: Arc<tokio::sync::Mutex<crate::iface::InterfaceTxReceiver>>,
+    metadata: Arc<InterfaceMetadata>,
+    _iface_address: AddressHash,
+    port_path: String,
+    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_serial::SerialStream>>>,
+    flow_control: Arc<std::sync::Mutex<KissFlowControl>>,
+    tnc_port: u8,
+    beacon: Option<BeaconConfig>,
+) {
+    let mut tx_buffer = [0u8; MAX_FRAME_SIZE];
+    let mut kiss_buffer = [0u8; MAX_FRAME_SIZE * 2 + 4];
+    let mut first_tx: Option<Instant> = None;
+
+    loop {
+        let mut tx_channel = tx_channel.lock().await;
+
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = stop.cancelled() => break,
+            Some(message) = tx_channel.recv() => {
+                let packet = message.packet;
+                let mut output = OutputBuffer::new(&mut tx_buffer);
+
+                if packet.serialize(&mut output).is_ok() {
+                    let mut kiss_output = OutputBuffer::new(&mut kiss_buffer);
+                    let encode_result = if tnc_port == 0 {
+                        Kiss::encode(output.as_slice(), &mut kiss_output)
+                    } else {
+                        Kiss::encode_with_port(output.as_slice(), tnc_port, &mut kiss_output)
+                    };
+
+                    if encode_result.is_ok() {
+                        let encoded = kiss_output.as_slice().to_vec();
+
+                        // Track first TX for beacon timing
+                        if first_tx.is_none() {
+                            first_tx = Some(Instant::now());
+                        }
+
+                        // Check flow control
+                        let ready = flow_control.lock().expect("flow_control lock").is_ready();
+                        if !ready {
+                            flow_control.lock().expect("flow_control lock").queue(encoded);
+                            continue;
+                        }
+
+                        metadata.add_tx_bytes(encoded.len() as u64);
+
+                        let mut w = writer.lock().await;
+                        if let Err(e) = w.write_all(&encoded).await {
+                            log::warn!("kiss[{}]: write error: {}", port_path, e);
+                            stop.cancel();
+                            break;
+                        }
+                        let _ = w.flush().await;
+                        drop(w);
+
+                        // Lock after TX if flow control is enabled
+                        flow_control.lock().expect("flow_control lock").lock();
+                    }
+                }
+            }
+            // Beacon check: send periodic identification if configured
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if let Some(ref beacon_config) = beacon {
+                    if let (Some(interval), Some(first)) = (beacon_config.interval, first_tx) {
+                        if first.elapsed() >= Duration::from_secs(interval) {
+                            let beacon_data = beacon_config.make_frame();
+                            let mut kiss_output = OutputBuffer::new(&mut kiss_buffer);
+                            let encode_result = if tnc_port == 0 {
+                                Kiss::encode(&beacon_data, &mut kiss_output)
+                            } else {
+                                Kiss::encode_with_port(&beacon_data, tnc_port, &mut kiss_output)
+                            };
+
+                            if encode_result.is_ok() {
+                                let mut w = writer.lock().await;
+                                let data = kiss_output.as_slice();
+                                metadata.add_tx_bytes(data.len() as u64);
+                                if let Err(e) = w.write_all(data).await {
+                                    log::warn!("kiss[{}]: beacon write error: {}", port_path, e);
+                                }
+                                let _ = w.flush().await;
+                            }
+                            // Reset first_tx for next beacon interval
+                            first_tx = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -700,46 +1345,6 @@ mod tests {
     fn test_default_baud_rate_9600() {
         let config = SerialConfig::default();
         assert_eq!(config.baud_rate, 9600);
-    }
-
-    #[test]
-    fn test_kiss_encode() {
-        let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss_iface = KissInterface::new(config, 0);
-
-        let data = vec![0x01, 0x02, 0x03];
-        let encoded = kiss_iface.encode_kiss(&data);
-
-        assert_eq!(encoded[0], FEND);
-        assert_eq!(encoded[1], CMD_DATA);
-        assert_eq!(encoded[encoded.len() - 1], FEND);
-    }
-
-    #[test]
-    fn test_kiss_encode_escape() {
-        let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss_iface = KissInterface::new(config, 0);
-
-        // Data containing FEND and FESC bytes
-        let data = vec![FEND, FESC, 0x42];
-        let encoded = kiss_iface.encode_kiss(&data);
-
-        // Should have escape sequences
-        assert!(encoded.contains(&FESC));
-        assert!(encoded.contains(&TFEND));
-        assert!(encoded.contains(&TFESC));
-    }
-
-    #[test]
-    fn test_kiss_decode() {
-        let config = SerialConfig::new("/dev/ttyUSB0");
-        let kiss_iface = KissInterface::new(config, 0);
-
-        // Valid KISS frame
-        let frame = vec![FEND, CMD_DATA, 0x01, 0x02, 0x03, FEND];
-        let decoded = kiss_iface.decode_kiss(&frame).unwrap();
-
-        assert_eq!(decoded, vec![0x01, 0x02, 0x03]);
     }
 
     #[test]
@@ -760,14 +1365,11 @@ mod tests {
 
     #[test]
     fn test_serial_mtu_564() {
-        // Verify serial MTU matches Python implementation (564 bytes)
-        // Python: RNS/Interfaces/Interface.py AUTOCONFIGURE_MTU = 564
         assert_eq!(SerialInterface::mtu(), 564);
     }
 
     #[test]
     fn test_kiss_mtu_564() {
-        // Verify KISS interface MTU also matches Python implementation
         assert_eq!(KissInterface::mtu(), 564);
     }
 
@@ -801,9 +1403,7 @@ mod tests {
     fn test_tnc_config_command_frames() {
         let tnc = KissTncConfig::default();
         let frames = tnc.command_frames();
-        // preamble, txtail, persistence, slottime (no flow control)
         assert_eq!(frames.len(), 4);
-        // Verify preamble frame: 350/10 = 35
         assert_eq!(frames[0], [FEND, kiss::CMD_TXDELAY, 35, FEND]);
     }
 
@@ -814,7 +1414,6 @@ mod tests {
             ..Default::default()
         };
         let frames = tnc.command_frames();
-        // preamble, txtail, persistence, slottime, flow_control
         assert_eq!(frames.len(), 5);
         assert_eq!(frames[4], [FEND, kiss::CMD_READY, 0x01, FEND]);
     }
@@ -862,7 +1461,6 @@ mod tests {
             data: b"N0CALL".to_vec(),
         };
         let frame = beacon.make_frame();
-        // "N0CALL" = 6 bytes, padded to 15
         assert_eq!(frame.len(), 15);
         assert_eq!(&frame[..6], b"N0CALL");
         assert!(frame[6..].iter().all(|&b| b == 0x00));
@@ -872,10 +1470,35 @@ mod tests {
     fn test_beacon_config_no_padding_needed() {
         let beacon = BeaconConfig {
             interval: Some(300),
-            data: vec![0x42; 20], // already > 15 bytes
+            data: vec![0x42; 20],
         };
         let frame = beacon.make_frame();
         assert_eq!(frame.len(), 20);
+    }
+
+    #[test]
+    fn test_map_parity() {
+        assert_eq!(map_parity(Parity::None), tokio_serial::Parity::None);
+        assert_eq!(map_parity(Parity::Odd), tokio_serial::Parity::Odd);
+        assert_eq!(map_parity(Parity::Even), tokio_serial::Parity::Even);
+    }
+
+    #[test]
+    fn test_map_data_bits() {
+        assert_eq!(map_data_bits(5), tokio_serial::DataBits::Five);
+        assert_eq!(map_data_bits(6), tokio_serial::DataBits::Six);
+        assert_eq!(map_data_bits(7), tokio_serial::DataBits::Seven);
+        assert_eq!(map_data_bits(8), tokio_serial::DataBits::Eight);
+        // Invalid values default to Eight
+        assert_eq!(map_data_bits(9), tokio_serial::DataBits::Eight);
+    }
+
+    #[test]
+    fn test_map_stop_bits() {
+        assert_eq!(map_stop_bits(1), tokio_serial::StopBits::One);
+        assert_eq!(map_stop_bits(2), tokio_serial::StopBits::Two);
+        // Invalid values default to One
+        assert_eq!(map_stop_bits(3), tokio_serial::StopBits::One);
     }
 
     mod from_config {
@@ -909,7 +1532,7 @@ mod tests {
         }
 
         #[test]
-        fn test_from_config_defaults() {
+        fn test_kiss_from_config_defaults() {
             let mut extra = HashMap::new();
             extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
             let config = make_iface_config(extra);
@@ -924,7 +1547,7 @@ mod tests {
         }
 
         #[test]
-        fn test_from_config_overrides() {
+        fn test_kiss_from_config_overrides() {
             let mut extra = HashMap::new();
             extra.insert("port".to_string(), "/dev/ttyS0".to_string());
             extra.insert("speed".to_string(), "19200".to_string());
@@ -947,14 +1570,14 @@ mod tests {
         }
 
         #[test]
-        fn test_from_config_missing_port() {
+        fn test_kiss_from_config_missing_port() {
             let extra = HashMap::new();
             let config = make_iface_config(extra);
             assert!(KissInterface::from_config(&config).is_err());
         }
 
         #[test]
-        fn test_from_config_parity() {
+        fn test_kiss_from_config_parity() {
             let mut extra = HashMap::new();
             extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
             extra.insert("parity".to_string(), "E".to_string());
@@ -962,6 +1585,63 @@ mod tests {
 
             let kiss = KissInterface::from_config(&config).unwrap();
             assert_eq!(kiss.serial().config().parity, Parity::Even);
+        }
+
+        #[test]
+        fn test_serial_from_config_defaults() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
+            let config = make_iface_config(extra);
+
+            let serial = SerialInterface::from_config(&config).unwrap();
+            assert_eq!(serial.config().port, "/dev/ttyUSB0");
+            assert_eq!(serial.config().baud_rate, 9600);
+            assert_eq!(serial.config().data_bits, 8);
+            assert_eq!(serial.config().stop_bits, 1);
+            assert_eq!(serial.config().parity, Parity::None);
+        }
+
+        #[test]
+        fn test_serial_from_config_overrides() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyS0".to_string());
+            extra.insert("speed".to_string(), "115200".to_string());
+            extra.insert("databits".to_string(), "7".to_string());
+            extra.insert("stopbits".to_string(), "2".to_string());
+            extra.insert("parity".to_string(), "O".to_string());
+            let config = make_iface_config(extra);
+
+            let serial = SerialInterface::from_config(&config).unwrap();
+            assert_eq!(serial.config().port, "/dev/ttyS0");
+            assert_eq!(serial.config().baud_rate, 115200);
+            assert_eq!(serial.config().data_bits, 7);
+            assert_eq!(serial.config().stop_bits, 2);
+            assert_eq!(serial.config().parity, Parity::Odd);
+        }
+
+        #[test]
+        fn test_serial_from_config_missing_port() {
+            let extra = HashMap::new();
+            let config = make_iface_config(extra);
+            assert!(SerialInterface::from_config(&config).is_err());
+        }
+
+        #[test]
+        fn test_serial_with_config() {
+            let mut extra = HashMap::new();
+            extra.insert("port".to_string(), "/dev/ttyUSB0".to_string());
+            let mut iface_config = make_iface_config(extra);
+            iface_config.outgoing = true;
+            iface_config.bitrate = Some(19200);
+            iface_config.mode = Some(InterfaceMode::Full);
+
+            let serial = SerialInterface::from_config(&iface_config)
+                .unwrap()
+                .with_config(&iface_config);
+
+            assert_eq!(serial.dir_out, Some(true));
+            assert_eq!(serial.bitrate, Some(19200));
+            assert_eq!(serial.mode, Some(InterfaceMode::Full));
         }
     }
 }
