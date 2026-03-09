@@ -4,6 +4,10 @@ const HDLC_FRAME_FLAG: u8 = 0x7e;
 const HDLC_ESCAPE_BYTE: u8 = 0x7d;
 const HDLC_ESCAPE_MASK: u8 = 0b00100000;
 
+/// Minimum decoded payload size for a valid Reticulum frame.
+/// Frames smaller than this are silently discarded by consumers.
+pub const MIN_FRAME_PAYLOAD: usize = 2;
+
 pub struct Hdlc {}
 
 impl Hdlc {
@@ -59,6 +63,22 @@ impl Hdlc {
         Option::None
     }
 
+    /// Find all complete HDLC frames in the buffer.
+    /// Returns Vec of (start, end) index pairs.
+    pub fn find_all(data: &[u8]) -> Vec<(usize, usize)> {
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        while offset < data.len() {
+            if let Some((start, end)) = Self::find(&data[offset..]) {
+                frames.push((offset + start, offset + end));
+                offset += end + 1;
+            } else {
+                break;
+            }
+        }
+        frames
+    }
+
     pub fn decode(data: &[u8], output: &mut OutputBuffer) -> Result<usize, RnsError> {
         let mut started = false;
         let mut finished = false;
@@ -89,7 +109,7 @@ impl Hdlc {
         }
 
         if !finished {
-            return Err(RnsError::OutOfMemory);
+            return Err(RnsError::FramingError);
         }
 
         Ok(output.offset())
@@ -233,6 +253,52 @@ mod tests {
         #[test]
         fn test_find_empty_data() {
             assert!(Hdlc::find(&[]).is_none());
+        }
+    }
+
+    /// Tests for finding all HDLC frames in a buffer.
+    mod find_all {
+        use super::*;
+
+        #[test]
+        fn test_find_all_single_frame() {
+            let data = [HDLC_FRAME_FLAG, 0x01, 0x02, HDLC_FRAME_FLAG];
+            let frames = Hdlc::find_all(&data);
+            assert_eq!(frames, vec![(0, 3)]);
+        }
+
+        #[test]
+        fn test_find_all_multiple_frames() {
+            let data = [
+                HDLC_FRAME_FLAG, 0x01, HDLC_FRAME_FLAG,  // frame 1
+                HDLC_FRAME_FLAG, 0x02, HDLC_FRAME_FLAG,  // frame 2
+            ];
+            let frames = Hdlc::find_all(&data);
+            assert_eq!(frames, vec![(0, 2), (3, 5)]);
+        }
+
+        #[test]
+        fn test_find_all_no_frames() {
+            let data = [0x01, 0x02, 0x03];
+            let frames = Hdlc::find_all(&data);
+            assert!(frames.is_empty());
+        }
+
+        #[test]
+        fn test_find_all_garbage_between_frames() {
+            let data = [
+                HDLC_FRAME_FLAG, 0x01, HDLC_FRAME_FLAG,  // frame 1
+                0xFF, 0xFE,                                // garbage
+                HDLC_FRAME_FLAG, 0x02, HDLC_FRAME_FLAG,  // frame 2
+            ];
+            let frames = Hdlc::find_all(&data);
+            assert_eq!(frames, vec![(0, 2), (5, 7)]);
+        }
+
+        #[test]
+        fn test_find_all_empty_data() {
+            let frames = Hdlc::find_all(&[]);
+            assert!(frames.is_empty());
         }
     }
 

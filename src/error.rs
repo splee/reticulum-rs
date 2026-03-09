@@ -26,6 +26,8 @@ pub enum RnsError {
     UnknownDestination,
     /// Buffer write/acquire exceeded the fixed capacity
     BufferOverflow,
+    /// Incomplete or malformed frame (HDLC/KISS)
+    FramingError,
 }
 
 impl fmt::Display for RnsError {
@@ -46,6 +48,7 @@ impl fmt::Display for RnsError {
             RnsError::ResourceRequired => write!(f, "resource required for large data"),
             RnsError::UnknownDestination => write!(f, "no known identity for destination"),
             RnsError::BufferOverflow => write!(f, "buffer overflow"),
+            RnsError::FramingError => write!(f, "incomplete or malformed frame"),
         }
     }
 }

@@ -663,6 +663,12 @@ impl Reticulum {
                         );
                     }
                 }
+                "KISSInterface" | "kiss" => {
+                    log::info!(
+                        "KISSInterface '{}' recognized but serial I/O not yet implemented (see #58)",
+                        iface_config.name
+                    );
+                }
                 other => {
                     log::warn!("Unknown interface type: {}", other);
                 }
