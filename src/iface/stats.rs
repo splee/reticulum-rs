@@ -5,9 +5,13 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::hash::AddressHash;
+
+/// How long an interface is considered "new" (2 hours).
+/// Python: `IC_NEW_TIME = 2*60*60`
+pub const IC_NEW_TIME: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Interface mode constants matching Python implementation.
 ///
@@ -45,6 +49,14 @@ impl From<u8> for InterfaceMode {
 }
 
 impl InterfaceMode {
+    /// Interface modes that warrant active path discovery in Transport Node mode.
+    /// Python: `DISCOVER_PATHS_FOR = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING]`
+    pub const DISCOVER_PATHS_FOR: &[InterfaceMode] = &[
+        InterfaceMode::AccessPoint,
+        InterfaceMode::Gateway,
+        InterfaceMode::Roaming,
+    ];
+
     /// Get a human-readable string representation of the mode.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -105,6 +117,20 @@ pub struct InterfaceMetadata {
     pub parent_interface_hash: Option<AddressHash>,
     /// Network endpoint address (for display, e.g., "127.0.0.1:4242")
     pub endpoint_address: String,
+    /// Whether interface has been detached from transport
+    pub detached: bool,
+    /// Whether interface supports peer discovery
+    pub supports_discovery: bool,
+    /// Whether interface can be discovered by others
+    pub discoverable: bool,
+    /// Timestamp of last discovery announce sent (seconds since epoch, 0 = never)
+    pub last_discovery_announce: f64,
+    /// Whether interface is only used for bootstrapping
+    pub bootstrap_only: bool,
+    /// Child interface hashes (parent-to-children tracking)
+    pub spawned_interfaces: Vec<AddressHash>,
+    /// Tunnel ID for tunneled interfaces
+    pub tunnel_id: Option<AddressHash>,
 }
 
 impl InterfaceMetadata {
@@ -133,6 +159,13 @@ impl InterfaceMetadata {
             created: Instant::now(),
             parent_interface_hash: None,
             endpoint_address: endpoint_address.into(),
+            detached: false,
+            supports_discovery: false,
+            discoverable: false,
+            last_discovery_announce: 0.0,
+            bootstrap_only: false,
+            spawned_interfaces: Vec::new(),
+            tunnel_id: None,
         }
     }
 
@@ -188,6 +221,12 @@ impl InterfaceMetadata {
     #[inline]
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::Acquire)
+    }
+
+    /// Returns elapsed time since interface creation.
+    /// Python equivalent: `time.time() - self.created`
+    pub fn age(&self) -> Duration {
+        self.created.elapsed()
     }
 }
 
@@ -328,5 +367,38 @@ mod tests {
         assert_eq!(InterfaceMode::from(0x00), InterfaceMode::Full);
         assert_eq!(InterfaceMode::from(0x07), InterfaceMode::Full);
         assert_eq!(InterfaceMode::from(0xFF), InterfaceMode::Full);
+    }
+
+    #[test]
+    fn test_lifecycle_field_defaults() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "");
+        assert!(!meta.detached);
+        assert!(!meta.supports_discovery);
+        assert!(!meta.discoverable);
+        assert_eq!(meta.last_discovery_announce, 0.0);
+        assert!(!meta.bootstrap_only);
+        assert!(meta.spawned_interfaces.is_empty());
+        assert!(meta.tunnel_id.is_none());
+    }
+
+    #[test]
+    fn test_age_returns_elapsed() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "");
+        // age() should return a non-zero duration (at least some nanoseconds have passed)
+        let age = meta.age();
+        assert!(age.as_nanos() > 0);
+    }
+
+    #[test]
+    fn test_discover_paths_for() {
+        assert_eq!(InterfaceMode::DISCOVER_PATHS_FOR.len(), 3);
+        assert!(InterfaceMode::DISCOVER_PATHS_FOR.contains(&InterfaceMode::AccessPoint));
+        assert!(InterfaceMode::DISCOVER_PATHS_FOR.contains(&InterfaceMode::Gateway));
+        assert!(InterfaceMode::DISCOVER_PATHS_FOR.contains(&InterfaceMode::Roaming));
+    }
+
+    #[test]
+    fn test_ic_new_time() {
+        assert_eq!(IC_NEW_TIME.as_secs(), 7200);
     }
 }
