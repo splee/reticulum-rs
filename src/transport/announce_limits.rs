@@ -7,26 +7,14 @@ use tokio::time::Instant;
 
 use crate::hash::AddressHash;
 
-/// Maximum number of timestamps to keep in history for rate calculation
-const MAX_TIMESTAMP_HISTORY: usize = 100;
-
-/// How long to keep timestamps in history (1 hour)
-const TIMESTAMP_HISTORY_WINDOW: Duration = Duration::from_secs(3600);
+/// Maximum number of timestamps to keep in history.
+/// Matches Python's Transport.MAX_RATE_TIMESTAMPS = 16.
+const MAX_RATE_TIMESTAMPS: usize = 16;
 
 pub struct AnnounceRateLimit {
     pub target: Duration,
     pub grace: u32,
-    pub penalty: Option<Duration>,
-}
-
-impl Default for AnnounceRateLimit {
-    fn default() -> Self {
-        Self {
-            target: Duration::from_secs(3600),
-            grace: 10,
-            penalty: Some(Duration::from_secs(7200)),
-        }
-    }
+    pub penalty: Duration,
 }
 
 /// Rate information for external display/queries
@@ -46,19 +34,14 @@ pub struct RateInfo {
 
 struct AnnounceLimitEntry {
     rate_limit: Option<AnnounceRateLimit>,
-    /// Current violation count (resets when grace period triggers block)
+    /// Current violation count — decremented when compliant, matching Python behavior
     violations: u32,
-    /// Total violations since entry was created (never resets)
-    total_violations: u32,
     /// Last announce time (None if this is the first announce)
     last_announce: Option<Instant>,
     /// When the block expires (None if not blocked)
     blocked_until: Option<Instant>,
-    /// History of announce timestamps for rate calculation
+    /// History of announce timestamps for rate info queries
     timestamp_history: VecDeque<Instant>,
-    /// When this entry was created (for unix timestamp calculation)
-    #[allow(dead_code)]
-    created_at: std::time::SystemTime,
 }
 
 impl AnnounceLimitEntry {
@@ -66,75 +49,80 @@ impl AnnounceLimitEntry {
         Self {
             rate_limit,
             violations: 0,
-            total_violations: 0,
             last_announce: None,
             blocked_until: None,
-            timestamp_history: VecDeque::with_capacity(MAX_TIMESTAMP_HISTORY),
-            created_at: std::time::SystemTime::now(),
+            timestamp_history: VecDeque::with_capacity(MAX_RATE_TIMESTAMPS),
         }
     }
 
-    /// Record an announce and check for rate limiting
+    /// Record an announce and check for rate limiting.
+    /// Returns Some(duration) if blocked, None if accepted.
+    ///
+    /// Matches Python Transport.py lines ~1691–1719:
+    /// - Inter-arrival time compared against target
+    /// - Violations increment when too fast, decrement (saturating) when on time
+    /// - Block triggers when violations > grace (strict >)
+    /// - blocked_until = last + target + penalty (not now-based)
+    /// - No state changes while blocked (no extension)
+    /// - last_announce only updated on accepted announces
     pub fn handle_announce(&mut self) -> Option<Duration> {
-        let mut is_blocked = false;
         let now = Instant::now();
 
-        // Add to timestamp history
+        // Record timestamp, cap at MAX_RATE_TIMESTAMPS (no time-based pruning).
         self.timestamp_history.push_back(now);
-
-        // Trim old timestamps beyond the history window
-        let cutoff = now.checked_sub(TIMESTAMP_HISTORY_WINDOW).unwrap_or(now);
-        while let Some(&oldest) = self.timestamp_history.front() {
-            if oldest < cutoff {
-                self.timestamp_history.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // Limit history size
-        while self.timestamp_history.len() > MAX_TIMESTAMP_HISTORY {
+        while self.timestamp_history.len() > MAX_RATE_TIMESTAMPS {
             self.timestamp_history.pop_front();
         }
 
-        if let Some(ref rate_limit) = self.rate_limit {
-            // Check if currently blocked
-            if let Some(blocked) = self.blocked_until {
-                if now < blocked {
-                    // Still blocked - extend the block
-                    let mut new_blocked = now + rate_limit.target;
-                    if let Some(penalty) = rate_limit.penalty {
-                        new_blocked += penalty;
-                    }
-                    self.blocked_until = Some(new_blocked);
-                    is_blocked = true;
-                } else {
-                    // Block expired, clear it
-                    self.blocked_until = None;
-                }
+        let rate_limit = match self.rate_limit {
+            Some(ref rl) => rl,
+            None => {
+                // No rate limit configured — always accept, update last for info queries.
+                self.last_announce = Some(now);
+                return None;
+            }
+        };
+
+        // First announce: accept unconditionally (Python: new entry gets last=now).
+        let last = match self.last_announce {
+            Some(last) => last,
+            None => {
+                self.last_announce = Some(now);
+                return None;
+            }
+        };
+
+        // Python: current_rate = now - rate_entry["last"]
+        let current_rate = now.duration_since(last);
+
+        // Python: if now > rate_entry["blocked_until"]:
+        let is_blocked = if self.blocked_until.map_or(true, |b| now > b) {
+            // Not currently blocked — evaluate rate compliance.
+            if current_rate < rate_limit.target {
+                // Too fast — increment violations
+                self.violations += 1;
+            } else {
+                // On time — decrement violations (Python: max(0, violations - 1))
+                self.violations = self.violations.saturating_sub(1);
             }
 
-            // If not blocked, check for rate violations
-            if !is_blocked {
-                if let Some(last) = self.last_announce {
-                    let next_allowed = last + rate_limit.target;
-                    if now < next_allowed {
-                        self.violations += 1;
-                        self.total_violations += 1;
-                        if self.violations >= rate_limit.grace {
-                            self.violations = 0;
-                            self.blocked_until = Some(now + rate_limit.target);
-                            is_blocked = true;
-                        }
-                    }
-                }
+            // Python: if rate_violations > grace (note: strict >, not >=)
+            if self.violations > rate_limit.grace {
+                // Python: blocked_until = last + target + penalty
+                self.blocked_until = Some(last + rate_limit.target + rate_limit.penalty);
+                true
+            } else {
+                // Accepted — only update last_announce on accept
+                self.last_announce = Some(now);
+                false
             }
-        }
-
-        self.last_announce = Some(now);
+        } else {
+            // Still blocked — no extension, no state changes
+            true
+        };
 
         if is_blocked {
-            self.blocked_until.map(|blocked| blocked - now)
+            self.blocked_until.and_then(|b| b.checked_duration_since(now))
         } else {
             None
         }
@@ -182,54 +170,9 @@ impl AnnounceLimitEntry {
             destination: format!("{}", destination),
             last_announce: last_announce_unix,
             timestamps,
-            violations: self.total_violations,
+            violations: self.violations,
             blocked_until: blocked_until_unix,
         }
-    }
-
-    /// Calculate announces per hour based on timestamp history
-    #[allow(dead_code)]
-    pub fn announces_per_hour(&self) -> f64 {
-        if self.timestamp_history.is_empty() {
-            return 0.0;
-        }
-
-        let now = Instant::now();
-        let cutoff = now.checked_sub(TIMESTAMP_HISTORY_WINDOW).unwrap_or(now);
-
-        // Count timestamps within the last hour
-        let count = self
-            .timestamp_history
-            .iter()
-            .filter(|&&ts| ts >= cutoff)
-            .count();
-
-        // Calculate time span
-        if count <= 1 {
-            return count as f64;
-        }
-
-        // Get oldest and newest in range
-        let relevant: Vec<_> = self
-            .timestamp_history
-            .iter()
-            .filter(|&&ts| ts >= cutoff)
-            .collect();
-
-        if relevant.len() < 2 {
-            return count as f64;
-        }
-
-        let oldest = *relevant.first().unwrap();
-        let newest = *relevant.last().unwrap();
-        let span = (*newest - *oldest).as_secs_f64();
-
-        if span < 1.0 {
-            return count as f64;
-        }
-
-        // Normalize to hourly rate
-        (count as f64 / span) * 3600.0
     }
 }
 
@@ -249,12 +192,17 @@ impl AnnounceLimits {
     /// When `rate_limit` is `None`, the entry tracks timestamps for rate info
     /// queries but never blocks — matching Python behavior where interfaces
     /// without `announce_rate_target` set do not rate-limit.
+    ///
+    /// Refreshes the rate_limit on existing entries so that interface config
+    /// changes take effect immediately (Python reads rate params fresh each call).
     pub fn check(
         &mut self,
         destination: &AddressHash,
         rate_limit: Option<AnnounceRateLimit>,
     ) -> Option<Duration> {
         if let Some(entry) = self.limits.get_mut(destination) {
+            // Refresh rate limit from current interface config
+            entry.rate_limit = rate_limit;
             return entry.handle_announce();
         }
 
@@ -365,24 +313,166 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_history_capped_at_max() {
+        let mut limits = AnnounceLimits::new();
+        let dest = zero_address_hash();
+
+        // Make more announces than MAX_RATE_TIMESTAMPS
+        for _ in 0..20 {
+            limits.check(&dest, None);
+        }
+
+        let info = limits.get_rate_info(&dest).unwrap();
+        assert_eq!(info.timestamps.len(), MAX_RATE_TIMESTAMPS);
+    }
+
+    #[test]
     fn test_with_rate_limit_blocks_after_grace() {
         let mut limits = AnnounceLimits::new();
         let dest = zero_address_hash();
 
-        let rate_limit = || Some(AnnounceRateLimit {
-            target: Duration::from_secs(3600),
-            grace: 2,
-            penalty: Some(Duration::from_secs(7200)),
-        });
+        let rate_limit = || {
+            Some(AnnounceRateLimit {
+                target: Duration::from_secs(3600),
+                grace: 2,
+                penalty: Duration::from_secs(7200),
+            })
+        };
 
         // First announce: creates entry, no block
         assert!(limits.check(&dest, rate_limit()).is_none());
 
-        // Rapid announces: violation 1 (under grace of 2)
+        // Rapid announce: violation 1 (under grace of 2)
         assert!(limits.check(&dest, rate_limit()).is_none());
 
-        // Rapid announce: violation 2 = grace threshold, should block
+        // Rapid announce: violation 2 = grace threshold, but Python uses strict >
+        // so violations=2 with grace=2 does NOT block yet
+        assert!(limits.check(&dest, rate_limit()).is_none());
+
+        // Rapid announce: violation 3 > grace of 2, should block
         let blocked = limits.check(&dest, rate_limit());
         assert!(blocked.is_some());
+    }
+
+    #[test]
+    fn test_violation_decrement_when_compliant() {
+        // Verify that violations decrement when inter-arrival time meets target.
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit {
+            target: Duration::from_millis(10),
+            grace: 5,
+            penalty: Duration::from_secs(60),
+        }));
+
+        // First announce — accepted
+        assert!(entry.handle_announce().is_none());
+
+        // Rapid announce — violation 1
+        assert!(entry.handle_announce().is_none());
+        assert_eq!(entry.violations, 1);
+
+        // Wait for target to elapse, then announce — should decrement
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(entry.handle_announce().is_none());
+        assert_eq!(entry.violations, 0);
+    }
+
+    #[test]
+    fn test_no_block_extension() {
+        // Announces while blocked should NOT extend blocked_until.
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit {
+            target: Duration::from_millis(100),
+            grace: 0, // Block on first violation
+            penalty: Duration::from_millis(200),
+        }));
+
+        // First announce — accepted
+        assert!(entry.handle_announce().is_none());
+
+        // Second announce — rapid, violations=1 > grace=0, blocked
+        let blocked = entry.handle_announce();
+        assert!(blocked.is_some());
+
+        let original_blocked_until = entry.blocked_until.unwrap();
+
+        // Another announce while blocked — blocked_until must NOT change
+        let still_blocked = entry.handle_announce();
+        assert!(still_blocked.is_some());
+        assert_eq!(entry.blocked_until.unwrap(), original_blocked_until);
+    }
+
+    #[test]
+    fn test_last_announce_not_updated_when_blocked() {
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit {
+            target: Duration::from_millis(100),
+            grace: 0,
+            penalty: Duration::from_millis(200),
+        }));
+
+        // First announce — accepted, sets last_announce
+        assert!(entry.handle_announce().is_none());
+        let last_after_accept = entry.last_announce.unwrap();
+
+        // Rapid announce — triggers block
+        assert!(entry.handle_announce().is_some());
+
+        // last_announce should NOT have been updated (block path doesn't update it)
+        assert_eq!(entry.last_announce.unwrap(), last_after_accept);
+
+        // Another announce while blocked — still should not update
+        assert!(entry.handle_announce().is_some());
+        assert_eq!(entry.last_announce.unwrap(), last_after_accept);
+    }
+
+    #[test]
+    fn test_rate_limit_updated_on_existing_entry() {
+        let mut limits = AnnounceLimits::new();
+        let dest = zero_address_hash();
+
+        // First call with no rate limit — always accepts
+        assert!(limits.check(&dest, None).is_none());
+
+        // Second call changes to a rate limit — should now evaluate rate
+        let rate_limit = Some(AnnounceRateLimit {
+            target: Duration::from_secs(3600),
+            grace: 0,
+            penalty: Duration::from_secs(7200),
+        });
+
+        // This is a rapid announce with grace=0, so violation=1 > 0 => blocked
+        let result = limits.check(&dest, rate_limit);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_blocked_until_uses_last_plus_target_plus_penalty() {
+        // Verify blocked_until = last + target + penalty (not now + target).
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit {
+            target: Duration::from_millis(100),
+            grace: 0,
+            penalty: Duration::from_millis(200),
+        }));
+
+        // First announce — accepted
+        assert!(entry.handle_announce().is_none());
+        let last = entry.last_announce.unwrap();
+
+        // Second announce — triggers block
+        assert!(entry.handle_announce().is_some());
+
+        // blocked_until should be last + target + penalty = last + 300ms
+        let expected = last + Duration::from_millis(300);
+        let actual = entry.blocked_until.unwrap();
+
+        // Allow small tolerance for timing
+        let diff = if actual > expected {
+            actual - expected
+        } else {
+            expected - actual
+        };
+        assert!(
+            diff < Duration::from_millis(5),
+            "blocked_until should be last + target + penalty, diff={:?}",
+            diff
+        );
     }
 }

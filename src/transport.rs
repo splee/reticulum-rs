@@ -2726,7 +2726,7 @@ async fn handle_announce<'a>(
         meta.announce_rate_target.map(|target| AnnounceRateLimit {
             target: Duration::from_secs(target),
             grace: meta.announce_rate_grace.unwrap_or(0),
-            penalty: Some(Duration::from_secs(meta.announce_rate_penalty.unwrap_or(0))),
+            penalty: Duration::from_secs(meta.announce_rate_penalty.unwrap_or(0)),
         })
     } else {
         None
