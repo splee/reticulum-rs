@@ -1423,8 +1423,6 @@ impl AutoInterface {
 mod tests {
     use super::*;
 
-    // -- Config tests (unchanged from #71) --
-
     #[test]
     fn test_auto_interface_config_defaults() {
         let config = AutoInterfaceConfig::new();
