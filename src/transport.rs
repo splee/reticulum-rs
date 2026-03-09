@@ -98,6 +98,7 @@ use announce_queue::{AnnounceQueueManager, QueuedAnnounce};
 use link_manager::LinkManager;
 use path_manager::PathManager;
 use path_request::PathRequestManager;
+use reverse_table::ReverseTable;
 use tunnel::TunnelManager;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -210,6 +211,9 @@ struct TransportHandler {
 
     /// Receipt manager for tracking packet proofs
     receipt_manager: ReceiptManager,
+
+    /// Reverse table for routing proofs back via the correct interface path
+    reverse_table: ReverseTable,
 
     /// Tunnel manager for transport-level tunnel tracking and persistence
     tunnel_manager: TunnelManager,
@@ -355,6 +359,7 @@ impl Transport {
             single_out_destinations: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             receipt_manager: ReceiptManager::new(1024),
+            reverse_table: ReverseTable::new(),
             tunnel_manager: {
                 let mut tm = TunnelManager::new(Some(storage_path.clone()));
                 if let Err(e) = tm.load() {
@@ -2236,7 +2241,12 @@ impl TransportHandler {
     }
 }
 
-async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_proof<'a>(
+    packet: &Packet,
+    iface: AddressHash,
+    from_local_client: bool,
+    mut handler: MutexGuard<'a, TransportHandler>,
+) {
     log::trace!(
         "tp({}): handle proof for {}",
         handler.config.name,
@@ -2324,20 +2334,57 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
 
     let maybe_packet = handler.link_manager.handle_proof(packet);
 
-    if let Some((packet, iface)) = maybe_packet {
+    if let Some((packet, link_iface)) = maybe_packet {
         handler.send(TxMessage {
-            tx_type: TxMessageType::Direct(iface),
+            tx_type: TxMessageType::Direct(link_iface),
             packet
         })
         .await;
     }
+
+    // Route proof via reverse table (Python Transport.py lines 2091-2100).
+    // Only transport nodes and local-client traffic participate.
+    let is_transport_enabled = handler.config.retransmit;
+    let proof_for_local_client = if let Some(entry) = handler.reverse_table.get(&packet.destination) {
+        handler.iface_manager.lock().await.is_local_client(&entry.receiving_interface)
+    } else {
+        false
+    };
+
+    if (is_transport_enabled || from_local_client || proof_for_local_client)
+        && packet.context != PacketContext::LinkRequestProof
+    {
+        if let Some(reverse_entry) = handler.reverse_table.remove(&packet.destination) {
+            if iface == reverse_entry.outbound_interface {
+                log::trace!(
+                    "tp({}): proof received on correct interface, routing via reverse table to {}",
+                    handler.config.name,
+                    reverse_entry.receiving_interface
+                );
+                handler.send(TxMessage {
+                    tx_type: TxMessageType::Direct(reverse_entry.receiving_interface),
+                    packet: *packet,
+                }).await;
+            } else {
+                log::debug!(
+                    "tp({}): proof received on wrong interface (expected {}, got {}), not transporting",
+                    handler.config.name,
+                    reverse_entry.outbound_interface,
+                    iface
+                );
+            }
+        }
+    }
 }
 
+/// Forward a packet to its next hop via the path table.
+///
+/// Returns the outbound interface address if forwarding succeeded, or None.
 async fn send_to_next_hop<'a>(
     packet: &Packet,
     handler: &MutexGuard<'a, TransportHandler>,
     lookup: Option<AddressHash>
-) -> bool {
+) -> Option<AddressHash> {
     let (packet, maybe_iface) = handler.path_manager.handle_inbound_packet(
         packet,
         lookup
@@ -2351,7 +2398,7 @@ async fn send_to_next_hop<'a>(
         .await;
     }
 
-    maybe_iface.is_some()
+    maybe_iface
 }
 
 async fn handle_keepalive_response<'a>(
@@ -2712,12 +2759,18 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client:
 
         let lookup = handler.link_manager.original_destination(&packet.destination);
         if lookup.is_some() {
-            let sent = send_to_next_hop(packet, &handler, lookup).await;
+            let outbound = send_to_next_hop(packet, &handler, lookup).await;
+
+            // Record in reverse table for proof routing back
+            if let Some(outbound_iface) = outbound {
+                let key = AddressHash::new_from_hash(&packet.hash());
+                handler.reverse_table.insert(key, iface, outbound_iface);
+            }
 
             log::trace!(
                 "tp({}): {} packet to remote link {}",
                 handler.config.name,
-                if sent { "forwarded" } else { "could not forward" },
+                if outbound.is_some() { "forwarded" } else { "could not forward" },
                 packet.destination
             );
         }
@@ -2753,7 +2806,12 @@ async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client:
                 handler.send_packet(proof).await;
             }
         } else {
-            data_handled = send_to_next_hop(packet, &handler, None).await;
+            // Forward to next hop and record in reverse table for proof routing
+            if let Some(outbound_iface) = send_to_next_hop(packet, &handler, None).await {
+                let key = AddressHash::new_from_hash(&packet.hash());
+                handler.reverse_table.insert(key, iface, outbound_iface);
+                data_handled = true;
+            }
         }
     }
 
@@ -3369,7 +3427,16 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
 }
 
 async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
-    handler.iface_manager.lock().await.cleanup();
+    // Collect active interface addresses before cleanup removes cancelled ones,
+    // then clean up stale reverse table entries referencing dead interfaces
+    // (Python Transport.py lines 606-615).
+    let active = {
+        let mut iface_mgr = handler.iface_manager.lock().await;
+        let active = iface_mgr.active_interface_addresses();
+        iface_mgr.cleanup();
+        active
+    };
+    handler.reverse_table.cleanup_stale_interfaces(&active);
 
     // Clean up expired tunnels and per-path expiry (Python: Transport.py:733-810)
     let active_ifaces = handler.get_active_interface_hashes().await;
@@ -3551,19 +3618,15 @@ async fn manage_transport(
                         }
 
                         // Determine whether to broadcast this packet.
-                        // Python never broadcasts LinkRequests or LinkRequestProofs —
-                        // LinkRequests are routed via path table (send_to_next_hop),
-                        // and LRPROOFs via link table (send_backwards).
-                        // Other proofs (receipt proofs) are broadcast here since
-                        // the reverse table is not yet implemented.
-                        // Announces are handled separately in handle_announce.
-                        let is_link_request_proof = packet.header.packet_type == PacketType::Proof
-                            && packet.context == PacketContext::LinkRequestProof;
-                        if handler.config.broadcast
-                            && packet.header.packet_type != PacketType::Announce
-                            && packet.header.packet_type != PacketType::LinkRequest
-                            && !is_link_request_proof
-                        {
+                        // Python never broadcasts Announces (handled separately),
+                        // LinkRequests (routed via path table), or Proofs
+                        // (link proofs routed via link table, receipt proofs via
+                        // reverse table).
+                        let is_broadcast_type = !matches!(
+                            packet.header.packet_type,
+                            PacketType::Announce | PacketType::LinkRequest | PacketType::Proof
+                        );
+                        if handler.config.broadcast && is_broadcast_type {
                             handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet }).await;
                         }
 
@@ -3579,7 +3642,7 @@ async fn manage_transport(
                                 message.address,
                                 handler
                             ).await,
-                            PacketType::Proof => handle_proof(&packet, handler).await,
+                            PacketType::Proof => handle_proof(&packet, message.address, from_local_client, handler).await,
                             PacketType::Data => handle_data(&packet, message.address, from_local_client, handler).await,
                         }
                     }
@@ -3678,6 +3741,9 @@ async fn manage_transport(
                             .release(INTERVAL_KEEP_PACKET_CACHED);
 
                         handler.link_manager.remove_stale();
+
+                        // Remove expired reverse table entries (>480s)
+                        handler.reverse_table.cleanup();
                     },
                 }
             }
@@ -4954,7 +5020,8 @@ mod tests {
 
         // This would panic with "Cannot block the current thread from within
         // a runtime" before the blocking_lock() -> lock().await fix.
-        handle_proof(&proof_packet, handler.lock().await).await;
+        let test_iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_proof(&proof_packet, test_iface, false, handler.lock().await).await;
 
         // Receipt should now be delivered
         let receipt_guard = receipt_arc.lock().await;
@@ -5016,7 +5083,8 @@ mod tests {
         proof_packet.destination = AddressHash::new(receipt_key);
         proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
 
-        handle_proof(&proof_packet, handler.lock().await).await;
+        let test_iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_proof(&proof_packet, test_iface, false, handler.lock().await).await;
 
         let receipt_guard = receipt_arc.lock().await;
         assert!(
@@ -5058,7 +5126,8 @@ mod tests {
         proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
 
         // No destination registered — should complete without panic
-        handle_proof(&proof_packet, handler.lock().await).await;
+        let test_iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_proof(&proof_packet, test_iface, false, handler.lock().await).await;
 
         let receipt_guard = receipt_arc.lock().await;
         assert!(
@@ -5112,7 +5181,8 @@ mod tests {
         proof_packet.destination = address_hash;
         proof_packet.data = PacketDataBuffer::new_from_slice(&proof_data);
 
-        handle_proof(&proof_packet, handler.lock().await).await;
+        let test_iface = AddressHash::new_from_slice(&[0xFFu8; 32]);
+        handle_proof(&proof_packet, test_iface, false, handler.lock().await).await;
 
         let receipt_guard = receipt_arc.lock().await;
         assert!(

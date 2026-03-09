@@ -363,6 +363,18 @@ impl InterfaceManager {
         self.ifaces.iter().any(|iface| &iface.address == address && iface.is_local_client)
     }
 
+    /// Get all active interface addresses (network + local client).
+    ///
+    /// Used for reverse table stale-entry cleanup — both network and local
+    /// client interfaces may appear in reverse entries.
+    pub fn active_interface_addresses(&self) -> std::collections::HashSet<AddressHash> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .map(|iface| iface.address)
+            .collect()
+    }
+
     /// Get the list of active network interface addresses (excludes local clients).
     ///
     /// Used for per-interface announce queue management (ANNOUNCE_CAP).
