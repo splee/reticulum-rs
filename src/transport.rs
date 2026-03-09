@@ -3528,11 +3528,11 @@ async fn manage_transport(
                         // LinkRequests (routed via path table), or Proofs
                         // (link proofs routed via link table, receipt proofs via
                         // reverse table).
-                        if handler.config.broadcast
-                            && packet.header.packet_type != PacketType::Announce
-                            && packet.header.packet_type != PacketType::LinkRequest
-                            && packet.header.packet_type != PacketType::Proof
-                        {
+                        let is_broadcast_type = !matches!(
+                            packet.header.packet_type,
+                            PacketType::Announce | PacketType::LinkRequest | PacketType::Proof
+                        );
+                        if handler.config.broadcast && is_broadcast_type {
                             handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet }).await;
                         }
 
