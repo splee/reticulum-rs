@@ -242,6 +242,32 @@ impl InterfaceManager {
         self.rx_recv.clone()
     }
 
+    /// Get a clone of the shared rx_sender for forwarding data to transport.
+    /// Used by AutoInterface to forward received data without going through InterfaceChannel.
+    pub fn rx_sender(&self) -> InterfaceRxSender {
+        self.rx_send.clone()
+    }
+
+    /// Get the global cancel token for coordinated shutdown.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Spawn an interface and return both its address hash and stop token.
+    /// The stop token can be used to teardown the interface individually.
+    pub fn spawn_with_stop<T: Interface, F, R>(&mut self, inner: T, worker: F, name: &str) -> (AddressHash, CancellationToken)
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        let context = self.new_context(inner, name);
+        let address = *context.channel.address();
+        let stop = context.channel.stop.clone();
+        task::spawn(worker(context));
+        (address, stop)
+    }
+
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
     }

@@ -663,6 +663,20 @@ impl Reticulum {
                         );
                     }
                 }
+                "AutoInterface" | "auto" => {
+                    use crate::iface::auto_interface::{AutoInterface, AutoInterfaceConfig};
+
+                    let auto_config = AutoInterfaceConfig::new().with_config(&iface_config);
+                    let name = format!("AutoInterface[{}]", auto_config.group_id);
+                    let auto = std::sync::Arc::new(AutoInterface::new(auto_config));
+                    let iface_mgr = transport.iface_manager();
+                    let cancel = iface_mgr.lock().await.cancel_token();
+                    tokio::spawn(async move {
+                        if let Err(e) = auto.run(cancel, Some(iface_mgr)).await {
+                            log::error!("{}: error: {}", name, e);
+                        }
+                    });
+                }
                 "KISSInterface" | "kiss" => {
                     log::info!(
                         "KISSInterface '{}' recognized but serial I/O not yet implemented (see #58)",

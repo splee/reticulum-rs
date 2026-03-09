@@ -17,20 +17,41 @@
 //! - Unicast discovery (recv on `discovery_port + 1`)
 //! - Data receive (recv on `data_port`, with MifDeque deduplication)
 //! - A single peer job task for expiry, reverse peering, and echo checks.
+//! - A peer spawn task that processes PeerCommand messages to spawn/teardown
+//!   peer interfaces via InterfaceManager.
+//!
+//! ## Data Flow
+//!
+//! ```text
+//! Incoming (peer → transport):
+//!   UDP datagram → parent data_recv_task → MifDeque dedup →
+//!   Packet::deserialize → RxMessage{peer_hash} → transport rx_channel
+//!
+//! Outgoing (transport → peer):
+//!   Transport → InterfaceManager::send() → peer tx_channel →
+//!   AutoInterfacePeer::spawn TX loop → packet.serialize() →
+//!   UdpSocket::send_to(peer_sockaddr)
+//! ```
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 
+use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::config::InterfaceConfig;
 use crate::hash::{AddressHash, Hash};
-use crate::iface::Interface;
+use crate::iface::stats::InterfaceMetadata;
+use crate::iface::{
+    InterfaceContext, InterfaceManager, InterfaceRegistry, InterfaceRxSender, Interface, RxMessage,
+};
+use crate::serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Constants — matched to Python AutoInterface.py
@@ -86,6 +107,148 @@ pub const MULTI_IF_DEQUE_TTL: Duration = Duration::from_millis(750);
 /// Multiplier applied to announce_interval to compute reverse peering interval.
 /// (Python: peer[2] checked against ANNOUNCE_INTERVAL * 3.25)
 const REVERSE_PEERING_MULTIPLIER: f64 = 3.25;
+
+// ---------------------------------------------------------------------------
+// Peer management types
+// ---------------------------------------------------------------------------
+
+/// Commands sent from sync add_peer/run_peer_jobs to the async peer_spawn_task.
+/// Uses an unbounded channel because add_peer() is called from a sync RwLock
+/// context and cannot await.
+enum PeerCommand {
+    /// Spawn a new peer interface for the discovered peer.
+    Spawn { addr: String, ifname: String },
+    /// Teardown an expired peer interface.
+    Teardown { addr: String },
+}
+
+/// Tracking info for a spawned peer interface.
+struct SpawnedPeerInfo {
+    /// Interface address hash (matches InterfaceManager's channel address).
+    address: AddressHash,
+    /// Stop token to individually teardown this peer's worker task.
+    stop: CancellationToken,
+    /// Shared metadata for stats tracking.
+    metadata: Arc<InterfaceMetadata>,
+}
+
+/// Spawned peer interface — one per discovered peer.
+///
+/// Handles TX only (outbound packets from transport → UDP to peer).
+/// RX is handled centrally by the parent AutoInterface's data_recv_task,
+/// which forwards packets using this peer's AddressHash as the source.
+///
+/// This matches Python's `AutoInterfacePeer` which is a full Interface subclass,
+/// but in Rust we split RX (parent) from TX (peer) for efficiency.
+pub struct AutoInterfacePeer {
+    /// Peer IPv6 address (descoped, e.g. "fe80::1234:5678")
+    addr: String,
+    /// OS interface name this peer was discovered on
+    ifname: String,
+    /// OS-level scope ID for SocketAddrV6
+    scope_id: u32,
+    /// Data port for UDP sends
+    data_port: u16,
+    /// Shared outbound UDP socket (one per AutoInterface)
+    outbound_socket: Arc<tokio::net::UdpSocket>,
+    /// Parent interface's address hash (for metadata tracking)
+    parent_address: AddressHash,
+}
+
+impl Interface for AutoInterfacePeer {
+    fn mtu() -> usize {
+        HW_MTU
+    }
+}
+
+impl AutoInterfacePeer {
+    /// TX-only worker for a spawned peer interface.
+    ///
+    /// Reads outbound packets from the tx_channel (provided by InterfaceManager),
+    /// serializes them, and sends via UDP to this specific peer's address.
+    /// No HDLC framing — raw serialized bytes go directly into UDP datagrams
+    /// (UDP provides message framing).
+    pub async fn spawn(context: InterfaceContext<Self>) {
+        // Extract fields from inner
+        let (addr, ifname, scope_id, data_port, outbound_socket, parent_address) = {
+            let inner = context.inner.lock().await;
+            (
+                inner.addr.clone(),
+                inner.ifname.clone(),
+                inner.scope_id,
+                inner.data_port,
+                inner.outbound_socket.clone(),
+                inner.parent_address,
+            )
+        };
+
+        let iface_address = *context.channel.address();
+        let peer_name = format!("AutoInterfacePeer[{}]", addr);
+
+        // Parse peer IPv6 address for socket sends
+        let peer_ipv6: Ipv6Addr = match addr.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                log::error!("{}: invalid IPv6 address: {}", peer_name, e);
+                return;
+            }
+        };
+        let peer_sockaddr = SocketAddrV6::new(peer_ipv6, data_port, 0, scope_id);
+
+        // Create and register metadata
+        let metadata = Arc::new(
+            InterfaceMetadata::new(
+                &peer_name,
+                &format!("peer:{}", addr),
+                "AutoInterfacePeer",
+                &addr,
+            )
+            .with_parent(parent_address)
+            .with_hw_mtu(HW_MTU)
+            .with_bitrate(BITRATE_GUESS)
+            .with_direction(true, true),
+        );
+
+        if let Some(ref reg) = context.interface_registry {
+            reg.register(iface_address, metadata.clone()).await;
+        }
+
+        metadata.set_online(true);
+        log::info!("{}: spawned on {} (TX → {})", peer_name, ifname, peer_sockaddr);
+
+        // TX loop: read from tx_channel, serialize, send UDP
+        let (_, mut tx_channel) = context.channel.split();
+        let mut tx_buffer = [0u8; HW_MTU + 128];
+
+        loop {
+            tokio::select! {
+                _ = context.cancel.cancelled() => break,
+                msg = tx_channel.recv() => {
+                    match msg {
+                        Some(message) => {
+                            let packet = message.packet;
+                            let mut output = OutputBuffer::new(&mut tx_buffer);
+                            if packet.serialize(&mut output).is_ok() {
+                                let data = output.as_slice();
+                                metadata.add_tx_bytes(data.len() as u64);
+                                if let Err(e) = outbound_socket.send_to(data, peer_sockaddr).await {
+                                    log::debug!("{}: send error: {}", peer_name, e);
+                                }
+                            }
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            }
+        }
+
+        metadata.set_online(false);
+        if let Some(ref reg) = context.interface_registry {
+            reg.unregister(&iface_address).await;
+        }
+        log::info!("{}: stopped", peer_name);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -659,6 +822,12 @@ pub enum AutoInterfaceState {
 /// Uses `Arc<Self>` with interior mutability for shared access across
 /// async tasks. All `RwLock`/`Mutex` fields are held only in synchronous
 /// blocks, never across `.await` points.
+///
+/// AutoInterface itself is NOT registered as a routable interface with
+/// InterfaceManager — it doesn't transmit data directly. Instead, each
+/// discovered peer gets a spawned `AutoInterfacePeer` interface that IS
+/// registered for routing. The parent handles RX centrally, while each
+/// peer handles its own TX.
 pub struct AutoInterface {
     /// Configuration (immutable after construction)
     config: AutoInterfaceConfig,
@@ -684,6 +853,16 @@ pub struct AutoInterface {
     online: AtomicBool,
     /// Set when carrier state changes (for external polling)
     carrier_changed: AtomicBool,
+
+    // -- Peer management fields (initialized by run()) --
+
+    /// Spawned peer interfaces keyed by descoped IPv6 address.
+    spawned_interfaces: RwLock<HashMap<String, SpawnedPeerInfo>>,
+    /// Shared outbound UDP socket for all peers (lazy-init via run()).
+    outbound_socket: tokio::sync::OnceCell<Arc<tokio::net::UdpSocket>>,
+    /// Command channel sender for async peer spawn/teardown.
+    /// Set once by run(); add_peer/run_peer_jobs send commands through this.
+    peer_command_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<PeerCommand>>,
 }
 
 impl AutoInterface {
@@ -702,12 +881,15 @@ impl AutoInterface {
             final_init_done: AtomicBool::new(false),
             online: AtomicBool::new(false),
             carrier_changed: AtomicBool::new(false),
+            spawned_interfaces: RwLock::new(HashMap::new()),
+            outbound_socket: tokio::sync::OnceCell::new(),
+            peer_command_tx: std::sync::OnceLock::new(),
         }
     }
 
     /// Get current lifecycle state.
     pub fn state(&self) -> AutoInterfaceState {
-        *self.state.read().unwrap()
+        *self.state.read().expect("state lock poisoned")
     }
 
     /// Whether the interface has completed initialization and is online.
@@ -727,17 +909,17 @@ impl AutoInterface {
 
     /// Get snapshot of all discovered peers.
     pub fn peers(&self) -> Vec<Peer> {
-        self.peers.read().unwrap().values().cloned().collect()
+        self.peers.read().expect("peers lock poisoned").values().cloned().collect()
     }
 
     /// Get peer count.
     pub fn peer_count(&self) -> usize {
-        self.peers.read().unwrap().len()
+        self.peers.read().expect("peers lock poisoned").len()
     }
 
     /// Check if a peer exists by address string.
     pub fn has_peer(&self, addr: &str) -> bool {
-        self.peers.read().unwrap().contains_key(addr)
+        self.peers.read().expect("peers lock poisoned").contains_key(addr)
     }
 
     /// Get the multicast discovery socket address.
@@ -747,12 +929,12 @@ impl AutoInterface {
 
     /// Get all link-local addresses (descoped).
     pub fn link_local_addresses(&self) -> Vec<String> {
-        self.link_local_addresses.read().unwrap().clone()
+        self.link_local_addresses.read().expect("link_local_addresses lock poisoned").clone()
     }
 
     /// Check if an address is one of our own.
     pub fn is_local_address(&self, addr: &str) -> bool {
-        self.link_local_addresses.read().unwrap().contains(&addr.to_string())
+        self.link_local_addresses.read().expect("link_local_addresses lock poisoned").contains(&addr.to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -767,54 +949,64 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py add_peer() lines 513-571.
     fn add_peer(&self, addr: &str, ifname: &str) {
         // Check if this is our own multicast echo
-        {
-            let link_locals = self.link_local_addresses.read().unwrap();
-            if link_locals.iter().any(|a| a == addr) {
-                drop(link_locals);
+        let is_own_echo = {
+            let link_locals = self.link_local_addresses.read()
+                .expect("link_local_addresses lock poisoned");
+            link_locals.iter().any(|a| a == addr)
+        };
 
-                // Find which adopted interface this address belongs to
-                let echo_ifname = {
-                    let adopted = self.adopted_interfaces.read().unwrap();
-                    adopted
-                        .iter()
-                        .find(|(_, ai)| ai.link_local_addr == addr)
-                        .map(|(name, _)| name.clone())
-                };
+        if is_own_echo {
+            // Find which adopted interface this address belongs to
+            let echo_ifname = {
+                let adopted = self.adopted_interfaces.read()
+                    .expect("adopted_interfaces lock poisoned");
+                adopted
+                    .iter()
+                    .find(|(_, ai)| ai.link_local_addr == addr)
+                    .map(|(name, _)| name.clone())
+            };
 
-                if let Some(echo_ifname) = echo_ifname {
-                    self.multicast_echoes
-                        .write()
-                        .unwrap()
-                        .insert(echo_ifname.clone(), Instant::now());
-                    self.initial_echoes
-                        .write()
-                        .unwrap()
-                        .entry(echo_ifname)
-                        .or_insert_with(Instant::now);
-                } else {
-                    log::warn!(
-                        "AutoInterface: received echo from own address {} but no matching interface",
-                        addr
-                    );
-                }
-                return;
+            if let Some(echo_ifname) = echo_ifname {
+                self.multicast_echoes
+                    .write()
+                    .expect("multicast_echoes lock poisoned")
+                    .insert(echo_ifname.clone(), Instant::now());
+                self.initial_echoes
+                    .write()
+                    .expect("initial_echoes lock poisoned")
+                    .entry(echo_ifname)
+                    .or_insert_with(Instant::now);
+            } else {
+                log::warn!(
+                    "AutoInterface: received echo from own address {} but no matching interface",
+                    addr
+                );
             }
+            return;
         }
 
         // Remote peer — add or refresh
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().expect("peers lock poisoned");
         if let Some(peer) = peers.get_mut(addr) {
             peer.last_heard = Instant::now();
         } else {
             log::debug!("AutoInterface: added peer {} on {}", addr, ifname);
             peers.insert(addr.to_string(), Peer::new(addr, ifname));
-            // TODO: Create AutoInterfacePeer spawned interface for transport integration
+
+            // Send spawn command to the async peer_spawn_task (if running).
+            // Gracefully skips when run() hasn't been called (standalone tests).
+            if let Some(tx) = self.peer_command_tx.get() {
+                let _ = tx.send(PeerCommand::Spawn {
+                    addr: addr.to_string(),
+                    ifname: ifname.to_string(),
+                });
+            }
         }
     }
 
     /// Refresh a peer's last_heard timestamp (for data traffic).
     fn refresh_peer(&self, addr: &str) {
-        if let Some(peer) = self.peers.write().unwrap().get_mut(addr) {
+        if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(addr) {
             peer.last_heard = Instant::now();
         }
     }
@@ -829,7 +1021,7 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py peer_announce() lines 491-507.
     fn peer_announce(&self, ifname: &str) -> std::io::Result<()> {
         let (link_local_addr, scope_id) = {
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
             let ai = adopted.get(ifname).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
             })?;
@@ -862,7 +1054,7 @@ impl AutoInterface {
     /// Matches Python AutoInterface.py reverse_announce() lines 477-489.
     fn reverse_announce(&self, ifname: &str, peer_addr: &str) -> std::io::Result<()> {
         let (link_local_addr, scope_id) = {
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
             let ai = adopted.get(ifname).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "interface not adopted")
             })?;
@@ -908,13 +1100,15 @@ impl AutoInterface {
     fn run_peer_jobs(&self) {
         let now = Instant::now();
 
-        // 1. Expire stale peers
+        // 1. Expire stale peers and send teardown commands for spawned interfaces
         {
-            let mut peers = self.peers.write().unwrap();
+            let mut peers = self.peers.write().expect("peers lock poisoned");
             let before = peers.len();
+            let mut expired_addrs = Vec::new();
             peers.retain(|addr, peer| {
                 if now.duration_since(peer.last_heard) > self.config.peering_timeout {
                     log::debug!("AutoInterface: peer {} on {} timed out", addr, peer.ifname);
+                    expired_addrs.push(addr.clone());
                     false
                 } else {
                     true
@@ -928,12 +1122,19 @@ impl AutoInterface {
                     peers.len()
                 );
             }
+
+            // Send teardown commands for expired peers (outside the peers lock)
+            if let Some(tx) = self.peer_command_tx.get() {
+                for addr in expired_addrs {
+                    let _ = tx.send(PeerCommand::Teardown { addr });
+                }
+            }
         }
 
         // 2. Reverse peering — send announces to peers we haven't contacted recently
         let reverse_interval = self.config.reverse_peering_interval();
         let peers_needing_reverse: Vec<(String, String)> = {
-            let peers = self.peers.read().unwrap();
+            let peers = self.peers.read().expect("peers lock poisoned");
             peers
                 .iter()
                 .filter(|(_, peer)| now.duration_since(peer.last_outbound) > reverse_interval)
@@ -951,17 +1152,17 @@ impl AutoInterface {
                 );
             }
             // Update last_outbound regardless of success (avoid tight retry loops)
-            if let Some(peer) = self.peers.write().unwrap().get_mut(peer_addr.as_str()) {
+            if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(peer_addr.as_str()) {
                 peer.last_outbound = Instant::now();
             }
         }
 
         // 3. Multicast echo check — carrier detection
         {
-            let echoes = self.multicast_echoes.read().unwrap();
-            let initial = self.initial_echoes.read().unwrap();
-            let mut timed_out = self.timed_out_interfaces.write().unwrap();
-            let adopted = self.adopted_interfaces.read().unwrap();
+            let echoes = self.multicast_echoes.read().expect("multicast_echoes lock poisoned");
+            let initial = self.initial_echoes.read().expect("initial_echoes lock poisoned");
+            let mut timed_out = self.timed_out_interfaces.write().expect("timed_out_interfaces lock poisoned");
+            let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
 
             for ifname in adopted.keys() {
                 let was_timed_out = timed_out.get(ifname).copied().unwrap_or(false);
@@ -1061,22 +1262,49 @@ fn create_udp_socket(
     tokio::net::UdpSocket::from_std(std_socket)
 }
 
+/// Create an unbound IPv6 UDP socket for outgoing peer data.
+///
+/// This matches Python's `outbound_udp_socket` — a single socket shared by all
+/// peers for sending data. The OS selects the source address based on routing.
+/// Using `send_to` with a `SocketAddrV6` that includes the correct `scope_id`
+/// ensures the packet goes out the right OS interface for link-local addresses.
+fn create_outbound_socket() -> std::io::Result<Arc<tokio::net::UdpSocket>> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    // Bind to unspecified address with OS-assigned port (matching Python's unbound socket)
+    let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
+    Ok(Arc::new(tokio_socket))
+}
+
 // ---------------------------------------------------------------------------
 // Async task architecture
 // ---------------------------------------------------------------------------
 
-use std::sync::Arc;
-
 impl AutoInterface {
     /// Main entry point — enumerate interfaces, set up sockets, and run discovery.
     ///
-    /// This method spawns per-interface discovery tasks and a shared peer job task,
-    /// waits for the initial peering delay, then marks the interface online.
+    /// This method spawns per-interface discovery tasks, a shared peer job task,
+    /// and a peer spawn task that processes PeerCommand messages. Waits for the
+    /// initial peering delay, then marks the interface online.
     ///
-    /// Follows the TCP server's async pattern: takes a CancellationToken for
-    /// graceful shutdown and joins all spawned tasks on exit.
-    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> std::io::Result<()> {
-        *self.state.write().unwrap() = AutoInterfaceState::Starting;
+    /// # Arguments
+    /// * `cancel` — Cancellation token for graceful shutdown.
+    /// * `iface_manager` — Optional InterfaceManager for spawning peer interfaces.
+    ///   When None (standalone tests), discovery still works but peers are not
+    ///   registered with transport and data is not forwarded.
+    pub async fn run(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
+    ) -> std::io::Result<()> {
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Starting;
 
         // 1. Enumerate and adopt interfaces
         let interfaces = enumerate_interfaces(
@@ -1086,13 +1314,13 @@ impl AutoInterface {
 
         if interfaces.is_empty() {
             log::warn!("AutoInterface: no suitable network interfaces found");
-            *self.state.write().unwrap() = AutoInterfaceState::Error;
+            *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Error;
             return Ok(());
         }
 
         {
-            let mut adopted = self.adopted_interfaces.write().unwrap();
-            let mut link_locals = self.link_local_addresses.write().unwrap();
+            let mut adopted = self.adopted_interfaces.write().expect("adopted_interfaces lock poisoned");
+            let mut link_locals = self.link_local_addresses.write().expect("link_local_addresses lock poisoned");
             for iface in &interfaces {
                 let descoped = descope_linklocal(&iface.link_local_addr.to_string());
                 log::info!(
@@ -1114,10 +1342,67 @@ impl AutoInterface {
             }
         }
 
+        // 2. Set up transport integration (if iface_manager is provided)
+        let interface_name = format!("AutoInterface[{}]", self.config.group_id);
+        let parent_address =
+            AddressHash::new_from_hash(&Hash::new_from_slice(interface_name.as_bytes()));
+        let rx_sender: Option<InterfaceRxSender>;
+        let interface_registry: Option<Arc<InterfaceRegistry>>;
+
+        if let Some(ref mgr) = iface_manager {
+            // Extract transport integration handles from InterfaceManager
+            {
+                let mgr_locked = mgr.lock().await;
+                rx_sender = Some(mgr_locked.rx_sender());
+                interface_registry = mgr_locked.interface_registry();
+            }
+
+            // Register parent metadata (IN=true, OUT=false — parent receives but doesn't transmit)
+            if let Some(ref reg) = interface_registry {
+                let parent_meta = Arc::new(
+                    InterfaceMetadata::new(
+                        &interface_name,
+                        &format!("auto:{}", self.config.group_id),
+                        "AutoInterface",
+                        "",
+                    )
+                    .with_hw_mtu(HW_MTU)
+                    .with_bitrate(self.config.configured_bitrate.unwrap_or(BITRATE_GUESS))
+                    .with_direction(true, false),
+                );
+                parent_meta.set_online(true);
+                reg.register(parent_address, parent_meta).await;
+            }
+
+            // Set up PeerCommand channel
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PeerCommand>();
+            let _ = self.peer_command_tx.set(cmd_tx);
+
+            // Spawn peer_spawn_task
+            let auto_for_spawn = Arc::clone(&self);
+            let cancel_for_spawn = cancel.clone();
+            let mgr_for_spawn = Arc::clone(mgr);
+            let reg_for_spawn = interface_registry.clone();
+            tokio::spawn(async move {
+                auto_for_spawn
+                    .peer_spawn_task(
+                        cmd_rx,
+                        mgr_for_spawn,
+                        reg_for_spawn,
+                        parent_address,
+                        &cancel_for_spawn,
+                    )
+                    .await;
+            });
+        } else {
+            rx_sender = None;
+            interface_registry = None;
+        }
+
         let mcast_addr = self.config.multicast_discovery_address();
         let mut task_handles = Vec::new();
 
-        // 2. Create sockets and spawn per-interface tasks
+        // 3. Create sockets and spawn per-interface tasks
         for iface in &interfaces {
             // Multicast discovery socket
             match create_multicast_socket(
@@ -1173,8 +1458,10 @@ impl AutoInterface {
                     let auto = Arc::clone(&self);
                     let cancel = cancel.clone();
                     let ifname = iface.name.clone();
+                    let rx_tx = rx_sender.clone();
                     task_handles.push(tokio::spawn(async move {
-                        auto.data_recv_task(&ifname, sock, &cancel).await;
+                        auto.data_recv_task(&ifname, sock, &cancel, rx_tx, parent_address)
+                            .await;
                     }));
                 }
                 Err(e) => {
@@ -1187,7 +1474,7 @@ impl AutoInterface {
             }
         }
 
-        // 3. Spawn shared peer job task
+        // 4. Spawn shared peer job task
         {
             let auto = Arc::clone(&self);
             let cancel = cancel.clone();
@@ -1196,13 +1483,13 @@ impl AutoInterface {
             }));
         }
 
-        // 4. Initial peering delay — matches Python's final_init()
+        // 5. Initial peering delay — matches Python's final_init()
         let init_delay =
             Duration::from_secs_f64(self.config.announce_interval.as_secs_f64() * 1.2);
         tokio::select! {
             _ = cancel.cancelled() => {
                 // Cancelled during init — clean up
-                *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+                *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Stopped;
                 for handle in task_handles {
                     let _ = handle.await;
                 }
@@ -1213,18 +1500,32 @@ impl AutoInterface {
 
         self.final_init_done.store(true, Ordering::SeqCst);
         self.online.store(true, Ordering::SeqCst);
-        *self.state.write().unwrap() = AutoInterfaceState::Running;
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Running;
         log::info!(
             "AutoInterface: online, {} interfaces adopted",
             interfaces.len()
         );
 
-        // 5. Wait for cancellation
+        // 6. Wait for cancellation
         cancel.cancelled().await;
 
-        // 6. Shutdown
+        // 7. Shutdown
         self.online.store(false, Ordering::SeqCst);
-        *self.state.write().unwrap() = AutoInterfaceState::Stopped;
+        *self.state.write().expect("state lock poisoned") = AutoInterfaceState::Stopped;
+
+        // Teardown all spawned peers
+        {
+            let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
+            for (_, info) in spawned.iter() {
+                info.stop.cancel();
+                info.metadata.set_online(false);
+            }
+        }
+
+        // Unregister parent from interface registry
+        if let Some(ref reg) = interface_registry {
+            reg.unregister(&parent_address).await;
+        }
 
         for handle in task_handles {
             let _ = handle.await;
@@ -1232,6 +1533,153 @@ impl AutoInterface {
 
         log::info!("AutoInterface: shut down");
         Ok(())
+    }
+
+    /// Async task that processes PeerCommand messages to spawn and teardown
+    /// peer interfaces via InterfaceManager.
+    ///
+    /// This task bridges the sync add_peer()/run_peer_jobs() world (which holds
+    /// std::sync::RwLock and cannot await) with the async InterfaceManager::spawn().
+    async fn peer_spawn_task(
+        self: &Arc<Self>,
+        mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PeerCommand>,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+        interface_registry: Option<Arc<InterfaceRegistry>>,
+        parent_address: AddressHash,
+        cancel: &CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(PeerCommand::Spawn { addr, ifname }) => {
+                            // Check if already spawned
+                            {
+                                let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
+                                if spawned.contains_key(&addr) {
+                                    continue;
+                                }
+                            }
+
+                            // Look up scope_id from adopted interfaces
+                            let scope_id = {
+                                let adopted = self.adopted_interfaces.read().expect("adopted_interfaces lock poisoned");
+                                match adopted.get(&ifname) {
+                                    Some(ai) => ai.scope_id,
+                                    None => {
+                                        log::warn!(
+                                            "AutoInterface: cannot spawn peer {} — interface {} not adopted",
+                                            addr,
+                                            ifname
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            // Initialize the shared outbound socket (lazy, once)
+                            let outbound_socket = match self.outbound_socket.get_or_try_init(|| async {
+                                create_outbound_socket()
+                            }).await {
+                                Ok(sock) => sock.clone(),
+                                Err(e) => {
+                                    log::error!(
+                                        "AutoInterface: failed to create outbound socket: {}",
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Create the peer interface
+                            let peer = AutoInterfacePeer {
+                                addr: addr.clone(),
+                                ifname: ifname.clone(),
+                                scope_id,
+                                data_port: self.config.data_port,
+                                outbound_socket,
+                                parent_address,
+                            };
+
+                            let peer_name = format!("AutoInterfacePeer[{}]", addr);
+
+                            // Spawn via InterfaceManager — this registers the channel
+                            // and starts the TX worker task
+                            let (address, stop) = {
+                                let mut mgr = iface_manager.lock().await;
+                                mgr.spawn_with_stop(peer, AutoInterfacePeer::spawn, &peer_name)
+                            };
+
+                            // Build metadata for tracking (mirrors what spawn() creates internally).
+                            // We need our own reference for RX stats updates in data_recv_task.
+                            let metadata = Arc::new(
+                                InterfaceMetadata::new(
+                                    &peer_name,
+                                    &format!("peer:{}", addr),
+                                    "AutoInterfacePeer",
+                                    &addr,
+                                )
+                                .with_parent(parent_address)
+                                .with_hw_mtu(HW_MTU)
+                                .with_bitrate(BITRATE_GUESS)
+                                .with_direction(true, true),
+                            );
+
+                            // Store tracking info
+                            {
+                                let mut spawned = self.spawned_interfaces.write().expect("spawned_interfaces lock poisoned");
+                                spawned.insert(
+                                    addr.clone(),
+                                    SpawnedPeerInfo {
+                                        address,
+                                        stop,
+                                        metadata,
+                                    },
+                                );
+                            }
+
+                            log::info!(
+                                "AutoInterface: spawned peer interface {} ({}) on {}",
+                                addr,
+                                address,
+                                ifname
+                            );
+                        }
+                        Some(PeerCommand::Teardown { addr }) => {
+                            let info = {
+                                let mut spawned = self.spawned_interfaces.write().expect("spawned_interfaces lock poisoned");
+                                spawned.remove(&addr)
+                            };
+
+                            if let Some(info) = info {
+                                // Cancel the peer's worker task
+                                info.stop.cancel();
+                                info.metadata.set_online(false);
+
+                                // Unregister from interface registry
+                                if let Some(ref reg) = interface_registry {
+                                    reg.unregister(&info.address).await;
+                                }
+
+                                // Clean up stopped interfaces from InterfaceManager
+                                {
+                                    let mut mgr = iface_manager.lock().await;
+                                    mgr.cleanup();
+                                }
+
+                                log::info!(
+                                    "AutoInterface: torn down peer interface {} ({})",
+                                    addr,
+                                    info.address
+                                );
+                            }
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            }
+        }
     }
 
     /// Multicast discovery task — sends periodic announces and processes incoming
@@ -1345,12 +1793,19 @@ impl AutoInterface {
     /// Data receive task — receives data packets, deduplicates via MifDeque,
     /// refreshes peer timestamps, and forwards to transport.
     ///
+    /// RX is handled centrally by the parent (one task per OS interface) rather
+    /// than per-peer, because all peers share the same data port and we need
+    /// cross-interface deduplication. The peer's AddressHash is looked up to
+    /// attribute the packet to the correct spawned interface for transport.
+    ///
     /// Matches Python AutoInterface.py data handler lines 603-619.
     async fn data_recv_task(
         &self,
         ifname: &str,
         socket: tokio::net::UdpSocket,
         cancel: &CancellationToken,
+        rx_sender: Option<InterfaceRxSender>,
+        parent_address: AddressHash,
     ) {
         // Extra headroom beyond MTU for potential framing
         let mut buf = vec![0u8; HW_MTU + 128];
@@ -1370,21 +1825,57 @@ impl AutoInterface {
                             // Deduplicate via MifDeque
                             let data_hash = Hash::new_from_slice(data);
                             {
-                                let mut deque = self.mif_deque.lock().unwrap();
+                                let mut deque = self.mif_deque.lock().expect("mif_deque lock poisoned");
                                 if deque.is_duplicate(&data_hash) {
                                     continue;
                                 }
                                 deque.insert(data_hash);
                             }
 
-                            // Refresh peer timestamp
-                            if let std::net::SocketAddr::V6(v6) = addr {
-                                let sender_addr = descope_linklocal(&v6.ip().to_string());
-                                self.refresh_peer(&sender_addr);
-                            }
+                            // Resolve sender address and look up peer
+                            let sender_addr = if let std::net::SocketAddr::V6(v6) = addr {
+                                let descoped = descope_linklocal(&v6.ip().to_string());
+                                self.refresh_peer(&descoped);
+                                descoped
+                            } else {
+                                continue;
+                            };
 
-                            // TODO: Forward data to transport layer via rx_channel.
-                            // This will be implemented when integrating with InterfaceContext.
+                            // Forward to transport if rx_sender is available
+                            if let Some(ref rx) = rx_sender {
+                                // Look up the peer's interface address hash and
+                                // update RX stats — all done synchronously before await
+                                let source_address = {
+                                    let spawned = self.spawned_interfaces.read().expect("spawned_interfaces lock poisoned");
+                                    if let Some(info) = spawned.get(&sender_addr) {
+                                        info.metadata.add_rx_bytes(len as u64);
+                                        info.address
+                                    } else {
+                                        // Peer not yet spawned — use parent address
+                                        parent_address
+                                    }
+                                };
+
+                                // Deserialize the raw UDP data into a Packet
+                                match crate::packet::Packet::deserialize(
+                                    &mut InputBuffer::new(data),
+                                ) {
+                                    Ok(packet) => {
+                                        let _ = rx.send(RxMessage {
+                                            address: source_address,
+                                            packet,
+                                        }).await;
+                                    }
+                                    Err(e) => {
+                                        log::debug!(
+                                            "AutoInterface: packet deserialize error on {} from {}: {}",
+                                            ifname,
+                                            sender_addr,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             if cancel.is_cancelled() {
