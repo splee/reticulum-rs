@@ -957,16 +957,20 @@ async fn create_transport(args: &Args, _config: &ReticulumConfig) -> Transport {
 
     // Set up interfaces from command line args
     if let Some(ref server_addr) = args.tcp_server {
+        let name = format!("TCPServerInterface[{}]", server_addr);
         transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
+            &name,
         ).await;
     }
 
     if let Some(ref client_addr) = args.tcp_client {
+        let name = format!("TCPInterface[{}]", client_addr);
         transport.spawn_interface(
             TcpClient::new(client_addr),
             TcpClient::spawn,
+            &name,
         ).await;
     }
 

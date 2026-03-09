@@ -26,6 +26,7 @@ async fn main() {
 
     log::info!("start kaonic client");
 
+    let kaonic_name = format!("KaonicInterface[{}]", grpc_addr);
     let _ = transport.lock().await.spawn_interface(
         KaonicGrpc::new(
             format!("http://{}", grpc_addr),
@@ -33,6 +34,7 @@ async fn main() {
             None,
         ),
         KaonicGrpc::spawn,
+        &kaonic_name,
     ).await;
 
     let identity = PrivateIdentity::new_from_name("kaonic-example");

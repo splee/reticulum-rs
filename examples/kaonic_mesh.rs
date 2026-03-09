@@ -24,6 +24,7 @@ async fn main() {
             None,
         ),
         KaonicGrpc::spawn,
+        "KaonicInterface[127.0.0.1:8080]",
     ).await;
 
     let _ = tokio::signal::ctrl_c().await;

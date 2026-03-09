@@ -18,6 +18,7 @@ async fn main() {
     transport.spawn_interface(
         TcpClient::new("amsterdam.connect.reticulum.network:4965"),
         TcpClient::spawn,
+        "TCPInterface[amsterdam.connect.reticulum.network:4965]",
     ).await;
 
     let transport = Arc::new(Mutex::new(transport));

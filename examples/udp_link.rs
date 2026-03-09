@@ -32,7 +32,9 @@ async fn main() {
 
     let _ = transport.spawn_interface(
         UdpInterface::new("0.0.0.0:4243", Some("127.0.0.1:4242")),
-        UdpInterface::spawn).await;
+        UdpInterface::spawn,
+        "UDPInterface[0.0.0.0:4243]",
+    ).await;
 
     let dest = transport.add_destination(id, DestinationName::new("example", "app").unwrap()).await;
 

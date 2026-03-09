@@ -463,16 +463,18 @@ async fn run_server(args: &Args, running: Arc<AtomicBool>) -> i32 {
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
         log::info!("Starting TCP server on {}", server_addr);
+        let name = format!("TCPServerInterface[{}]", server_addr);
         transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
+            &name,
         ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         log::info!("Connecting TCP client to {}", client_addr);
         transport
-            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn, &format!("TCPInterface[{}]", client_addr))
             .await;
     }
 
@@ -746,15 +748,17 @@ async fn run_client(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
+        let name = format!("TCPServerInterface[{}]", server_addr);
         transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
+            &name,
         ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         transport
-            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn, &format!("TCPInterface[{}]", client_addr))
             .await;
     }
 
@@ -1005,15 +1009,17 @@ async fn run_interactive(args: &Args, running: Arc<AtomicBool>) -> i32 {
 
     // Set up interfaces
     if let Some(server_addr) = &args.tcp_server {
+        let name = format!("TCPServerInterface[{}]", server_addr);
         transport.spawn_interface(
             TcpServer::new(server_addr, transport.iface_manager()),
             TcpServer::spawn,
+            &name,
         ).await;
     }
 
     if let Some(client_addr) = &args.tcp_client {
         transport
-            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+            .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn, &format!("TCPInterface[{}]", client_addr))
             .await;
     }
 

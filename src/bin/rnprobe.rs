@@ -120,6 +120,7 @@ async fn create_transport(args: &Args, config: &ReticulumConfig) -> Transport {
             .spawn(
                 TcpServer::new(server_addr, transport.iface_manager()),
                 TcpServer::spawn,
+                &format!("TCPServerInterface[{}]", server_addr),
             );
     }
 
@@ -128,7 +129,11 @@ async fn create_transport(args: &Args, config: &ReticulumConfig) -> Transport {
             .iface_manager()
             .lock()
             .await
-            .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            .spawn(
+                TcpClient::new(client_addr),
+                TcpClient::spawn,
+                &format!("TCPInterface[{}]", client_addr),
+            );
     }
 
     // If no CLI interfaces specified, use config interfaces
@@ -139,17 +144,19 @@ async fn create_transport(args: &Args, config: &ReticulumConfig) -> Transport {
                     if let Some(ref target) = iface_config.target_host {
                         let port = iface_config.target_port.unwrap_or(4242);
                         let addr = format!("{}:{}", target, port);
+                        let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
                         transport
                             .iface_manager()
                             .lock()
                             .await
-                            .spawn(TcpClient::new(&addr), TcpClient::spawn);
+                            .spawn(TcpClient::new(&addr), TcpClient::spawn, &name);
                     }
                 }
                 "TCPServerInterface" => {
                     let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
                     let listen_port = iface_config.listen_port.unwrap_or(4242);
                     let addr = format!("{}:{}", listen_ip, listen_port);
+                    let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
                     transport
                         .iface_manager()
                         .lock()
@@ -157,6 +164,7 @@ async fn create_transport(args: &Args, config: &ReticulumConfig) -> Transport {
                         .spawn(
                             TcpServer::new(&addr, transport.iface_manager()),
                             TcpServer::spawn,
+                            &name,
                         );
                 }
                 _ => {

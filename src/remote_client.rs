@@ -244,9 +244,11 @@ pub async fn create_client_transport(config: &ReticulumConfig, name: &str) -> Tr
     // Daemon exists, connect as client via LocalClientInterface
     log::info!("Connecting to existing daemon via LocalClientInterface");
 
+    let local_name = format!("LocalInterface[{}]", local_addr.display());
     transport.spawn_interface(
         LocalClientInterface::new(local_addr.clone()),
         LocalClientInterface::spawn,
+        &local_name,
     ).await;
 
     // Give LocalClientInterface time to connect
@@ -271,9 +273,11 @@ async fn try_become_shared_instance(
             drop(_listener);
 
             // Start LocalServerInterface to serve other clients
+            let server_name = format!("Shared Instance[{}]", local_addr.display());
             transport.spawn_interface(
                 LocalServerInterface::new(local_addr, transport.iface_manager()),
                 LocalServerInterface::spawn,
+                &server_name,
             ).await;
 
             // Load network interfaces from config
@@ -303,10 +307,18 @@ async fn spawn_network_interfaces(transport: &Transport, config: &ReticulumConfi
                 if let Some(ref target) = iface_config.target_host {
                     let port = iface_config.target_port.unwrap_or(4242);
                     let addr = format!("{}:{}", target, port);
+                    let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
                     log::info!("Starting TCPClientInterface: {}", addr);
+
+                    let mut client = TcpClient::new(&addr);
+                    if let Some(mtu) = iface_config.fixed_mtu {
+                        client = client.with_fixed_mtu(mtu);
+                    }
+
                     transport.spawn_interface(
-                        TcpClient::new(&addr),
+                        client,
                         TcpClient::spawn,
+                        &name,
                     ).await;
                 }
             }

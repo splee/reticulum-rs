@@ -252,9 +252,11 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
             );
             log::info!("Starting LocalServerInterface on {}", local_addr.display());
 
+            let local_name = format!("Shared Instance[{}]", local_addr.display());
             transport.spawn_interface(
                 LocalServerInterface::new(local_addr, transport.iface_manager()),
                 LocalServerInterface::spawn,
+                &local_name,
             ).await;
 
             // Start RPC server for management queries
@@ -319,12 +321,14 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
                     let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
                     let listen_port = iface_config.listen_port.unwrap_or(4242);
                     let addr = format!("{}:{}", listen_ip, listen_port);
+                    let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
 
                     log::info!("  TCP Server listening on {}", addr);
 
                     transport.spawn_interface(
                         TcpServer::new(&addr, transport.iface_manager()),
                         TcpServer::spawn,
+                        &name,
                     ).await;
                 }
                 "TCPClientInterface" | "tcp_client" => {
@@ -332,12 +336,19 @@ fn run_daemon(config: &ReticulumConfig, args: &Args, running: Arc<AtomicBool>) {
                         (&iface_config.target_host, iface_config.target_port)
                     {
                         let addr = format!("{}:{}", host, port);
+                        let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
 
                         log::info!("  TCP Client connecting to {}", addr);
 
+                        let mut client = TcpClient::new(&addr);
+                        if let Some(mtu) = iface_config.fixed_mtu {
+                            client = client.with_fixed_mtu(mtu);
+                        }
+
                         transport.spawn_interface(
-                            TcpClient::new(&addr),
+                            client,
                             TcpClient::spawn,
+                            &name,
                         ).await;
                     } else {
                         log::warn!("  TCP Client '{}' missing target_host or target_port",
@@ -408,9 +419,11 @@ fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBo
                         let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
                         let listen_port = iface_config.listen_port.unwrap_or(4242);
                         let addr = format!("{}:{}", listen_ip, listen_port);
+                        let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
                         transport.spawn_interface(
                             TcpServer::new(&addr, transport.iface_manager()),
                             TcpServer::spawn,
+                            &name,
                         ).await;
                     }
                     "TCPClientInterface" | "tcp_client" => {
@@ -418,9 +431,15 @@ fn run_interactive(config: &ReticulumConfig, _args: &Args, running: Arc<AtomicBo
                             (&iface_config.target_host, iface_config.target_port)
                         {
                             let addr = format!("{}:{}", host, port);
+                            let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
+                            let mut client = TcpClient::new(&addr);
+                            if let Some(mtu) = iface_config.fixed_mtu {
+                                client = client.with_fixed_mtu(mtu);
+                            }
                             transport.spawn_interface(
-                                TcpClient::new(&addr),
+                                client,
                                 TcpClient::spawn,
+                                &name,
                             ).await;
                         }
                     }

@@ -114,6 +114,7 @@ fn main() {
                 .spawn_interface(
                     TcpServer::new(server_addr, transport.iface_manager()),
                     TcpServer::spawn,
+                    &format!("TCPServerInterface[{}]", server_addr),
                 )
                 .await;
         }
@@ -121,7 +122,11 @@ fn main() {
         if let Some(client_addr) = &args.tcp_client {
             log::info!("Connecting TCP client to {}", client_addr);
             transport
-                .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+                .spawn_interface(
+                    TcpClient::new(client_addr),
+                    TcpClient::spawn,
+                    &format!("TCPInterface[{}]", client_addr),
+                )
                 .await;
         }
 

@@ -17,11 +17,16 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
     transport.spawn_interface(
         TcpServer::new(server_addr, transport.iface_manager()),
         TcpServer::spawn,
+        &format!("TCPServerInterface[{}]", server_addr),
     ).await;
 
     for &addr in client_addr {
         transport
-            .spawn_interface(TcpClient::new(addr), TcpClient::spawn)
+            .spawn_interface(
+                TcpClient::new(addr),
+                TcpClient::spawn,
+                &format!("TCPInterface[{}]", addr),
+            )
             .await;
     }
 

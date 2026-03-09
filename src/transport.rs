@@ -391,12 +391,12 @@ impl Transport {
     /// only when you need the raw `Arc<Mutex<InterfaceManager>>` (e.g. TcpServer
     /// and LocalServerInterface constructors that spawn child connections at
     /// accept time).
-    pub async fn spawn_interface<T: Interface, F, R>(&self, inner: T, worker: F) -> AddressHash
+    pub async fn spawn_interface<T: Interface, F, R>(&self, inner: T, worker: F, name: &str) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.iface_manager.lock().await.spawn(inner, worker)
+        self.iface_manager.lock().await.spawn(inner, worker, name)
     }
 
     /// Spawn a local IPC client interface.
@@ -407,12 +407,13 @@ impl Transport {
         &self,
         inner: T,
         worker: F,
+        name: &str,
     ) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.iface_manager.lock().await.spawn_local_client(inner, worker)
+        self.iface_manager.lock().await.spawn_local_client(inner, worker, name)
     }
 
     /// Get the interface registry for stats tracking.

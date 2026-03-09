@@ -934,6 +934,7 @@ async fn create_client_transport(config: &ReticulumConfig) -> (Transport, bool) 
     // Step 2: Daemon exists, connect as client via LocalClientInterface
     log::info!("Connecting to existing daemon via LocalClientInterface");
 
+    let iface_name = format!("LocalInterface[{}]", local_addr.display());
     transport
         .iface_manager()
         .lock()
@@ -941,6 +942,7 @@ async fn create_client_transport(config: &ReticulumConfig) -> (Transport, bool) 
         .spawn(
             LocalClientInterface::new(local_addr.clone()),
             LocalClientInterface::spawn,
+            &iface_name,
         );
 
     // Give LocalClientInterface time to connect
@@ -972,6 +974,7 @@ async fn try_become_shared_instance(
                 .spawn(
                     LocalServerInterface::new(local_addr, transport.iface_manager()),
                     LocalServerInterface::spawn,
+                    "LocalServerInterface",
                 );
 
             // Load network interfaces from config (matching Python's __start_local_interface)
@@ -1006,7 +1009,11 @@ async fn spawn_network_interfaces(transport: &Transport, config: &ReticulumConfi
                         .iface_manager()
                         .lock()
                         .await
-                        .spawn(TcpClient::new(&addr), TcpClient::spawn);
+                        .spawn(
+                            TcpClient::new(&addr),
+                            TcpClient::spawn,
+                            &format!("TCPInterface[{}]", addr),
+                        );
                 }
             }
             "TCPServerInterface" | "tcp_server" => {

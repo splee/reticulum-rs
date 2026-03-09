@@ -58,16 +58,20 @@ async fn main() {
 
     let our_address = format!("0.0.0.0:{}", our_hop + 5101);
 
+    let server_name = format!("TCPServerInterface[{}]", our_address);
     let _ = transport.spawn_interface(
         TcpServer::new(our_address, transport.iface_manager()),
         TcpServer::spawn,
+        &server_name,
     ).await;
 
     if our_hop > 0 {
         let connect_to = format!("127.0.0.1:{}", our_hop + 5100);
+        let client_name = format!("TCPInterface[{}]", connect_to);
         let client_addr = transport.spawn_interface(
             TcpClient::new(connect_to),
             TcpClient::spawn,
+            &client_name,
         ).await;
 
         let destination;
