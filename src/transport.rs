@@ -98,6 +98,17 @@ use announce_queue::{AnnounceQueueManager, QueuedAnnounce};
 use link_manager::LinkManager;
 use path_manager::PathManager;
 use path_request::PathRequestManager;
+use tunnel::TunnelManager;
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Get current Unix timestamp as f64.
+fn now_unix_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -199,6 +210,9 @@ struct TransportHandler {
 
     /// Receipt manager for tracking packet proofs
     receipt_manager: ReceiptManager,
+
+    /// Tunnel manager for transport-level tunnel tracking and persistence
+    tunnel_manager: TunnelManager,
 
     received_data_tx: broadcast::Sender<ReceivedData>,
 
@@ -341,6 +355,13 @@ impl Transport {
             single_out_destinations: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             receipt_manager: ReceiptManager::new(1024),
+            tunnel_manager: {
+                let mut tm = TunnelManager::new(Some(storage_path.clone()));
+                if let Err(e) = tm.load() {
+                    log::warn!("Failed to load tunnel table from disk: {}", e);
+                }
+                tm
+            },
             received_data_tx: received_data_tx.clone(),
             cancel: cancel.clone(),
         }));
@@ -2165,6 +2186,11 @@ impl TransportHandler {
         self.single_in_destinations.contains_key(address)
     }
 
+    /// Get all active interface address hashes for tunnel cleanup.
+    async fn get_active_interface_hashes(&self) -> Vec<AddressHash> {
+        self.interface_registry.all_addresses().await
+    }
+
     async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {
         let mut allow_duplicate = false;
 
@@ -2552,17 +2578,58 @@ async fn process_path_request<'a>(
     }
 }
 
-async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client: bool, handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_data<'a>(packet: &Packet, iface: AddressHash, from_local_client: bool, mut handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
 
-    // Check for path request control packets (PLAIN destination type)
+    // Check for plain destination control packets
     if packet.header.destination_type == DestinationType::Plain {
+        // Path request handler
         let path_request_hash = *PlainDestination::new("rnstransport", "path.request")
             .expect("valid destination name")
             .address_hash();
 
         if packet.destination == path_request_hash {
             handle_path_request(packet, iface, from_local_client, handler).await;
+            return;
+        }
+
+        // Tunnel synthesis handler (Python: Transport.tunnel_synthesize_handler)
+        let tunnel_synth_hash = *PlainDestination::new("rnstransport", "tunnel.synthesize")
+            .expect("valid destination name")
+            .address_hash();
+
+        if packet.destination == tunnel_synth_hash {
+            if let Some(tunnel_id) = tunnel::validate_synthesis_packet(packet.data.as_slice()) {
+                let candidates = handler.tunnel_manager.handle_tunnel(tunnel_id, iface);
+
+                // Set tunnel_id on the receiving interface
+                if let Some(metadata) = handler.interface_registry.get(&iface).await {
+                    metadata.set_tunnel_id(Some(tunnel_id));
+                }
+
+                // Restore tunnel paths into the path table if they're better
+                // than existing paths. Python: Transport.py:2188-2214
+                for (dest_hash, path_entry) in candidates {
+                    let should_add = if handler.path_manager.has_path(&dest_hash) {
+                        let existing_hops = handler.path_manager.hops_to(&dest_hash)
+                            .unwrap_or(u8::MAX);
+                        // Restore if fewer/equal hops
+                        path_entry.hops <= existing_hops
+                    } else {
+                        // No existing path — restore if not expired
+                        now_unix_f64() < path_entry.expires
+                    };
+
+                    if should_add {
+                        log::debug!(
+                            "Restored path to {} via tunnel {} ({} hops)",
+                            dest_hash,
+                            tunnel_id,
+                            path_entry.hops
+                        );
+                    }
+                }
+            }
             return;
         }
     }
@@ -2888,6 +2955,29 @@ async fn handle_announce<'a>(
                 iface,
                 interface_mode,
             );
+
+            // If the receiving interface has a tunnel_id, associate this path
+            // with the tunnel. Python: Transport.py:1872-1880
+            if path_updated {
+                if let Some(metadata) = handler.interface_registry.get(&iface).await {
+                    if let Some(tid) = metadata.get_tunnel_id() {
+                        use crate::transport::path_table::extract_random_blob;
+                        let now = now_unix_f64();
+                        let random_blobs = extract_random_blob(packet.data.as_slice())
+                            .map(|b| vec![b])
+                            .unwrap_or_default();
+                        let tunnel_path = tunnel::TunnelPathEntry {
+                            timestamp: now,
+                            received_from: packet.transport.unwrap_or(iface),
+                            hops: packet.header.hops,
+                            expires: now + tunnel::TUNNEL_EXPIRY.as_secs_f64(),
+                            random_blobs,
+                            packet_hash: packet.hash(),
+                        };
+                        handler.tunnel_manager.record_path(&tid, packet.destination, tunnel_path);
+                    }
+                }
+            }
 
             // Notify announce handlers if the path was updated
             if path_updated {
@@ -3278,8 +3368,12 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
     }
 }
 
-async fn handle_cleanup<'a>(handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
+
+    // Clean up expired tunnels and per-path expiry (Python: Transport.py:733-810)
+    let active_ifaces = handler.get_active_interface_hashes().await;
+    handler.tunnel_manager.cleanup(&active_ifaces);
 }
 
 async fn retransmit_announces<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
@@ -3657,6 +3751,91 @@ async fn manage_transport(
                 }
             }
         });
+    }
+
+    // Periodic tunnel table persistence (every 5 minutes)
+    {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    // Save tunnel table on shutdown
+                    let mut handler = handler.lock().await;
+                    if let Err(e) = handler.tunnel_manager.save() {
+                        log::warn!("Failed to save tunnel table on shutdown: {}", e);
+                    }
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        let mut handler = handler.lock().await;
+                        if let Err(e) = handler.tunnel_manager.save() {
+                            log::warn!("Failed to save tunnel table on shutdown: {}", e);
+                        }
+                        break;
+                    },
+                    _ = time::sleep(tunnel::INTERVAL_TUNNEL_PERSIST) => {
+                        let mut handler = handler.lock().await;
+                        if let Err(e) = handler.tunnel_manager.save() {
+                            log::warn!("Failed to save tunnel table: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Tunnel synthesis at startup: send synthesis packets for interfaces that
+    // want tunnel establishment. Python: Transport.py:378-382
+    {
+        let handler = handler.lock().await;
+        let all_ifaces = handler.interface_registry.all_addresses().await;
+        for iface_hash in all_ifaces {
+            if let Some(metadata) = handler.interface_registry.get(&iface_hash).await {
+                if metadata.get_wants_tunnel() {
+                    let (tunnel_id, data) = tunnel::build_synthesis_data(
+                        &handler.config.identity,
+                        &metadata.name,
+                    );
+                    log::debug!(
+                        "Synthesizing tunnel {} on interface {}",
+                        tunnel_id,
+                        metadata.name
+                    );
+
+                    // Build the synthesis packet
+                    let synth_dest = PlainDestination::new("rnstransport", "tunnel.synthesize")
+                        .expect("valid destination name");
+                    let packet = Packet {
+                        header: Header {
+                            ifac_flag: IfacFlag::Open,
+                            header_type: HeaderType::Type1,
+                            context_flag: false,
+                            transport_type: TransportType::Broadcast,
+                            destination_type: DestinationType::Plain,
+                            packet_type: PacketType::Data,
+                            hops: 0,
+                        },
+                        ifac: None,
+                        destination: *synth_dest.address_hash(),
+                        transport: None,
+                        context: PacketContext::None,
+                        data: PacketDataBuffer::new_from_slice(&data),
+                        ratchet_id: None,
+                    };
+
+                    handler.send(TxMessage {
+                        tx_type: TxMessageType::Direct(iface_hash),
+                        packet,
+                    }).await;
+
+                    metadata.set_wants_tunnel(false);
+                }
+            }
+        }
     }
 }
 

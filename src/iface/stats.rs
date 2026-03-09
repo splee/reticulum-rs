@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::hash::AddressHash;
+use crate::hash::{AddressHash, Hash};
 use crate::packet::Packet;
 
 /// How long an interface is considered "new" (2 hours).
@@ -375,8 +375,13 @@ pub struct InterfaceMetadata {
     pub bootstrap_only: bool,
     /// Child interface hashes (parent-to-children tracking)
     pub spawned_interfaces: Vec<AddressHash>,
-    /// Tunnel ID for tunneled interfaces
-    pub tunnel_id: Option<AddressHash>,
+    /// Tunnel ID for tunneled interfaces (32-byte full hash, matching Python's
+    /// Identity.full_hash(public_key + interface_hash))
+    pub tunnel_id: std::sync::Mutex<Option<Hash>>,
+    /// Whether this interface needs tunnel synthesis at startup.
+    /// Set by interface implementations connecting to transport-capable remotes.
+    /// Python: interface.wants_tunnel
+    pub wants_tunnel: std::sync::Mutex<bool>,
     /// Whether interface can receive packets (Python: Interface.IN)
     pub dir_in: bool,
     /// Whether interface can transmit packets (Python: Interface.OUT)
@@ -440,7 +445,8 @@ impl InterfaceMetadata {
             last_discovery_announce: 0.0,
             bootstrap_only: false,
             spawned_interfaces: Vec::new(),
-            tunnel_id: None,
+            tunnel_id: std::sync::Mutex::new(None),
+            wants_tunnel: std::sync::Mutex::new(false),
             dir_in: true,
             dir_out: true,
             fwd: false,
@@ -653,6 +659,26 @@ impl InterfaceMetadata {
     pub fn held_announce_count(&self) -> usize {
         self.ingress_control.lock().unwrap().held_count()
     }
+
+    /// Get the tunnel ID for this interface.
+    pub fn get_tunnel_id(&self) -> Option<Hash> {
+        *self.tunnel_id.lock().unwrap()
+    }
+
+    /// Set the tunnel ID for this interface.
+    pub fn set_tunnel_id(&self, id: Option<Hash>) {
+        *self.tunnel_id.lock().unwrap() = id;
+    }
+
+    /// Check whether this interface wants tunnel synthesis.
+    pub fn get_wants_tunnel(&self) -> bool {
+        *self.wants_tunnel.lock().unwrap()
+    }
+
+    /// Set whether this interface wants tunnel synthesis.
+    pub fn set_wants_tunnel(&self, wants: bool) {
+        *self.wants_tunnel.lock().unwrap() = wants;
+    }
 }
 
 impl std::fmt::Debug for InterfaceMetadata {
@@ -846,7 +872,7 @@ mod tests {
         assert_eq!(meta.last_discovery_announce, 0.0);
         assert!(!meta.bootstrap_only);
         assert!(meta.spawned_interfaces.is_empty());
-        assert!(meta.tunnel_id.is_none());
+        assert!(meta.get_tunnel_id().is_none());
         assert!(meta.hw_mtu.is_none());
         assert!(!meta.autoconfigure_mtu);
         assert!(!meta.fixed_mtu);
