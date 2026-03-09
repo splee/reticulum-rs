@@ -131,6 +131,15 @@ pub struct InterfaceMetadata {
     pub spawned_interfaces: Vec<AddressHash>,
     /// Tunnel ID for tunneled interfaces
     pub tunnel_id: Option<AddressHash>,
+    /// Hardware MTU in bytes. None means use default.
+    /// Python: self.HW_MTU
+    pub hw_mtu: Option<usize>,
+    /// Whether this interface auto-configures MTU based on bitrate.
+    /// Python: AUTOCONFIGURE_MTU (class-level, subclasses opt in)
+    pub autoconfigure_mtu: bool,
+    /// Whether this interface has a user-fixed MTU from configuration.
+    /// Python: FIXED_MTU
+    pub fixed_mtu: bool,
 }
 
 impl InterfaceMetadata {
@@ -166,6 +175,9 @@ impl InterfaceMetadata {
             bootstrap_only: false,
             spawned_interfaces: Vec::new(),
             tunnel_id: None,
+            hw_mtu: None,
+            autoconfigure_mtu: false,
+            fixed_mtu: false,
         }
     }
 
@@ -185,6 +197,61 @@ impl InterfaceMetadata {
     pub fn with_parent(mut self, parent_hash: AddressHash) -> Self {
         self.parent_interface_hash = Some(parent_hash);
         self
+    }
+
+    /// Set the hardware MTU.
+    pub fn with_hw_mtu(mut self, mtu: usize) -> Self {
+        self.hw_mtu = Some(mtu);
+        self
+    }
+
+    /// Enable MTU auto-configuration based on bitrate.
+    pub fn with_autoconfigure_mtu(mut self) -> Self {
+        self.autoconfigure_mtu = true;
+        self
+    }
+
+    /// Set a fixed (user-configured) MTU and disable auto-configuration.
+    pub fn with_fixed_mtu(mut self, mtu: usize) -> Self {
+        self.hw_mtu = Some(mtu);
+        self.fixed_mtu = true;
+        self.autoconfigure_mtu = false;
+        self
+    }
+
+    /// Auto-configure HW_MTU based on interface bitrate.
+    ///
+    /// Matches Python's `Interface.optimise_mtu()` (Interface.py lines 140-165).
+    /// Must be called before wrapping in Arc since it takes `&mut self`.
+    pub fn optimise_mtu(&mut self) {
+        if self.fixed_mtu || !self.autoconfigure_mtu {
+            return;
+        }
+        if let Some(bitrate) = self.bitrate {
+            self.hw_mtu = if bitrate >= 1_000_000_000 {
+                Some(524288)
+            } else if bitrate > 750_000_000 {
+                Some(262144)
+            } else if bitrate > 400_000_000 {
+                Some(131072)
+            } else if bitrate > 200_000_000 {
+                Some(65536)
+            } else if bitrate > 100_000_000 {
+                Some(32768)
+            } else if bitrate > 10_000_000 {
+                Some(16384)
+            } else if bitrate > 5_000_000 {
+                Some(8192)
+            } else if bitrate > 2_000_000 {
+                Some(4096)
+            } else if bitrate > 1_000_000 {
+                Some(2048)
+            } else if bitrate > 62_500 {
+                Some(1024)
+            } else {
+                None
+            };
+        }
     }
 
     /// Increment received bytes counter.
@@ -379,6 +446,61 @@ mod tests {
         assert!(!meta.bootstrap_only);
         assert!(meta.spawned_interfaces.is_empty());
         assert!(meta.tunnel_id.is_none());
+        assert!(meta.hw_mtu.is_none());
+        assert!(!meta.autoconfigure_mtu);
+        assert!(!meta.fixed_mtu);
+    }
+
+    #[test]
+    fn test_optimise_mtu_bitrate_thresholds() {
+        // Python: Interface.optimise_mtu() bitrate-to-MTU table
+        let cases: Vec<(u64, Option<usize>)> = vec![
+            (1_000_000_000, Some(524288)),  // >= 1 Gbps
+            (2_000_000_000, Some(524288)),   // > 1 Gbps
+            (750_000_001, Some(262144)),     // > 750 Mbps
+            (400_000_001, Some(131072)),     // > 400 Mbps
+            (200_000_001, Some(65536)),      // > 200 Mbps
+            (100_000_001, Some(32768)),      // > 100 Mbps
+            (10_000_001, Some(16384)),       // > 10 Mbps
+            (10_000_000, Some(8192)),        // = 10 Mbps (not > 10M, but > 5M)
+            (5_000_001, Some(8192)),         // > 5 Mbps
+            (2_000_001, Some(4096)),         // > 2 Mbps
+            (1_000_001, Some(2048)),         // > 1 Mbps
+            (62_501, Some(1024)),            // > 62.5 Kbps
+            (62_500, None),                  // = 62.5 Kbps (not >)
+            (1_000, None),                   // Very low bitrate
+        ];
+
+        for (bitrate, expected_mtu) in cases {
+            let mut meta = InterfaceMetadata::new("test", "test", "test", "")
+                .with_bitrate(bitrate)
+                .with_autoconfigure_mtu();
+            meta.optimise_mtu();
+            assert_eq!(
+                meta.hw_mtu, expected_mtu,
+                "bitrate={} expected hw_mtu={:?}, got {:?}",
+                bitrate, expected_mtu, meta.hw_mtu
+            );
+        }
+    }
+
+    #[test]
+    fn test_optimise_mtu_skipped_when_fixed() {
+        let mut meta = InterfaceMetadata::new("test", "test", "test", "")
+            .with_bitrate(1_000_000_000)
+            .with_fixed_mtu(4096);
+        meta.optimise_mtu();
+        // Fixed MTU should not be overridden by optimise_mtu
+        assert_eq!(meta.hw_mtu, Some(4096));
+    }
+
+    #[test]
+    fn test_optimise_mtu_skipped_when_not_enabled() {
+        let mut meta = InterfaceMetadata::new("test", "test", "test", "")
+            .with_bitrate(1_000_000_000);
+        // autoconfigure_mtu is false by default
+        meta.optimise_mtu();
+        assert!(meta.hw_mtu.is_none());
     }
 
     #[test]

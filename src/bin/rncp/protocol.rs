@@ -67,6 +67,7 @@ pub async fn setup_transport_interfaces(
             .spawn(
                 TcpServer::new(server_addr, transport.iface_manager()),
                 TcpServer::spawn,
+                &format!("TCPServerInterface[{}]", server_addr),
             );
     }
 
@@ -76,7 +77,11 @@ pub async fn setup_transport_interfaces(
             .iface_manager()
             .lock()
             .await
-            .spawn(TcpClient::new(client_addr), TcpClient::spawn);
+            .spawn(
+                TcpClient::new(client_addr),
+                TcpClient::spawn,
+                &format!("TCPInterface[{}]", client_addr),
+            );
     }
 }
 

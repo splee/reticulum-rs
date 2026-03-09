@@ -125,12 +125,14 @@ fn main() {
                 config.shared_instance_port,
             );
 
+            let iface_name = format!("LocalInterface[{}]", local_addr.display());
             log::info!("Connecting to {}", local_addr.display());
 
             transport
                 .spawn_interface(
                     LocalClientInterface::new(local_addr),
                     LocalClientInterface::spawn,
+                    &iface_name,
                 )
                 .await;
 
@@ -144,6 +146,7 @@ fn main() {
                     .spawn_interface(
                         TcpServer::new(server_addr, transport.iface_manager()),
                         TcpServer::spawn,
+                        &format!("TCPServerInterface[{}]", server_addr),
                     )
                     .await;
             }
@@ -151,7 +154,11 @@ fn main() {
             if let Some(client_addr) = &args.tcp_client {
                 log::info!("Connecting TCP client to {}", client_addr);
                 transport
-                    .spawn_interface(TcpClient::new(client_addr), TcpClient::spawn)
+                    .spawn_interface(
+                        TcpClient::new(client_addr),
+                        TcpClient::spawn,
+                        &format!("TCPInterface[{}]", client_addr),
+                    )
                     .await;
             }
 

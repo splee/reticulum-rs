@@ -127,9 +127,11 @@ impl LocalServerInterface {
                                 // Spawn a local client interface to handle this connection.
                                 // Local client interfaces always receive packets regardless
                                 // of the transport's broadcast setting.
+                                let client_name = format!("LocalInterface[{}]", peer_addr);
                                 iface_manager.spawn_local_client(
                                     LocalClientInterface::new_from_stream(peer_addr, stream),
                                     LocalClientInterface::spawn,
+                                    &client_name,
                                 );
                             }
                             Err(e) => {

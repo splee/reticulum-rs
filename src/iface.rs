@@ -111,7 +111,6 @@ pub struct InterfaceContext<T: Interface> {
 }
 
 pub struct InterfaceManager {
-    counter: usize,
     rx_recv: Arc<tokio::sync::Mutex<InterfaceRxReceiver>>,
     rx_send: InterfaceRxSender,
     cancel: CancellationToken,
@@ -126,7 +125,6 @@ impl InterfaceManager {
         let rx_recv = Arc::new(tokio::sync::Mutex::new(rx_recv));
 
         Self {
-            counter: 0,
             rx_recv,
             rx_send,
             cancel: CancellationToken::new(),
@@ -145,25 +143,27 @@ impl InterfaceManager {
         self.interface_registry.clone()
     }
 
-    pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_impl(tx_cap, false)
+    pub fn new_channel(&mut self, tx_cap: usize, name: &str) -> InterfaceChannel {
+        self.new_channel_impl(tx_cap, false, name)
     }
 
     /// Create a channel for a local IPC client interface.
     /// Local client interfaces always receive packets regardless of broadcast settings.
-    pub fn new_channel_local_client(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_impl(tx_cap, true)
+    pub fn new_channel_local_client(&mut self, tx_cap: usize, name: &str) -> InterfaceChannel {
+        self.new_channel_impl(tx_cap, true, name)
     }
 
-    fn new_channel_impl(&mut self, tx_cap: usize, is_local_client: bool) -> InterfaceChannel {
-        self.counter += 1;
-
-        let counter_bytes = self.counter.to_le_bytes();
-        let address = AddressHash::new_from_hash(&Hash::new_from_slice(&counter_bytes[..]));
+    /// Compute the interface address hash from its name string.
+    ///
+    /// This matches Python's `Interface.get_hash()` which computes
+    /// `SHA256(str(self).encode("utf-8"))` — a deterministic hash derived
+    /// from the interface's string representation.
+    fn new_channel_impl(&mut self, tx_cap: usize, is_local_client: bool, name: &str) -> InterfaceChannel {
+        let address = AddressHash::new_from_hash(&Hash::new_from_slice(name.as_bytes()));
 
         let (tx_send, tx_recv) = InterfaceChannel::make_tx_channel(tx_cap);
 
-        log::debug!("iface: create channel {} (local_client={})", address, is_local_client);
+        log::debug!("iface: create channel {} for '{}' (local_client={})", address, name, is_local_client);
 
         let stop = CancellationToken::new();
 
@@ -182,20 +182,20 @@ impl InterfaceManager {
         }
     }
 
-    pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        self.new_context_impl(inner, false)
+    pub fn new_context<T: Interface>(&mut self, inner: T, name: &str) -> InterfaceContext<T> {
+        self.new_context_impl(inner, false, name)
     }
 
     /// Create a context for a local IPC client interface.
-    pub fn new_context_local_client<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        self.new_context_impl(inner, true)
+    pub fn new_context_local_client<T: Interface>(&mut self, inner: T, name: &str) -> InterfaceContext<T> {
+        self.new_context_impl(inner, true, name)
     }
 
-    fn new_context_impl<T: Interface>(&mut self, inner: T, is_local_client: bool) -> InterfaceContext<T> {
+    fn new_context_impl<T: Interface>(&mut self, inner: T, is_local_client: bool, name: &str) -> InterfaceContext<T> {
         let channel = if is_local_client {
-            self.new_channel_local_client(1)
+            self.new_channel_local_client(1, name)
         } else {
-            self.new_channel(1)
+            self.new_channel(1, name)
         };
 
         let inner = Arc::new(Mutex::new(inner));
@@ -208,13 +208,13 @@ impl InterfaceManager {
         }
     }
 
-    pub fn spawn<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
+    pub fn spawn<T: Interface, F, R>(&mut self, inner: T, worker: F, name: &str) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context(inner);
+        let context = self.new_context(inner, name);
         let address = *context.channel.address();
 
         task::spawn(worker(context));
@@ -224,13 +224,13 @@ impl InterfaceManager {
 
     /// Spawn a local IPC client interface.
     /// Local client interfaces always receive packets regardless of broadcast settings.
-    pub fn spawn_local_client<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
+    pub fn spawn_local_client<T: Interface, F, R>(&mut self, inner: T, worker: F, name: &str) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context_local_client(inner);
+        let context = self.new_context_local_client(inner, name);
         let address = *context.channel.address();
 
         task::spawn(worker(context));

@@ -61,14 +61,20 @@ impl TcpServer {
 
         let iface_manager = { context.inner.lock().await.iface_manager.clone() };
 
-        // Create interface metadata for stats tracking
+        // Create interface metadata for stats tracking.
+        // Name matches Python's TCPServerInterface.__str__() format (no framing suffix).
         let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
-        let metadata = Arc::new(InterfaceMetadata::new(
-            format!("TCPServerInterface[{}]({})", addr, framing_type),
+        let mut meta = InterfaceMetadata::new(
+            format!("TCPServerInterface[{}]", addr),
             "TCPServer",
             "TCPServerInterface",
             addr.clone(),
-        ));
+        )
+        .with_bitrate(10_000_000) // BITRATE_GUESS = 10 Mbps
+        .with_autoconfigure_mtu()
+        .with_hw_mtu(262144);
+        meta.optimise_mtu();
+        let metadata = Arc::new(meta);
 
         // Register with interface registry if available
         let registry = context.interface_registry.clone();
@@ -152,10 +158,13 @@ impl TcpServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
-                            // Spawn client with the same framing mode as the server
+                            // Spawn client with the same framing mode as the server.
+                            // Name matches Python's format for server-spawned clients.
+                            let client_name = format!("TCPInterface[{}]", peer_addr);
                             iface_manager.spawn(
                                 TcpClient::new_from_stream_with_framing(peer_addr.to_string(), stream, kiss_framing),
                                 TcpClient::spawn,
+                                &client_name,
                             );
                         }
                     }

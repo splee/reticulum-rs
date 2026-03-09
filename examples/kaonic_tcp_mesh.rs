@@ -26,6 +26,7 @@ async fn main() {
 
     log::info!("start kaonic client");
 
+    let kaonic_name = format!("KaonicInterface[{}]", &args[2]);
     let _ = transport.lock().await.spawn_interface(
         KaonicGrpc::new(
             format!("http://{}", &args[2]),
@@ -33,14 +34,16 @@ async fn main() {
             None,
         ),
         KaonicGrpc::spawn,
+        &kaonic_name,
     ).await;
 
     log::info!("start tcp client");
 
+    let tcp_name = format!("TCPInterface[{}]", &args[1]);
     let _ = transport
         .lock()
         .await
-        .spawn_interface(TcpClient::new(&args[1]), TcpClient::spawn)
+        .spawn_interface(TcpClient::new(&args[1]), TcpClient::spawn, &tcp_name)
         .await;
 
     log::info!("start tcp client");

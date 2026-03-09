@@ -47,6 +47,8 @@ pub struct InterfaceStatsSnapshot {
     pub parent_interface_hash: Option<AddressHash>,
     /// Interface address hash (unique identifier)
     pub interface_hash: AddressHash,
+    /// Hardware MTU in bytes (if configured or auto-configured)
+    pub hw_mtu: Option<usize>,
 }
 
 /// Per-interface speed calculation state.
@@ -200,6 +202,7 @@ impl InterfaceRegistry {
                     endpoint_address: metadata.endpoint_address.clone(),
                     parent_interface_hash: metadata.parent_interface_hash,
                     interface_hash: *address,
+                    hw_mtu: metadata.hw_mtu,
                 }
             })
             .collect()

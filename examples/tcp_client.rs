@@ -15,7 +15,7 @@ async fn main() {
     let transport = Transport::new(TransportConfig::default());
 
     let client_addr = transport
-        .spawn_interface(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn)
+        .spawn_interface(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn, "TCPInterface[127.0.0.1:4242]")
         .await;
 
     let id = PrivateIdentity::new_from_rand(OsRng);

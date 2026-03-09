@@ -526,9 +526,11 @@ impl Reticulum {
         // Start LocalServerInterface for IPC
         let local_addr = ipc.transport_addr();
 
+        let local_name = format!("Shared Instance[{}]", local_addr.display());
         transport_arc.spawn_interface(
             LocalServerInterface::new(local_addr, transport_arc.iface_manager()),
             LocalServerInterface::spawn,
+            &local_name,
         ).await;
 
         // Start RPC server
@@ -595,9 +597,11 @@ impl Reticulum {
         let transport_arc = Arc::new(transport);
 
         // Spawn LocalClientInterface to relay packets to/from daemon
+        let local_name = format!("LocalInterface[{}]", local_addr.display());
         transport_arc.spawn_interface(
             LocalClientInterface::new(local_addr),
             LocalClientInterface::spawn,
+            &local_name,
         ).await;
 
         transport_arc
@@ -628,10 +632,12 @@ impl Reticulum {
                     let listen_ip = iface_config.listen_ip.as_deref().unwrap_or("0.0.0.0");
                     let listen_port = iface_config.listen_port.unwrap_or(4242);
                     let addr = format!("{}:{}", listen_ip, listen_port);
+                    let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
 
                     transport.spawn_interface(
                         TcpServer::new(&addr, transport.iface_manager()),
                         TcpServer::spawn,
+                        &name,
                     ).await;
                 }
                 "TCPClientInterface" | "tcp_client" => {
@@ -639,9 +645,17 @@ impl Reticulum {
                         (&iface_config.target_host, iface_config.target_port)
                     {
                         let addr = format!("{}:{}", host, port);
+                        let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
+
+                        let mut client = TcpClient::new(&addr);
+                        if let Some(mtu) = iface_config.fixed_mtu {
+                            client = client.with_fixed_mtu(mtu);
+                        }
+
                         transport.spawn_interface(
-                            TcpClient::new(&addr),
+                            client,
                             TcpClient::spawn,
+                            &name,
                         ).await;
                     } else {
                         log::warn!(

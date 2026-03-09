@@ -35,6 +35,8 @@ pub struct TcpClient {
     stream: Option<TcpStream>,
     /// When true, use KISS framing instead of HDLC
     kiss_framing: bool,
+    /// User-configured fixed MTU (bytes). When set, disables MTU auto-configuration.
+    fixed_mtu: Option<usize>,
 }
 
 impl TcpClient {
@@ -44,6 +46,7 @@ impl TcpClient {
             addr: addr.into(),
             stream: None,
             kiss_framing: false,
+            fixed_mtu: None,
         }
     }
 
@@ -53,6 +56,7 @@ impl TcpClient {
             addr: addr.into(),
             stream: Some(stream),
             kiss_framing: false,
+            fixed_mtu: None,
         }
     }
 
@@ -66,6 +70,7 @@ impl TcpClient {
             addr: addr.into(),
             stream: None,
             kiss_framing,
+            fixed_mtu: None,
         }
     }
 
@@ -75,12 +80,19 @@ impl TcpClient {
             addr: addr.into(),
             stream: Some(stream),
             kiss_framing,
+            fixed_mtu: None,
         }
     }
 
     /// Enable KISS framing (builder pattern).
     pub fn with_kiss_framing(mut self) -> Self {
         self.kiss_framing = true;
+        self
+    }
+
+    /// Set a fixed MTU (disables auto-configuration).
+    pub fn with_fixed_mtu(mut self, mtu: usize) -> Self {
+        self.fixed_mtu = Some(mtu);
         self
     }
 
@@ -91,21 +103,32 @@ impl TcpClient {
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
-        let (addr, kiss_framing) = {
+        let (addr, kiss_framing, fixed_mtu) = {
             let inner = context.inner.lock().await;
-            (inner.addr.clone(), inner.kiss_framing)
+            (inner.addr.clone(), inner.kiss_framing, inner.fixed_mtu)
         };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().await.stream.take() };
 
-        // Create interface metadata for stats tracking
-        let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
-        let metadata = Arc::new(InterfaceMetadata::new(
-            format!("TCPInterface[{}]({})", addr, framing_type),
+        // Create interface metadata for stats tracking.
+        // Name matches Python's TCPInterface.__str__() format (no framing suffix).
+        let mut meta = InterfaceMetadata::new(
+            format!("TCPInterface[{}]", addr),
             "TCPClient",
             "TCPClientInterface",
             addr.clone(),
-        ));
+        )
+        .with_bitrate(10_000_000); // TCPClientInterface.BITRATE_GUESS = 10 Mbps
+
+        // Configure MTU: use fixed value from config, or auto-configure from bitrate
+        if let Some(mtu) = fixed_mtu {
+            meta = meta.with_fixed_mtu(mtu);
+        } else {
+            meta = meta.with_autoconfigure_mtu().with_hw_mtu(262144);
+            meta.optimise_mtu();
+        }
+
+        let metadata = Arc::new(meta);
 
         // Register with interface registry if available
         let registry = context.interface_registry.clone();
