@@ -13,7 +13,7 @@ pub mod registry;
 pub mod stats;
 
 pub use registry::{InterfaceRegistry, InterfaceStatsSnapshot};
-pub use stats::{InterfaceMetadata, InterfaceMode};
+pub use stats::{HeldAnnounce, InterfaceMetadata, InterfaceMode};
 
 use std::sync::Arc;
 

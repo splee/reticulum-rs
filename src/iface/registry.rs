@@ -49,6 +49,12 @@ pub struct InterfaceStatsSnapshot {
     pub interface_hash: AddressHash,
     /// Hardware MTU in bytes (if configured or auto-configured)
     pub hw_mtu: Option<usize>,
+    /// Current incoming announce frequency in Hz
+    pub incoming_announce_frequency: f64,
+    /// Current outgoing announce frequency in Hz
+    pub outgoing_announce_frequency: f64,
+    /// Number of currently held announces
+    pub held_announces: usize,
 }
 
 /// Per-interface speed calculation state.
@@ -203,9 +209,49 @@ impl InterfaceRegistry {
                     parent_interface_hash: metadata.parent_interface_hash,
                     interface_hash: *address,
                     hw_mtu: metadata.hw_mtu,
+                    incoming_announce_frequency: metadata.incoming_announce_frequency(),
+                    outgoing_announce_frequency: metadata.outgoing_announce_frequency(),
+                    held_announces: metadata.held_announce_count(),
                 }
             })
             .collect()
+    }
+
+    /// Record an incoming announce on an interface, propagating to its parent.
+    ///
+    /// Python: `Interface.received_announce(from_spawned=True)` propagation.
+    pub async fn record_incoming_announce(&self, iface: &AddressHash) {
+        let interfaces = self.interfaces.read().await;
+        if let Some(metadata) = interfaces.get(iface) {
+            metadata.record_incoming_announce();
+            // Propagate to parent interface
+            if let Some(parent_hash) = metadata.parent_interface_hash {
+                if let Some(parent) = interfaces.get(&parent_hash) {
+                    parent.record_incoming_announce();
+                }
+            }
+        }
+    }
+
+    /// Record an outgoing announce on an interface, propagating to its parent.
+    ///
+    /// Python: `Interface.sent_announce(from_spawned=True)` propagation.
+    pub async fn record_outgoing_announce(&self, iface: &AddressHash) {
+        let interfaces = self.interfaces.read().await;
+        if let Some(metadata) = interfaces.get(iface) {
+            metadata.record_outgoing_announce();
+            // Propagate to parent interface
+            if let Some(parent_hash) = metadata.parent_interface_hash {
+                if let Some(parent) = interfaces.get(&parent_hash) {
+                    parent.record_outgoing_announce();
+                }
+            }
+        }
+    }
+
+    /// Get all registered interface address hashes.
+    pub async fn all_addresses(&self) -> Vec<AddressHash> {
+        self.interfaces.read().await.keys().copied().collect()
     }
 
     /// Get aggregate traffic statistics across all interfaces.

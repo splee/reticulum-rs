@@ -1,17 +1,263 @@
 //! Interface statistics tracking.
 //!
 //! This module provides thread-safe structures for tracking interface metadata
-//! and traffic statistics (rx/tx bytes, online status, etc.).
+//! and traffic statistics (rx/tx bytes, online status, etc.), as well as
+//! announce frequency tracking and ingress control for burst detection.
 
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::hash::AddressHash;
+use crate::packet::Packet;
 
 /// How long an interface is considered "new" (2 hours).
 /// Python: `IC_NEW_TIME = 2*60*60`
 pub const IC_NEW_TIME: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Number of incoming announce frequency samples to track.
+/// Python: `IA_FREQ_SAMPLES = 6`
+pub const IA_FREQ_SAMPLES: usize = 6;
+
+/// Number of outgoing announce frequency samples to track.
+/// Python: `OA_FREQ_SAMPLES = 6`
+pub const OA_FREQ_SAMPLES: usize = 6;
+
+/// Maximum number of held announces per interface.
+/// Python: `MAX_HELD_ANNOUNCES = 256`
+pub const MAX_HELD_ANNOUNCES: usize = 256;
+
+/// Announce frequency threshold (Hz) for interfaces younger than IC_NEW_TIME.
+/// Python: `IC_BURST_FREQ_NEW = 3.5`
+pub const IC_BURST_FREQ_NEW: f64 = 3.5;
+
+/// Announce frequency threshold (Hz) for established interfaces.
+/// Python: `IC_BURST_FREQ = 12`
+pub const IC_BURST_FREQ: f64 = 12.0;
+
+/// Minimum burst mode duration before deactivation is considered.
+/// Python: `IC_BURST_HOLD = 1*60`
+pub const IC_BURST_HOLD: Duration = Duration::from_secs(60);
+
+/// Penalty delay after burst mode deactivation before releasing held announces.
+/// Python: `IC_BURST_PENALTY = 5*60`
+pub const IC_BURST_PENALTY: Duration = Duration::from_secs(300);
+
+/// Minimum interval between releasing held announces.
+/// Python: `IC_HELD_RELEASE_INTERVAL = 30`
+pub const IC_HELD_RELEASE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Bounded deque of timestamps for computing announce frequency.
+///
+/// Stores up to `capacity` timestamps and computes the rolling frequency
+/// using the Python formula: `num_samples / (sum_of_consecutive_deltas + elapsed_since_last)`.
+struct FreqDeque {
+    times: VecDeque<Instant>,
+    capacity: usize,
+}
+
+impl FreqDeque {
+    /// Create a new frequency deque with the given maximum capacity.
+    fn new(capacity: usize) -> Self {
+        Self {
+            times: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Record a timestamp. Evicts the oldest entry if at capacity.
+    fn push(&mut self, now: Instant) {
+        if self.times.len() >= self.capacity {
+            self.times.pop_front();
+        }
+        self.times.push_back(now);
+    }
+
+    /// Calculate the rolling announce frequency in Hz.
+    ///
+    /// Python formula (Interface.py lines 212-227):
+    /// ```text
+    /// delta_sum = sum of consecutive intervals + elapsed since last sample
+    /// frequency = num_samples / delta_sum
+    /// ```
+    /// Returns 0.0 if fewer than 2 samples exist.
+    fn frequency(&self) -> f64 {
+        if self.times.len() <= 1 {
+            return 0.0;
+        }
+        let dq_len = self.times.len();
+        let mut delta_sum = Duration::ZERO;
+
+        // Sum intervals between consecutive samples
+        for i in 1..dq_len {
+            delta_sum += self.times[i].duration_since(self.times[i - 1]);
+        }
+
+        // Add time elapsed since last recorded sample
+        delta_sum += self.times[dq_len - 1].elapsed();
+
+        let delta_secs = delta_sum.as_secs_f64();
+        if delta_secs == 0.0 {
+            0.0
+        } else {
+            dq_len as f64 / delta_secs
+        }
+    }
+}
+
+/// A held announce entry — the packet plus the interface it arrived on.
+pub struct HeldAnnounce {
+    pub packet: Packet,
+    pub receiving_interface: AddressHash,
+}
+
+/// Per-interface ingress control state for announce burst detection and held announces.
+///
+/// Tracks announce frequencies and manages burst detection per Python's
+/// `Interface.py` lines 94-200. Protected by a `std::sync::Mutex` inside
+/// `InterfaceMetadata` — callers use accessor methods and never touch the lock.
+struct IngressControl {
+    /// Whether ingress control is enabled for this interface.
+    enabled: bool,
+    /// Incoming announce frequency tracker.
+    ia_freq: FreqDeque,
+    /// Outgoing announce frequency tracker.
+    oa_freq: FreqDeque,
+    /// Whether burst mode is currently active.
+    burst_active: bool,
+    /// When burst mode was activated.
+    burst_activated: Instant,
+    /// Earliest time at which a held announce may be released.
+    held_release: Instant,
+    /// Map from destination hash to held announce (latest wins per destination).
+    held_announces: HashMap<AddressHash, HeldAnnounce>,
+}
+
+impl IngressControl {
+    /// Create new ingress control state.
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ia_freq: FreqDeque::new(IA_FREQ_SAMPLES),
+            oa_freq: FreqDeque::new(OA_FREQ_SAMPLES),
+            burst_active: false,
+            burst_activated: Instant::now(),
+            // Allow immediate release (now is already passed)
+            held_release: Instant::now(),
+            held_announces: HashMap::new(),
+        }
+    }
+
+    /// Record an incoming announce timestamp.
+    fn record_incoming(&mut self) {
+        self.ia_freq.push(Instant::now());
+    }
+
+    /// Record an outgoing announce timestamp.
+    fn record_outgoing(&mut self) {
+        self.oa_freq.push(Instant::now());
+    }
+
+    /// Get current incoming announce frequency in Hz.
+    fn incoming_announce_frequency(&self) -> f64 {
+        self.ia_freq.frequency()
+    }
+
+    /// Get current outgoing announce frequency in Hz.
+    fn outgoing_announce_frequency(&self) -> f64 {
+        self.oa_freq.frequency()
+    }
+
+    /// Check whether this interface should ingress-limit announces.
+    ///
+    /// Implements the Python `should_ingress_limit()` state machine (Interface.py lines 117-138):
+    /// - If burst is active: check if frequency dropped AND hold time elapsed → deactivate
+    /// - If not in burst: check if frequency exceeds threshold → activate burst
+    fn should_ingress_limit(&mut self, interface_age: Duration) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        let freq_threshold = if interface_age < IC_NEW_TIME {
+            IC_BURST_FREQ_NEW
+        } else {
+            IC_BURST_FREQ
+        };
+        let ia_freq = self.ia_freq.frequency();
+
+        if self.burst_active {
+            // In burst mode: check deactivation conditions
+            if ia_freq < freq_threshold
+                && self.burst_activated.elapsed() >= IC_BURST_HOLD
+            {
+                self.burst_active = false;
+                // Apply penalty before releasing held announces
+                self.held_release = Instant::now() + IC_BURST_PENALTY;
+            }
+            true // Always limit while burst was/is active this check
+        } else {
+            // Not in burst: check activation threshold
+            if ia_freq > freq_threshold {
+                self.burst_active = true;
+                self.burst_activated = Instant::now();
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Hold an announce packet for later release.
+    ///
+    /// If an announce for the same destination is already held, it is replaced
+    /// (latest wins). New announces are only added if under the capacity limit.
+    fn hold_announce(&mut self, dest_hash: AddressHash, packet: Packet, receiving_interface: AddressHash) {
+        if self.held_announces.contains_key(&dest_hash) {
+            // Replace existing announce for this destination
+            self.held_announces.insert(dest_hash, HeldAnnounce { packet, receiving_interface });
+        } else if self.held_announces.len() < MAX_HELD_ANNOUNCES {
+            self.held_announces.insert(dest_hash, HeldAnnounce { packet, receiving_interface });
+        }
+        // Drop silently if at capacity and not a replacement
+    }
+
+    /// Try to release one held announce for reprocessing.
+    ///
+    /// Selects the announce with the minimum hop count (highest priority),
+    /// respecting the release interval. Returns None if conditions aren't met.
+    fn take_releasable_announce(&mut self) -> Option<(AddressHash, HeldAnnounce)> {
+        if self.held_announces.is_empty() {
+            return None;
+        }
+
+        // Check release interval
+        if Instant::now() < self.held_release {
+            return None;
+        }
+
+        // Find announce with minimum hops
+        let best_dest = self
+            .held_announces
+            .iter()
+            .min_by_key(|(_, held)| held.packet.header.hops)
+            .map(|(dest, _)| *dest);
+
+        if let Some(dest) = best_dest {
+            // Update release timer
+            self.held_release = Instant::now() + IC_HELD_RELEASE_INTERVAL;
+            let held = self.held_announces.remove(&dest).unwrap();
+            Some((dest, held))
+        } else {
+            None
+        }
+    }
+
+    /// Get count of currently held announces.
+    fn held_count(&self) -> usize {
+        self.held_announces.len()
+    }
+}
 
 /// Interface mode constants matching Python implementation.
 ///
@@ -157,6 +403,9 @@ pub struct InterfaceMetadata {
     /// Whether this interface has a user-fixed MTU from configuration.
     /// Python: FIXED_MTU
     pub fixed_mtu: bool,
+    /// Ingress control state (frequency tracking, burst detection, held announces).
+    /// Protected by std::sync::Mutex — callers use accessor methods only.
+    ingress_control: std::sync::Mutex<IngressControl>,
 }
 
 impl InterfaceMetadata {
@@ -202,6 +451,7 @@ impl InterfaceMetadata {
             hw_mtu: None,
             autoconfigure_mtu: false,
             fixed_mtu: false,
+            ingress_control: std::sync::Mutex::new(IngressControl::new(true)),
         }
     }
 
@@ -247,6 +497,15 @@ impl InterfaceMetadata {
     pub fn with_direction(mut self, dir_in: bool, dir_out: bool) -> Self {
         self.dir_in = dir_in;
         self.dir_out = dir_out;
+        self
+    }
+
+    /// Disable ingress control for this interface.
+    ///
+    /// Used for interface types like SerialInterface and KISSInterface that
+    /// override `should_ingress_limit()` to return `False` in Python.
+    pub fn with_ingress_control_disabled(self) -> Self {
+        self.ingress_control.lock().unwrap().enabled = false;
         self
     }
 
@@ -334,6 +593,66 @@ impl InterfaceMetadata {
     pub fn age(&self) -> Duration {
         self.created.elapsed()
     }
+
+    /// Record an incoming announce timestamp for frequency tracking.
+    /// Python: `Interface.received_announce()`
+    pub fn record_incoming_announce(&self) {
+        self.ingress_control.lock().unwrap().record_incoming();
+    }
+
+    /// Record an outgoing announce timestamp for frequency tracking.
+    /// Python: `Interface.sent_announce()`
+    pub fn record_outgoing_announce(&self) {
+        self.ingress_control.lock().unwrap().record_outgoing();
+    }
+
+    /// Check ingress limit and hold the announce if limiting.
+    ///
+    /// Returns `true` if the announce was held (caller should stop processing).
+    /// Acquires the lock once for both the limit check and the hold operation,
+    /// avoiding TOCTOU gaps.
+    pub fn check_ingress_and_hold(
+        &self,
+        dest_hash: AddressHash,
+        packet: Packet,
+        receiving_interface: AddressHash,
+    ) -> bool {
+        let mut ic = self.ingress_control.lock().unwrap();
+        if ic.should_ingress_limit(self.age()) {
+            ic.hold_announce(dest_hash, packet, receiving_interface);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to release one held announce if conditions permit.
+    ///
+    /// Returns `None` if the interface is still ingress-limiting, the release
+    /// interval hasn't elapsed, or there are no held announces.
+    pub fn try_release_held_announce(&self) -> Option<(AddressHash, HeldAnnounce)> {
+        let mut ic = self.ingress_control.lock().unwrap();
+        // Don't release while burst is active
+        if ic.should_ingress_limit(self.age()) {
+            return None;
+        }
+        ic.take_releasable_announce()
+    }
+
+    /// Get current incoming announce frequency in Hz.
+    pub fn incoming_announce_frequency(&self) -> f64 {
+        self.ingress_control.lock().unwrap().incoming_announce_frequency()
+    }
+
+    /// Get current outgoing announce frequency in Hz.
+    pub fn outgoing_announce_frequency(&self) -> f64 {
+        self.ingress_control.lock().unwrap().outgoing_announce_frequency()
+    }
+
+    /// Get count of currently held announces.
+    pub fn held_announce_count(&self) -> usize {
+        self.ingress_control.lock().unwrap().held_count()
+    }
 }
 
 impl std::fmt::Debug for InterfaceMetadata {
@@ -353,6 +672,7 @@ impl std::fmt::Debug for InterfaceMetadata {
             .field("announce_rate_target", &self.announce_rate_target)
             .field("announce_rate_grace", &self.announce_rate_grace)
             .field("announce_rate_penalty", &self.announce_rate_penalty)
+            .field("held_announces", &self.held_announce_count())
             .finish()
     }
 }
@@ -603,5 +923,214 @@ mod tests {
     #[test]
     fn test_ic_new_time() {
         assert_eq!(IC_NEW_TIME.as_secs(), 7200);
+    }
+
+    #[test]
+    fn test_ic_constants() {
+        assert_eq!(IA_FREQ_SAMPLES, 6);
+        assert_eq!(OA_FREQ_SAMPLES, 6);
+        assert_eq!(MAX_HELD_ANNOUNCES, 256);
+        assert_eq!(IC_BURST_FREQ_NEW, 3.5);
+        assert_eq!(IC_BURST_FREQ, 12.0);
+        assert_eq!(IC_BURST_HOLD.as_secs(), 60);
+        assert_eq!(IC_BURST_PENALTY.as_secs(), 300);
+        assert_eq!(IC_HELD_RELEASE_INTERVAL.as_secs(), 30);
+    }
+
+    #[test]
+    fn test_freq_deque_empty_returns_zero() {
+        let dq = FreqDeque::new(6);
+        assert_eq!(dq.frequency(), 0.0);
+    }
+
+    #[test]
+    fn test_freq_deque_single_sample_returns_zero() {
+        let mut dq = FreqDeque::new(6);
+        dq.push(Instant::now());
+        assert_eq!(dq.frequency(), 0.0);
+    }
+
+    #[test]
+    fn test_freq_deque_two_samples() {
+        let mut dq = FreqDeque::new(6);
+        let now = Instant::now();
+        dq.times.push_back(now - Duration::from_secs(1));
+        dq.times.push_back(now);
+        // 2 samples with ~1 second spread + ~0 elapsed => freq ~= 2/1 = 2 Hz
+        let freq = dq.frequency();
+        assert!(freq > 1.5 && freq < 2.5, "freq was {}", freq);
+    }
+
+    #[test]
+    fn test_freq_deque_capacity_bounded() {
+        let mut dq = FreqDeque::new(3);
+        for _ in 0..5 {
+            dq.push(Instant::now());
+        }
+        assert_eq!(dq.times.len(), 3);
+    }
+
+    #[test]
+    fn test_freq_deque_evicts_oldest() {
+        let mut dq = FreqDeque::new(3);
+        let t1 = Instant::now();
+        let t2 = t1 + Duration::from_millis(100);
+        let t3 = t2 + Duration::from_millis(100);
+        let t4 = t3 + Duration::from_millis(100);
+
+        dq.times.push_back(t1);
+        dq.times.push_back(t2);
+        dq.times.push_back(t3);
+        assert_eq!(dq.times.len(), 3);
+
+        dq.push(t4);
+        assert_eq!(dq.times.len(), 3);
+        // t1 should have been evicted
+        assert_eq!(dq.times[0], t2);
+    }
+
+    #[test]
+    fn test_ingress_control_disabled() {
+        let mut ic = IngressControl::new(false);
+        // Should never limit when disabled
+        assert!(!ic.should_ingress_limit(Duration::from_secs(0)));
+        assert!(!ic.should_ingress_limit(IC_NEW_TIME + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_ingress_control_no_burst_below_threshold() {
+        let mut ic = IngressControl::new(true);
+        // No samples -> frequency is 0 -> no burst
+        assert!(!ic.should_ingress_limit(IC_NEW_TIME + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_ingress_control_burst_activation() {
+        let mut ic = IngressControl::new(true);
+        // Simulate high-frequency announces by pushing timestamps very close together
+        let now = Instant::now();
+        for i in 0..6 {
+            ic.ia_freq.times.push_back(now - Duration::from_millis(50 * (5 - i)));
+        }
+        // 6 samples over ~250ms => freq ~= 6/0.25 = 24 Hz, well above IC_BURST_FREQ (12)
+        let age = IC_NEW_TIME + Duration::from_secs(1); // Established interface
+        assert!(ic.should_ingress_limit(age));
+        assert!(ic.burst_active);
+    }
+
+    #[test]
+    fn test_ingress_control_burst_new_interface_lower_threshold() {
+        let mut ic = IngressControl::new(true);
+        // Frequency that's above IC_BURST_FREQ_NEW (3.5) but below IC_BURST_FREQ (12)
+        let now = Instant::now();
+        for i in 0..6 {
+            // 6 samples over ~1 second => freq ~= 6 Hz
+            ic.ia_freq.times.push_back(now - Duration::from_millis(200 * (5 - i)));
+        }
+        // New interface should trigger burst at 3.5 Hz
+        assert!(ic.should_ingress_limit(Duration::from_secs(60)));
+        // Established interface should not trigger burst at 6 Hz (threshold is 12)
+        let mut ic2 = IngressControl::new(true);
+        for i in 0..6 {
+            ic2.ia_freq.times.push_back(now - Duration::from_millis(200 * (5 - i)));
+        }
+        assert!(!ic2.should_ingress_limit(IC_NEW_TIME + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_ingress_control_hold_announce() {
+        let mut ic = IngressControl::new(true);
+        let dest = AddressHash::new_from_slice(&[1u8; 32]);
+        let iface = AddressHash::new_from_slice(&[2u8; 32]);
+        let packet = Packet::default();
+
+        ic.hold_announce(dest, packet, iface);
+        assert_eq!(ic.held_count(), 1);
+
+        // Replace for same destination
+        ic.hold_announce(dest, packet, iface);
+        assert_eq!(ic.held_count(), 1);
+
+        // Different destination
+        let dest2 = AddressHash::new_from_slice(&[3u8; 32]);
+        ic.hold_announce(dest2, packet, iface);
+        assert_eq!(ic.held_count(), 2);
+    }
+
+    #[test]
+    fn test_ingress_control_hold_capacity_limit() {
+        let mut ic = IngressControl::new(true);
+        let iface = AddressHash::new_from_slice(&[0u8; 32]);
+        let packet = Packet::default();
+
+        // Fill to capacity
+        for i in 0..MAX_HELD_ANNOUNCES {
+            let mut dest_bytes = [0u8; 32];
+            dest_bytes[0] = (i & 0xFF) as u8;
+            dest_bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let dest = AddressHash::new_from_slice(&dest_bytes);
+            ic.hold_announce(dest, packet, iface);
+        }
+        assert_eq!(ic.held_count(), MAX_HELD_ANNOUNCES);
+
+        // One more should be silently dropped
+        let extra = AddressHash::new_from_slice(&[0xFF; 32]);
+        ic.hold_announce(extra, packet, iface);
+        assert_eq!(ic.held_count(), MAX_HELD_ANNOUNCES);
+    }
+
+    #[test]
+    fn test_ingress_control_release_selects_min_hops() {
+        use crate::packet::Header;
+
+        let mut ic = IngressControl::new(true);
+        let iface = AddressHash::new_from_slice(&[0u8; 32]);
+        // held_release is initialized to Instant::now(), so it should be immediately passable
+
+        let dest1 = AddressHash::new_from_slice(&[1u8; 32]);
+        let dest2 = AddressHash::new_from_slice(&[2u8; 32]);
+
+        let mut pkt_high_hops = Packet::default();
+        pkt_high_hops.header.hops = 5;
+        let mut pkt_low_hops = Packet::default();
+        pkt_low_hops.header.hops = 1;
+
+        ic.hold_announce(dest1, pkt_high_hops, iface);
+        ic.hold_announce(dest2, pkt_low_hops, iface);
+
+        // Should release the one with fewer hops
+        let released = ic.take_releasable_announce();
+        assert!(released.is_some());
+        let (dest, held) = released.unwrap();
+        assert_eq!(dest, dest2);
+        assert_eq!(held.packet.header.hops, 1);
+        assert_eq!(ic.held_count(), 1);
+    }
+
+    #[test]
+    fn test_metadata_ingress_accessors() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "");
+        assert_eq!(meta.incoming_announce_frequency(), 0.0);
+        assert_eq!(meta.outgoing_announce_frequency(), 0.0);
+        assert_eq!(meta.held_announce_count(), 0);
+
+        // Record some announces
+        meta.record_incoming_announce();
+        meta.record_outgoing_announce();
+        // After one sample, frequency is still 0 (need >=2)
+        assert_eq!(meta.incoming_announce_frequency(), 0.0);
+        assert_eq!(meta.outgoing_announce_frequency(), 0.0);
+    }
+
+    #[test]
+    fn test_metadata_ingress_control_disabled() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "")
+            .with_ingress_control_disabled();
+        let dest = AddressHash::new_from_slice(&[1u8; 32]);
+        let iface = AddressHash::new_from_slice(&[2u8; 32]);
+        let packet = Packet::default();
+
+        // Should never hold when disabled
+        assert!(!meta.check_ingress_and_hold(dest, packet, iface));
     }
 }
