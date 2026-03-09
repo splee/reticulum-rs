@@ -131,6 +131,23 @@ pub struct InterfaceMetadata {
     pub spawned_interfaces: Vec<AddressHash>,
     /// Tunnel ID for tunneled interfaces
     pub tunnel_id: Option<AddressHash>,
+    /// Whether interface can receive packets (Python: Interface.IN)
+    pub dir_in: bool,
+    /// Whether interface can transmit packets (Python: Interface.OUT)
+    pub dir_out: bool,
+    /// Whether interface can forward packets (Python: Interface.FWD)
+    pub fwd: bool,
+    /// Whether interface can repeat packets (Python: Interface.RPT)
+    pub rpt: bool,
+    /// Per-interface announce rate target in seconds (None = no rate limit).
+    /// Python: `interface.announce_rate_target`
+    pub announce_rate_target: Option<u64>,
+    /// Per-interface announce rate grace violations before blocking.
+    /// Python: `interface.announce_rate_grace`
+    pub announce_rate_grace: Option<u32>,
+    /// Per-interface announce rate penalty in seconds.
+    /// Python: `interface.announce_rate_penalty`
+    pub announce_rate_penalty: Option<u64>,
     /// Hardware MTU in bytes. None means use default.
     /// Python: self.HW_MTU
     pub hw_mtu: Option<usize>,
@@ -175,6 +192,13 @@ impl InterfaceMetadata {
             bootstrap_only: false,
             spawned_interfaces: Vec::new(),
             tunnel_id: None,
+            dir_in: true,
+            dir_out: true,
+            fwd: false,
+            rpt: false,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
             hw_mtu: None,
             autoconfigure_mtu: false,
             fixed_mtu: false,
@@ -216,6 +240,21 @@ impl InterfaceMetadata {
         self.hw_mtu = Some(mtu);
         self.fixed_mtu = true;
         self.autoconfigure_mtu = false;
+        self
+    }
+
+    /// Set the direction flags (IN and OUT).
+    pub fn with_direction(mut self, dir_in: bool, dir_out: bool) -> Self {
+        self.dir_in = dir_in;
+        self.dir_out = dir_out;
+        self
+    }
+
+    /// Set per-interface announce rate limiting parameters.
+    pub fn with_announce_rate(mut self, target: u64, grace: u32, penalty: u64) -> Self {
+        self.announce_rate_target = Some(target);
+        self.announce_rate_grace = Some(grace);
+        self.announce_rate_penalty = Some(penalty);
         self
     }
 
@@ -307,6 +346,13 @@ impl std::fmt::Debug for InterfaceMetadata {
             .field("rx_bytes", &self.get_rx_bytes())
             .field("tx_bytes", &self.get_tx_bytes())
             .field("endpoint_address", &self.endpoint_address)
+            .field("dir_in", &self.dir_in)
+            .field("dir_out", &self.dir_out)
+            .field("fwd", &self.fwd)
+            .field("rpt", &self.rpt)
+            .field("announce_rate_target", &self.announce_rate_target)
+            .field("announce_rate_grace", &self.announce_rate_grace)
+            .field("announce_rate_penalty", &self.announce_rate_penalty)
             .finish()
     }
 }
@@ -434,6 +480,41 @@ mod tests {
         assert_eq!(InterfaceMode::from(0x00), InterfaceMode::Full);
         assert_eq!(InterfaceMode::from(0x07), InterfaceMode::Full);
         assert_eq!(InterfaceMode::from(0xFF), InterfaceMode::Full);
+    }
+
+    #[test]
+    fn test_direction_flag_defaults() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "");
+        // Python: IN=True, OUT=True by default; FWD=False, RPT=False
+        assert!(meta.dir_in);
+        assert!(meta.dir_out);
+        assert!(!meta.fwd);
+        assert!(!meta.rpt);
+    }
+
+    #[test]
+    fn test_direction_builder() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "")
+            .with_direction(false, true);
+        assert!(!meta.dir_in);
+        assert!(meta.dir_out);
+    }
+
+    #[test]
+    fn test_announce_rate_defaults() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "");
+        assert!(meta.announce_rate_target.is_none());
+        assert!(meta.announce_rate_grace.is_none());
+        assert!(meta.announce_rate_penalty.is_none());
+    }
+
+    #[test]
+    fn test_announce_rate_builder() {
+        let meta = InterfaceMetadata::new("test", "test", "test", "")
+            .with_announce_rate(3600, 10, 7200);
+        assert_eq!(meta.announce_rate_target, Some(3600));
+        assert_eq!(meta.announce_rate_grace, Some(10));
+        assert_eq!(meta.announce_rate_penalty, Some(7200));
     }
 
     #[test]

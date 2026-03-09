@@ -244,14 +244,22 @@ impl AnnounceLimits {
         }
     }
 
-    /// Check and record an announce, returning block duration if rate limited
-    pub fn check(&mut self, destination: &AddressHash) -> Option<Duration> {
+    /// Check and record an announce, returning block duration if rate limited.
+    ///
+    /// When `rate_limit` is `None`, the entry tracks timestamps for rate info
+    /// queries but never blocks — matching Python behavior where interfaces
+    /// without `announce_rate_target` set do not rate-limit.
+    pub fn check(
+        &mut self,
+        destination: &AddressHash,
+        rate_limit: Option<AnnounceRateLimit>,
+    ) -> Option<Duration> {
         if let Some(entry) = self.limits.get_mut(destination) {
             return entry.handle_announce();
         }
 
-        // Create new entry with default rate limits and record this announce
-        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));
+        // Create new entry with the provided rate limit (or None for no limiting)
+        let mut entry = AnnounceLimitEntry::new(rate_limit);
         let result = entry.handle_announce();
         self.limits.insert(*destination, entry);
 
@@ -317,8 +325,8 @@ mod tests {
         let mut limits = AnnounceLimits::new();
         let dest = zero_address_hash();
 
-        // First check creates the entry
-        limits.check(&dest);
+        // First check creates the entry (no rate limit)
+        limits.check(&dest, None);
 
         // Get rate info
         let rate_table = limits.get_rate_table();
@@ -336,12 +344,45 @@ mod tests {
         let mut limits = AnnounceLimits::new();
         let dest = zero_address_hash();
 
-        // Make multiple announces
+        // Make multiple announces (no rate limit — should never block)
         for _ in 0..5 {
-            limits.check(&dest);
+            assert!(limits.check(&dest, None).is_none());
         }
 
         let info = limits.get_rate_info(&dest).unwrap();
         assert_eq!(info.timestamps.len(), 5);
+    }
+
+    #[test]
+    fn test_no_rate_limit_never_blocks() {
+        let mut limits = AnnounceLimits::new();
+        let dest = zero_address_hash();
+
+        // With no rate limit, rapid announces should never be blocked
+        for _ in 0..100 {
+            assert!(limits.check(&dest, None).is_none());
+        }
+    }
+
+    #[test]
+    fn test_with_rate_limit_blocks_after_grace() {
+        let mut limits = AnnounceLimits::new();
+        let dest = zero_address_hash();
+
+        let rate_limit = || Some(AnnounceRateLimit {
+            target: Duration::from_secs(3600),
+            grace: 2,
+            penalty: Some(Duration::from_secs(7200)),
+        });
+
+        // First announce: creates entry, no block
+        assert!(limits.check(&dest, rate_limit()).is_none());
+
+        // Rapid announces: violation 1 (under grace of 2)
+        assert!(limits.check(&dest, rate_limit()).is_none());
+
+        // Rapid announce: violation 2 = grace threshold, should block
+        let blocked = limits.check(&dest, rate_limit());
+        assert!(blocked.is_some());
     }
 }
