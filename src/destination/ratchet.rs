@@ -207,11 +207,41 @@ impl RatchetState {
     /// Returns Ok(true) if ratchets were reloaded, Ok(false) if no path is configured.
     /// This is used to retry decryption after ratchet drift between in-memory and
     /// persisted state (Python: Destination.py:640-649).
+    ///
+    /// On I/O failure, retries once after 500ms to handle concurrent access conflicts
+    /// (matching Python's `_reload_ratchets()` retry logic). On second failure, clears
+    /// all ratchet state and returns an error.
     pub fn reload(&mut self, identity: &PrivateIdentity) -> Result<bool, RnsError> {
         if let Some(path) = self.ratchets_path.clone() {
             if path.exists() {
-                self.load_from_file(&path, identity)?;
-                Ok(true)
+                match self.load_from_file(&path, identity) {
+                    Ok(()) => Ok(true),
+                    Err(first_err) => {
+                        log::warn!(
+                            "First ratchet reload attempt failed, possible I/O conflict. \
+                             Retrying in 500ms. Error: {first_err}"
+                        );
+                        std::thread::sleep(Duration::from_millis(500));
+                        match self.load_from_file(&path, identity) {
+                            Ok(()) => {
+                                log::info!("Ratchet reload retry succeeded");
+                                Ok(true)
+                            }
+                            Err(second_err) => {
+                                log::error!(
+                                    "Ratchet file at {:?} could not be loaded after retry. \
+                                     File may be corrupt.",
+                                    path
+                                );
+                                // Clear state on permanent failure (matches Python behavior)
+                                self.ratchets.clear();
+                                self.ratchets_path = None;
+                                self.latest_ratchet_id = None;
+                                Err(second_err)
+                            }
+                        }
+                    }
+                }
             } else {
                 Ok(false)
             }
@@ -349,5 +379,71 @@ mod tests {
         let _result = state.rotate_if_needed(&identity);
         // Note: This will fail because the path doesn't exist,
         // but we can test the rotation logic separately
+    }
+
+    #[test]
+    fn test_reload_corrupt_file_clears_state() {
+        // Write invalid data to a file to simulate corruption
+        let dir = tempfile::tempdir().unwrap();
+        let ratchet_path = dir.path().join("ratchets");
+        std::fs::write(&ratchet_path, b"this is not valid msgpack data").unwrap();
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut state = RatchetState::new_disabled();
+        state.ratchets_path = Some(ratchet_path);
+
+        // reload() should fail on both attempts and clear state
+        let result = state.reload(&identity);
+        assert!(result.is_err(), "Expected error from corrupt ratchet file");
+        assert!(state.ratchets_path.is_none(), "ratchets_path should be cleared after double failure");
+        assert!(state.ratchets.is_empty(), "ratchets should be cleared after double failure");
+        assert!(state.latest_ratchet_id.is_none(), "latest_ratchet_id should be cleared after double failure");
+    }
+
+    #[test]
+    fn test_reload_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ratchet_path = dir.path().join("ratchets");
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut state = RatchetState::new_disabled();
+
+        // Enable and generate a ratchet, which persists to file
+        state.enable(ratchet_path.clone(), &identity).unwrap();
+        state.set_interval(Duration::from_secs(0));
+        state.rotate_if_needed(&identity).unwrap();
+        assert!(!state.ratchets.is_empty(), "Should have at least one ratchet after rotation");
+        let original_count = state.ratchets.len();
+        let original_ratchet_id = state.latest_ratchet_id;
+
+        // Clear in-memory state (but keep the path so reload works)
+        state.ratchets.clear();
+        state.latest_ratchet_id = None;
+        assert!(state.ratchets.is_empty());
+
+        // Reload from file should restore state
+        let reloaded = state.reload(&identity).unwrap();
+        assert!(reloaded, "reload() should return true when file exists and loads");
+        assert_eq!(state.ratchets.len(), original_count, "Ratchet count should match after reload");
+        assert_eq!(state.latest_ratchet_id, original_ratchet_id, "Ratchet ID should match after reload");
+    }
+
+    #[test]
+    fn test_reload_no_path_returns_false() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut state = RatchetState::new_disabled();
+
+        let result = state.reload(&identity).unwrap();
+        assert!(!result, "reload() with no path should return false");
+    }
+
+    #[test]
+    fn test_reload_missing_file_returns_false() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut state = RatchetState::new_disabled();
+        state.ratchets_path = Some(PathBuf::from("/tmp/nonexistent_ratchet_file_12345"));
+
+        let result = state.reload(&identity).unwrap();
+        assert!(!result, "reload() with nonexistent file should return false");
     }
 }
