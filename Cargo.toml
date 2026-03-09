@@ -85,11 +85,14 @@ ctrlc = "3.4"
 # Hex encoding (for test binaries)
 hex = "0.4"
 
+# Network interface enumeration (for AutoInterface)
+if-addrs = "0.13"
+
 # Base32/Base64 encoding
 data-encoding = "2.6"
 
-# libc for Linux-specific TCP socket options (TCP_USER_TIMEOUT)
-[target.'cfg(target_os = "linux")'.dependencies]
+# libc for platform-specific socket options and interface enumeration
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
