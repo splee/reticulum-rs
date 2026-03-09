@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
+use crate::config::InterfaceConfig;
 use crate::error::RnsError;
-use crate::iface::stats::InterfaceMetadata;
+use crate::iface::stats::{InterfaceMetadata, InterfaceMode};
 
 use super::tcp_client::TcpClient;
 use super::tcp_options::configure_tcp_socket;
@@ -18,6 +19,18 @@ pub struct TcpServer {
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     /// When true, use KISS framing instead of HDLC for all clients
     kiss_framing: bool,
+    /// Interface operating mode from config
+    mode: Option<InterfaceMode>,
+    /// Interface bitrate from config
+    bitrate: Option<u64>,
+    /// Whether interface can transmit packets
+    dir_out: Option<bool>,
+    /// Per-interface announce rate target in seconds
+    announce_rate_target: Option<u64>,
+    /// Per-interface announce rate grace violations
+    announce_rate_grace: Option<u32>,
+    /// Per-interface announce rate penalty in seconds
+    announce_rate_penalty: Option<u64>,
 }
 
 impl TcpServer {
@@ -30,6 +43,12 @@ impl TcpServer {
             addr: addr.into(),
             iface_manager,
             kiss_framing: false,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -43,6 +62,12 @@ impl TcpServer {
             addr: addr.into(),
             iface_manager,
             kiss_framing,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -52,10 +77,24 @@ impl TcpServer {
         self
     }
 
+    /// Apply configuration from an InterfaceConfig.
+    pub fn with_config(mut self, config: &InterfaceConfig) -> Self {
+        self.mode = config.mode;
+        self.bitrate = config.bitrate;
+        self.dir_out = Some(config.outgoing);
+        self.announce_rate_target = config.announce_rate_target;
+        self.announce_rate_grace = config.announce_rate_grace;
+        self.announce_rate_penalty = config.announce_rate_penalty;
+        self
+    }
+
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let (addr, kiss_framing) = {
+        let (addr, kiss_framing, mode, bitrate, dir_out,
+             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
             let inner = context.inner.lock().await;
-            (inner.addr.clone(), inner.kiss_framing)
+            (inner.addr.clone(), inner.kiss_framing, inner.mode, inner.bitrate,
+             inner.dir_out, inner.announce_rate_target, inner.announce_rate_grace,
+             inner.announce_rate_penalty)
         };
         let iface_address = context.channel.address;
 
@@ -64,15 +103,32 @@ impl TcpServer {
         // Create interface metadata for stats tracking.
         // Name matches Python's TCPServerInterface.__str__() format (no framing suffix).
         let framing_type = if kiss_framing { "KISS" } else { "HDLC" };
+        let effective_bitrate = bitrate.unwrap_or(10_000_000); // BITRATE_GUESS = 10 Mbps
         let mut meta = InterfaceMetadata::new(
             format!("TCPServerInterface[{}]", addr),
             "TCPServer",
             "TCPServerInterface",
             addr.clone(),
         )
-        .with_bitrate(10_000_000) // BITRATE_GUESS = 10 Mbps
+        .with_bitrate(effective_bitrate)
+        .with_direction(true, dir_out.unwrap_or(true))
         .with_autoconfigure_mtu()
         .with_hw_mtu(262144);
+
+        // Apply interface mode from config
+        if let Some(m) = mode {
+            meta = meta.with_mode(m);
+        }
+
+        // Apply announce rate limiting from config
+        if let Some(target) = announce_rate_target {
+            meta = meta.with_announce_rate(
+                target,
+                announce_rate_grace.unwrap_or(0),
+                announce_rate_penalty.unwrap_or(0),
+            );
+        }
+
         meta.optimise_mtu();
         let metadata = Arc::new(meta);
 
@@ -159,10 +215,22 @@ impl TcpServer {
                             let mut iface_manager = iface_manager.lock().await;
 
                             // Spawn client with the same framing mode as the server.
-                            // Name matches Python's format for server-spawned clients.
+                            // Propagate config from server to spawned client
+                            // (Python: TCPInterface.py:576-619).
                             let client_name = format!("TCPInterface[{}]", peer_addr);
+                            let mut client = TcpClient::new_from_stream_with_framing(
+                                peer_addr.to_string(), stream, kiss_framing,
+                            );
+                            // Propagate server config to spawned client
+                            client.mode = mode;
+                            client.bitrate = bitrate;
+                            client.dir_out = dir_out;
+                            client.announce_rate_target = announce_rate_target;
+                            client.announce_rate_grace = announce_rate_grace;
+                            client.announce_rate_penalty = announce_rate_penalty;
+
                             iface_manager.spawn(
-                                TcpClient::new_from_stream_with_framing(peer_addr.to_string(), stream, kiss_framing),
+                                client,
                                 TcpClient::spawn,
                                 &client_name,
                             );

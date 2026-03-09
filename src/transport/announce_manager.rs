@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use crate::hash::AddressHash;
 use crate::packet::Packet;
 
-use super::announce_limits::{AnnounceLimits, RateInfo};
+use super::announce_limits::{AnnounceLimits, AnnounceRateLimit, RateInfo};
 use super::announce_table::AnnounceTable;
 use super::AnnounceEvent;
 
@@ -50,8 +50,14 @@ impl AnnounceManager {
     ///
     /// Returns the block duration if the announce is rate limited,
     /// or None if it should be processed normally.
-    pub fn check_rate_limit(&mut self, destination: &AddressHash) -> Option<Duration> {
-        self.limits.check(destination)
+    /// When `rate_limit` is `None`, no rate limiting applies (matching Python
+    /// behavior for interfaces without `announce_rate_target`).
+    pub fn check_rate_limit(
+        &mut self,
+        destination: &AddressHash,
+        rate_limit: Option<AnnounceRateLimit>,
+    ) -> Option<Duration> {
+        self.limits.check(destination, rate_limit)
     }
 
     /// Get rate information for all tracked destinations.
@@ -190,8 +196,8 @@ mod tests {
         let mut manager = AnnounceManager::new(tx);
         let dest = zero_address_hash();
 
-        // First check should not be rate limited
-        assert!(manager.check_rate_limit(&dest).is_none());
+        // First check should not be rate limited (no rate limit configured)
+        assert!(manager.check_rate_limit(&dest, None).is_none());
 
         // Should now have rate info
         let info = manager.get_rate_info(&dest);

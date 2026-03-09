@@ -15,6 +15,9 @@ use tokio::io::AsyncReadExt;
 
 use alloc::string::String;
 
+use crate::config::InterfaceConfig;
+use crate::iface::stats::InterfaceMode;
+
 use super::hdlc::Hdlc;
 use super::kiss::Kiss;
 use super::tcp_options::configure_tcp_socket;
@@ -37,6 +40,18 @@ pub struct TcpClient {
     kiss_framing: bool,
     /// User-configured fixed MTU (bytes). When set, disables MTU auto-configuration.
     fixed_mtu: Option<usize>,
+    /// Interface operating mode from config
+    pub(crate) mode: Option<InterfaceMode>,
+    /// Interface bitrate from config
+    pub(crate) bitrate: Option<u64>,
+    /// Whether interface can transmit packets
+    pub(crate) dir_out: Option<bool>,
+    /// Per-interface announce rate target in seconds
+    pub(crate) announce_rate_target: Option<u64>,
+    /// Per-interface announce rate grace violations
+    pub(crate) announce_rate_grace: Option<u32>,
+    /// Per-interface announce rate penalty in seconds
+    pub(crate) announce_rate_penalty: Option<u64>,
 }
 
 impl TcpClient {
@@ -47,6 +62,12 @@ impl TcpClient {
             stream: None,
             kiss_framing: false,
             fixed_mtu: None,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -57,6 +78,12 @@ impl TcpClient {
             stream: Some(stream),
             kiss_framing: false,
             fixed_mtu: None,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -71,6 +98,12 @@ impl TcpClient {
             stream: None,
             kiss_framing,
             fixed_mtu: None,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -81,6 +114,12 @@ impl TcpClient {
             stream: Some(stream),
             kiss_framing,
             fixed_mtu: None,
+            mode: None,
+            bitrate: None,
+            dir_out: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
         }
     }
 
@@ -96,6 +135,20 @@ impl TcpClient {
         self
     }
 
+    /// Apply configuration from an InterfaceConfig.
+    pub fn with_config(mut self, config: &InterfaceConfig) -> Self {
+        self.mode = config.mode;
+        self.bitrate = config.bitrate;
+        self.dir_out = Some(config.outgoing);
+        self.announce_rate_target = config.announce_rate_target;
+        self.announce_rate_grace = config.announce_rate_grace;
+        self.announce_rate_penalty = config.announce_rate_penalty;
+        if let Some(mtu) = config.fixed_mtu {
+            self.fixed_mtu = Some(mtu);
+        }
+        self
+    }
+
     /// Check if KISS framing is enabled.
     pub fn is_kiss_framing(&self) -> bool {
         self.kiss_framing
@@ -103,22 +156,42 @@ impl TcpClient {
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
-        let (addr, kiss_framing, fixed_mtu) = {
+        let (addr, kiss_framing, fixed_mtu, mode, bitrate, dir_out,
+             announce_rate_target, announce_rate_grace, announce_rate_penalty) = {
             let inner = context.inner.lock().await;
-            (inner.addr.clone(), inner.kiss_framing, inner.fixed_mtu)
+            (inner.addr.clone(), inner.kiss_framing, inner.fixed_mtu,
+             inner.mode, inner.bitrate, inner.dir_out,
+             inner.announce_rate_target, inner.announce_rate_grace,
+             inner.announce_rate_penalty)
         };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().await.stream.take() };
 
         // Create interface metadata for stats tracking.
         // Name matches Python's TCPInterface.__str__() format (no framing suffix).
+        let effective_bitrate = bitrate.unwrap_or(10_000_000); // BITRATE_GUESS = 10 Mbps
         let mut meta = InterfaceMetadata::new(
             format!("TCPInterface[{}]", addr),
             "TCPClient",
             "TCPClientInterface",
             addr.clone(),
         )
-        .with_bitrate(10_000_000); // TCPClientInterface.BITRATE_GUESS = 10 Mbps
+        .with_bitrate(effective_bitrate)
+        .with_direction(true, dir_out.unwrap_or(true));
+
+        // Apply interface mode from config
+        if let Some(m) = mode {
+            meta = meta.with_mode(m);
+        }
+
+        // Apply announce rate limiting from config
+        if let Some(target) = announce_rate_target {
+            meta = meta.with_announce_rate(
+                target,
+                announce_rate_grace.unwrap_or(0),
+                announce_rate_penalty.unwrap_or(0),
+            );
+        }
 
         // Configure MTU: use fixed value from config, or auto-configure from bitrate
         if let Some(mtu) = fixed_mtu {

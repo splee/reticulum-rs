@@ -62,6 +62,7 @@ use crate::persistence::{KnownDestinations, RatchetManager};
 
 pub mod announce_handler;
 mod announce_limits;
+use announce_limits::AnnounceRateLimit;
 pub mod announce_manager;
 pub mod announce_queue;
 mod announce_table;
@@ -2714,7 +2715,23 @@ async fn handle_announce<'a>(
         handler.config.is_client_mode()
     );
 
-    if let Some(blocked_until) = handler.announce_manager.check_rate_limit(&packet.destination) {
+    // Build per-interface rate limit from the receiving interface's metadata.
+    // Python: only rate-limits when `interface.announce_rate_target != None`.
+    // Skip rate check for PATH_RESPONSE context (Python: Transport.py:1692).
+    let rate_limit = if packet.context != PacketContext::None {
+        // PATH_RESPONSE and other non-default contexts skip rate limiting
+        None
+    } else if let Some(meta) = handler.interface_registry.get(&iface).await {
+        meta.announce_rate_target.map(|target| AnnounceRateLimit {
+            target: Duration::from_secs(target),
+            grace: meta.announce_rate_grace.unwrap_or(0),
+            penalty: Some(Duration::from_secs(meta.announce_rate_penalty.unwrap_or(0))),
+        })
+    } else {
+        None
+    };
+
+    if let Some(blocked_until) = handler.announce_manager.check_rate_limit(&packet.destination, rate_limit) {
         log::info!(
             "tp({}): too many announces from {}, blocked for {} seconds",
             handler.config.name,

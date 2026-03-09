@@ -473,6 +473,22 @@ impl ReticulumConfig {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                // Parse announce rate limiting fields (Python: Reticulum.py:692-711)
+                let announce_rate_target = subsection
+                    .get_int("announce_rate_target")
+                    .filter(|&v| v > 0)
+                    .map(|v| v as u64);
+                let announce_rate_grace = subsection
+                    .get_int("announce_rate_grace")
+                    .filter(|&v| v >= 0)
+                    .map(|v| v as u32)
+                    .or_else(|| announce_rate_target.map(|_| 0));
+                let announce_rate_penalty = subsection
+                    .get_int("announce_rate_penalty")
+                    .filter(|&v| v >= 0)
+                    .map(|v| v as u64)
+                    .or_else(|| announce_rate_target.map(|_| 0));
+
                 interfaces.push(InterfaceConfig {
                     name: name.clone(),
                     interface_type: subsection
@@ -492,6 +508,9 @@ impl ReticulumConfig {
                     outgoing: subsection.get_bool("outgoing").unwrap_or(true),
                     bitrate: subsection.get_int("bitrate").map(|b| b as u64),
                     fixed_mtu: subsection.get_int("mtu").map(|m| m as usize),
+                    announce_rate_target,
+                    announce_rate_grace,
+                    announce_rate_penalty,
                     extra: subsection.values.clone(),
                 });
             }
@@ -530,6 +549,15 @@ pub struct InterfaceConfig {
     pub bitrate: Option<u64>,
     /// Fixed interface MTU (bytes), if configured
     pub fixed_mtu: Option<usize>,
+    /// Per-interface announce rate target in seconds (None = no rate limit).
+    /// Python: `announce_rate_target`
+    pub announce_rate_target: Option<u64>,
+    /// Per-interface announce rate grace violations before blocking.
+    /// Python: `announce_rate_grace`
+    pub announce_rate_grace: Option<u32>,
+    /// Per-interface announce rate penalty in seconds.
+    /// Python: `announce_rate_penalty`
+    pub announce_rate_penalty: Option<u64>,
     /// Additional configuration values
     pub extra: HashMap<String, String>,
 }
@@ -744,6 +772,57 @@ mod tests {
         assert_eq!(iface1.passphrase, Some("test_pass".to_string()));
         assert_eq!(iface2.passphrase, Some("legacy_pass".to_string()));
         assert_eq!(iface3.passphrase, Some("canonical_pass".to_string()));
+    }
+
+    #[test]
+    fn test_announce_rate_config_parsing() {
+        let content = r#"
+[reticulum]
+  enable_transport = false
+
+[interfaces]
+  [[RateLimited]]
+    type = TCPClientInterface
+    target_host = example.com
+    target_port = 4242
+    announce_rate_target = 3600
+    announce_rate_grace = 10
+    announce_rate_penalty = 7200
+
+  [[TargetOnly]]
+    type = TCPClientInterface
+    target_host = example.com
+    target_port = 4243
+    announce_rate_target = 1800
+
+  [[NoRateLimit]]
+    type = TCPClientInterface
+    target_host = example.com
+    target_port = 4244
+"#;
+        let parsed = Config::parse(content);
+        let config = ReticulumConfig::from_parsed_config(StoragePaths::new("/tmp/test"), parsed);
+        let interfaces = config.interface_configs();
+
+        assert_eq!(interfaces.len(), 3);
+
+        // Fully specified rate limiting
+        let rate_limited = interfaces.iter().find(|i| i.name == "RateLimited").unwrap();
+        assert_eq!(rate_limited.announce_rate_target, Some(3600));
+        assert_eq!(rate_limited.announce_rate_grace, Some(10));
+        assert_eq!(rate_limited.announce_rate_penalty, Some(7200));
+
+        // Target only: grace and penalty default to 0
+        let target_only = interfaces.iter().find(|i| i.name == "TargetOnly").unwrap();
+        assert_eq!(target_only.announce_rate_target, Some(1800));
+        assert_eq!(target_only.announce_rate_grace, Some(0));
+        assert_eq!(target_only.announce_rate_penalty, Some(0));
+
+        // No rate limit configured
+        let no_limit = interfaces.iter().find(|i| i.name == "NoRateLimit").unwrap();
+        assert!(no_limit.announce_rate_target.is_none());
+        assert!(no_limit.announce_rate_grace.is_none());
+        assert!(no_limit.announce_rate_penalty.is_none());
     }
 
     #[test]

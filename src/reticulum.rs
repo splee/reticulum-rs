@@ -635,7 +635,8 @@ impl Reticulum {
                     let name = format!("TCPServerInterface[{}/{}]", iface_config.name, addr);
 
                     transport.spawn_interface(
-                        TcpServer::new(&addr, transport.iface_manager()),
+                        TcpServer::new(&addr, transport.iface_manager())
+                            .with_config(&iface_config),
                         TcpServer::spawn,
                         &name,
                     ).await;
@@ -647,10 +648,8 @@ impl Reticulum {
                         let addr = format!("{}:{}", host, port);
                         let name = format!("TCPInterface[{}/{}]", iface_config.name, addr);
 
-                        let mut client = TcpClient::new(&addr);
-                        if let Some(mtu) = iface_config.fixed_mtu {
-                            client = client.with_fixed_mtu(mtu);
-                        }
+                        let client = TcpClient::new(&addr)
+                            .with_config(&iface_config);
 
                         transport.spawn_interface(
                             client,
