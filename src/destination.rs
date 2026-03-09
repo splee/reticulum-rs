@@ -489,6 +489,9 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     /// When set and announce() is called with app_data=None, this callback is invoked
     /// to generate app_data dynamically.
     pub default_app_data: Option<DefaultAppDataCallback>,
+    /// Whether this destination accepts incoming link requests (default: true).
+    /// Matches Python's `Destination.accept_link_requests`.
+    pub accept_link_requests: bool,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -520,6 +523,18 @@ impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
     /// Clear any previously set default app_data callback.
     pub fn clear_default_app_data(&mut self) {
         self.default_app_data = None;
+    }
+
+    /// Set whether this destination accepts incoming link requests.
+    /// Matches Python's `Destination.accepts_links(accepts)` setter behavior.
+    pub fn set_accepts_links(&mut self, accepts: bool) {
+        self.accept_link_requests = accepts;
+    }
+
+    /// Returns whether this destination accepts incoming link requests.
+    /// Matches Python's `Destination.accepts_links()` getter behavior.
+    pub fn accepts_links(&self) -> bool {
+        self.accept_link_requests
     }
 
     /// Decide whether to send a proof for a given packet.
@@ -567,6 +582,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
             default_app_data: None,
+            accept_link_requests: true,
         }
     }
 
@@ -755,8 +771,12 @@ impl Destination<PrivateIdentity, Input, Single> {
         }
 
         if packet.header.packet_type == PacketType::LinkRequest {
-            // Always prove link requests (matching Python's default behavior).
-            return DestinationHandleStatus::LinkProof;
+            // Only process link requests if accept_link_requests is enabled.
+            // Matches Python's Destination.incoming_link_request() check.
+            if self.accept_link_requests {
+                return DestinationHandleStatus::LinkProof;
+            }
+            return DestinationHandleStatus::None;
         }
 
         DestinationHandleStatus::None
@@ -1025,6 +1045,7 @@ impl Destination<Identity, Output, Single> {
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
             default_app_data: None,
+            accept_link_requests: true,
         }
     }
 
@@ -1098,6 +1119,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             ratchet_state: RatchetState::default(),
             latest_ratchet_id: None,
             default_app_data: None,
+            accept_link_requests: true,
         }
     }
 }
@@ -1709,5 +1731,66 @@ mod tests {
             validation.app_data.is_empty(),
             "after clear, announce should have no app_data"
         );
+    }
+
+    #[test]
+    fn test_accepts_links_default_true() {
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "linksdefault").unwrap();
+        let destination = SingleInputDestination::new(priv_identity, name);
+
+        assert!(destination.accepts_links(), "accept_link_requests should default to true");
+        assert!(destination.accept_link_requests, "field should also be true directly");
+    }
+
+    #[test]
+    fn test_accepts_links_setter() {
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "linkssetter").unwrap();
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        assert!(destination.accepts_links());
+
+        destination.set_accepts_links(false);
+        assert!(!destination.accepts_links(), "should be false after set_accepts_links(false)");
+
+        destination.set_accepts_links(true);
+        assert!(destination.accepts_links(), "should be true after set_accepts_links(true)");
+    }
+
+    #[test]
+    fn test_link_request_rejected_when_disabled() {
+        use crate::packet::{Header, PacketDataBuffer, PacketType, DestinationType};
+
+        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("testapp", "linkreject").unwrap();
+        let mut destination = SingleInputDestination::new(priv_identity, name);
+
+        // Build a minimal link request packet addressed to this destination
+        let packet = crate::packet::Packet {
+            header: Header {
+                packet_type: PacketType::LinkRequest,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination: destination.desc.address_hash,
+            data: PacketDataBuffer::new(),
+            ..Default::default()
+        };
+
+        // With accept_link_requests enabled (default), should return LinkProof
+        assert!(matches!(
+            destination.handle_packet(&packet),
+            super::DestinationHandleStatus::LinkProof
+        ));
+
+        // Disable link requests
+        destination.set_accepts_links(false);
+
+        // Should now return None
+        assert!(matches!(
+            destination.handle_packet(&packet),
+            super::DestinationHandleStatus::None
+        ));
     }
 }
