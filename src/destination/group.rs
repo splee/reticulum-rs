@@ -80,6 +80,16 @@ impl GroupKey {
         &self.full_key
     }
 
+    /// Get the signing key half (first 32 bytes, used for HMAC-SHA256)
+    pub fn signing_key(&self) -> &[u8; GROUP_KEY_HALF] {
+        &self.signing_key
+    }
+
+    /// Get the encryption key half (last 32 bytes, used for AES-256)
+    pub fn encryption_key(&self) -> &[u8; GROUP_KEY_HALF] {
+        &self.encryption_key
+    }
+
     /// Encrypt data with this group key
     pub fn encrypt<'a, R: CryptoRngCore + Copy>(
         &self,
