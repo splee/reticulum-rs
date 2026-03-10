@@ -137,8 +137,18 @@ impl LinkManager {
         received_from: AddressHash,
         next_hop: AddressHash,
         iface: AddressHash,
+        remaining_hops: u8,
+        receiving_iface_bitrate: Option<u64>,
     ) {
-        self.table.add(link_request, destination, received_from, next_hop, iface)
+        self.table.add(
+            link_request,
+            destination,
+            received_from,
+            next_hop,
+            iface,
+            remaining_hops,
+            receiving_iface_bitrate,
+        )
     }
 
     /// Get the original destination for a link (if validated).

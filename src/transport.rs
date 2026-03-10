@@ -3220,6 +3220,8 @@ async fn handle_link_request_as_intermediate<'a>(
     received_from: AddressHash,
     next_hop: AddressHash,
     next_hop_iface: AddressHash,
+    remaining_hops: u8,
+    receiving_iface_bitrate: Option<u64>,
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>
 ) {
@@ -3228,7 +3230,9 @@ async fn handle_link_request_as_intermediate<'a>(
         packet.destination,
         received_from,
         next_hop,
-        next_hop_iface
+        next_hop_iface,
+        remaining_hops,
+        receiving_iface_bitrate,
     );
 
     // Clamp link MTU signalling in relayed link requests so that endpoints
@@ -3311,13 +3315,22 @@ async fn handle_link_request<'a>(
             packet.destination
         );
 
+        let remaining_hops = handler.path_manager.hops_to(&packet.destination).unwrap_or(1);
+        let receiving_iface_bitrate = handler
+            .interface_registry
+            .get(&iface)
+            .await
+            .and_then(|m| m.bitrate);
+
         let (next_hop, next_iface) = entry;
         handle_link_request_as_intermediate(
             iface,
             next_hop,
             next_iface,
+            remaining_hops,
+            receiving_iface_bitrate,
             packet,
-            handler
+            handler,
         ).await;
     } else {
         log::trace!(

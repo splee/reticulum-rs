@@ -2,8 +2,22 @@ use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
 
 use crate::destination::link::LinkId;
+use crate::destination::link_watchdog::ESTABLISHMENT_TIMEOUT_PER_HOP;
 use crate::hash::AddressHash;
-use crate::packet::{Header, Packet};
+use crate::packet::{Header, Packet, RETICULUM_MTU};
+
+/// Extra proof timeout based on interface bitrate, matching Python's
+/// Transport.extra_link_proof_timeout(). Accounts for transmission
+/// time of one MTU-sized packet on slow links.
+fn extra_link_proof_timeout(bitrate: Option<u64>) -> Duration {
+    match bitrate {
+        Some(bps) if bps > 0 => {
+            let secs = (8.0 / bps as f64) * RETICULUM_MTU as f64;
+            Duration::from_secs_f64(secs)
+        }
+        _ => Duration::ZERO,
+    }
+}
 
 pub struct LinkEntry {
     #[allow(dead_code)]
@@ -64,6 +78,8 @@ impl LinkTable {
         received_from: AddressHash,
         next_hop: AddressHash,
         iface: AddressHash,
+        remaining_hops: u8,
+        receiving_iface_bitrate: Option<u64>,
     ) {
         let link_id = LinkId::from(link_request);
 
@@ -74,16 +90,22 @@ impl LinkTable {
         let now = Instant::now();
         let taken_hops = link_request.header.hops + 1;
 
+        // Compute proof timeout dynamically based on remaining hops and interface
+        // bitrate, matching Python Transport.py lines 1454-1456.
+        let effective_hops = (remaining_hops as f64).max(1.0);
+        let base_timeout = Duration::from_secs_f64(ESTABLISHMENT_TIMEOUT_PER_HOP * effective_hops);
+        let extra = extra_link_proof_timeout(receiving_iface_bitrate);
+
         let entry = LinkEntry {
             timestamp: now,
-            proof_timeout: now + Duration::from_secs(600), // TODO
+            proof_timeout: now + base_timeout + extra,
             next_hop,
             next_hop_iface: iface,
             received_from,
             original_destination: destination,
             taken_hops,
-            remaining_hops: 0,
-            validated: false
+            remaining_hops,
+            validated: false,
         };
 
         self.0.insert(link_id, entry);
@@ -200,7 +222,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         assert_eq!(table.0.len(), 1);
 
@@ -226,9 +248,9 @@ mod tests {
         let iface = test_address_hash(40);
 
         // Add first entry
-        table.add(&link_request, destination1, received_from, next_hop, iface);
+        table.add(&link_request, destination1, received_from, next_hop, iface, 0, None);
         // Try to add duplicate with different destination
-        table.add(&link_request, destination2, received_from, next_hop, iface);
+        table.add(&link_request, destination2, received_from, next_hop, iface, 0, None);
 
         // Should still only have one entry
         assert_eq!(table.0.len(), 1);
@@ -248,7 +270,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         let link_id = LinkId::from(&link_request);
 
@@ -275,7 +297,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         let link_id = LinkId::from(&link_request);
         let proof = test_proof_packet(5, link_id);
@@ -318,7 +340,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         let link_id = LinkId::from(&link_request);
         let proof = test_proof_packet(3, link_id);
@@ -349,7 +371,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
         let link_id = LinkId::from(&link_request);
 
         // Validate the link first
@@ -396,7 +418,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         let link_id = LinkId::from(&link_request);
 
@@ -422,7 +444,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         // Force the proof_timeout to be in the past
         let link_id = LinkId::from(&link_request);
@@ -447,7 +469,7 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         // Validate the entry
         let link_id = LinkId::from(&link_request);
@@ -476,9 +498,9 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
-        // Entry is unvalidated but timeout is in future (default 600s)
+        // Entry is unvalidated but timeout is in future (6s with 0 remaining hops)
         assert_eq!(table.0.len(), 1);
 
         table.remove_stale();
@@ -496,12 +518,69 @@ mod tests {
         let next_hop = test_address_hash(30);
         let iface = test_address_hash(40);
 
-        table.add(&link_request, destination, received_from, next_hop, iface);
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
 
         let link_id = LinkId::from(&link_request);
         let entry = table.0.get(&link_id).unwrap();
 
         // taken_hops = packet.header.hops + 1
         assert_eq!(entry.taken_hops, 6);
+    }
+
+    #[test]
+    fn test_proof_timeout_scales_with_hops() {
+        let mut table = LinkTable::new();
+        let link_request_1 = test_link_request_packet(0, 0xA1);
+        let link_request_5 = test_link_request_packet(0, 0xA2);
+        let destination = test_address_hash(10);
+        let received_from = test_address_hash(20);
+        let next_hop = test_address_hash(30);
+        let iface = test_address_hash(40);
+
+        // 1 remaining hop → timeout = 6s * max(1,1) = 6s
+        table.add(&link_request_1, destination, received_from, next_hop, iface, 1, None);
+        // 5 remaining hops → timeout = 6s * max(1,5) = 30s
+        table.add(&link_request_5, destination, received_from, next_hop, iface, 5, None);
+
+        let id_1 = LinkId::from(&link_request_1);
+        let id_5 = LinkId::from(&link_request_5);
+        let entry_1 = table.0.get(&id_1).unwrap();
+        let entry_5 = table.0.get(&id_5).unwrap();
+
+        // The 5-hop entry should have a longer proof timeout
+        assert!(entry_5.proof_timeout > entry_1.proof_timeout);
+    }
+
+    #[test]
+    fn test_extra_link_proof_timeout_with_known_bitrate() {
+        // 115200 bps serial link: extra = (8 / 115200) * 500 ≈ 0.03472s
+        let extra = extra_link_proof_timeout(Some(115200));
+        let expected_secs = (8.0 / 115200.0) * RETICULUM_MTU as f64;
+        let diff = (extra.as_secs_f64() - expected_secs).abs();
+        assert!(diff < 1e-9, "expected ~{} got {}", expected_secs, extra.as_secs_f64());
+
+        // None bitrate → zero extra timeout
+        assert_eq!(extra_link_proof_timeout(None), Duration::ZERO);
+
+        // Zero bitrate → zero extra timeout (avoid division by zero)
+        assert_eq!(extra_link_proof_timeout(Some(0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_remaining_hops_set_from_parameter() {
+        let mut table = LinkTable::new();
+        let link_request = test_link_request_packet(0, 0xA3);
+        let destination = test_address_hash(10);
+        let received_from = test_address_hash(20);
+        let next_hop = test_address_hash(30);
+        let iface = test_address_hash(40);
+
+        table.add(&link_request, destination, received_from, next_hop, iface, 7, None);
+
+        let link_id = LinkId::from(&link_request);
+        let entry = table.0.get(&link_id).unwrap();
+
+        // remaining_hops should be set from the parameter, not hardcoded to 0
+        assert_eq!(entry.remaining_hops, 7);
     }
 }
