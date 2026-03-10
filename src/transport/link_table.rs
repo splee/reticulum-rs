@@ -6,6 +6,11 @@ use crate::destination::link_watchdog::ESTABLISHMENT_TIMEOUT_PER_HOP;
 use crate::hash::AddressHash;
 use crate::packet::{Header, Packet, RETICULUM_MTU};
 
+/// Timeout for validated link table entries.
+/// Matches Python Transport.LINK_TIMEOUT = Link.STALE_TIME * 1.25
+/// = (KEEPALIVE_MAX * STALE_FACTOR) * 1.25 = (360 * 2) * 1.25 = 900s
+const LINK_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// Extra proof timeout based on interface bitrate, matching Python's
 /// Transport.extra_link_proof_timeout(). Accounts for transmission
 /// time of one MTU-sized packet on slow links.
@@ -137,7 +142,9 @@ impl LinkTable {
 
         for (link_id, entry) in &self.0 {
             if entry.validated {
-                // TODO remove active timed out links
+                if now >= entry.timestamp + LINK_TIMEOUT {
+                    stale.push(*link_id);
+                }
             } else if entry.proof_timeout <= now {
                 stale.push(*link_id);
             }
@@ -461,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_stale_keeps_validated() {
+    fn test_remove_stale_keeps_unexpired_validated() {
         let mut table = LinkTable::new();
         let link_request = test_link_request_packet(0, 0x44);
         let destination = test_address_hash(10);
@@ -485,8 +492,37 @@ mod tests {
 
         table.remove_stale();
 
-        // Entry should NOT be removed (it's validated)
+        // Entry should NOT be removed (validated and LINK_TIMEOUT has not elapsed)
         assert_eq!(table.0.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_stale_removes_expired_validated() {
+        let mut table = LinkTable::new();
+        let link_request = test_link_request_packet(0, 0x45);
+        let destination = test_address_hash(10);
+        let received_from = test_address_hash(20);
+        let next_hop = test_address_hash(30);
+        let iface = test_address_hash(40);
+
+        table.add(&link_request, destination, received_from, next_hop, iface, 0, None);
+
+        // Validate the entry
+        let link_id = LinkId::from(&link_request);
+        let proof = test_proof_packet(1, link_id);
+        table.handle_proof(&proof);
+
+        // Force the timestamp far enough in the past to exceed LINK_TIMEOUT (900s)
+        if let Some(entry) = table.0.get_mut(&link_id) {
+            entry.timestamp = Instant::now() - Duration::from_secs(901);
+        }
+
+        assert_eq!(table.0.len(), 1);
+
+        table.remove_stale();
+
+        // Entry should be removed (validated but LINK_TIMEOUT exceeded)
+        assert!(table.0.is_empty());
     }
 
     #[test]
