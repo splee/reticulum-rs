@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
 
 use crate::crypt::hkdf::hkdf_into;
+use crate::destination::group::GroupKey;
 
 use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
@@ -633,7 +634,54 @@ impl DecryptIdentity for PrivateIdentity {
     }
 }
 
-pub struct GroupIdentity {}
+/// Identity type for GROUP destinations.
+///
+/// Wraps an optional `GroupKey` for symmetric encryption. The key is optional
+/// because GROUP IN destinations may create it later via `create_keys()`.
+///
+/// For address hashing, GROUP destinations use name-only hashing (like PLAIN) —
+/// `as_address_hash_slice()` returns `&[]` so the symmetric key does not
+/// contribute to the destination address hash.
+#[derive(Clone, Debug)]
+pub struct GroupIdentity {
+    key: Option<GroupKey>,
+}
+
+impl GroupIdentity {
+    /// Create a GroupIdentity with no key (key created later via `create_keys()`).
+    pub fn new() -> Self {
+        Self { key: None }
+    }
+
+    /// Create a GroupIdentity with an existing group key.
+    pub fn with_key(key: GroupKey) -> Self {
+        Self { key: Some(key) }
+    }
+
+    /// Get a reference to the group key, if set.
+    pub fn key(&self) -> Option<&GroupKey> {
+        self.key.as_ref()
+    }
+
+    /// Set or replace the group key.
+    pub fn set_key(&mut self, key: GroupKey) {
+        self.key = Some(key);
+    }
+}
+
+impl Default for GroupIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HashIdentity for GroupIdentity {
+    fn as_address_hash_slice(&self) -> &[u8] {
+        // GROUP destinations compute address hash from name only (like PLAIN).
+        // The symmetric key does not contribute to the address hash.
+        &[]
+    }
+}
 
 pub struct DerivedKey {
     key: [u8; DERIVED_KEY_LENGTH],
@@ -1102,5 +1150,45 @@ mod tests {
     fn test_private_identity_hex_string_non_ascii_returns_error() {
         let non_ascii = "ö".repeat(64);
         assert!(PrivateIdentity::new_from_hex_string(&non_ascii).is_err());
+    }
+
+    // =========================================================================
+    // GroupIdentity Tests
+    // =========================================================================
+
+    #[test]
+    fn test_group_identity_new_has_no_key() {
+        let gi = GroupIdentity::new();
+        assert!(gi.key().is_none());
+    }
+
+    #[test]
+    fn test_group_identity_with_key() {
+        let key = GroupKey::generate(OsRng);
+        let gi = GroupIdentity::with_key(key);
+        assert!(gi.key().is_some());
+    }
+
+    #[test]
+    fn test_group_identity_set_key() {
+        let mut gi = GroupIdentity::new();
+        assert!(gi.key().is_none());
+        gi.set_key(GroupKey::generate(OsRng));
+        assert!(gi.key().is_some());
+    }
+
+    #[test]
+    fn test_group_identity_hash_is_empty() {
+        let gi = GroupIdentity::new();
+        assert_eq!(gi.as_address_hash_slice(), &[] as &[u8]);
+
+        let gi_with_key = GroupIdentity::with_key(GroupKey::generate(OsRng));
+        assert_eq!(gi_with_key.as_address_hash_slice(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_group_identity_default() {
+        let gi = GroupIdentity::default();
+        assert!(gi.key().is_none());
     }
 }
