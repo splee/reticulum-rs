@@ -1,5 +1,7 @@
 # Reticulum-rs
 
+Forked from [BeechatNetworkSystemsLtd/Reticulum-rs](https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs).
+
 A Rust implementation of the [Reticulum Network Stack](https://reticulum.network/), targeting protocol compatibility with the [Python reference implementation](https://github.com/markqvist/Reticulum).
 
 > **WARNING: This code has NOT been security reviewed and CANNOT be trusted for
