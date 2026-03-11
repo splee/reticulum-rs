@@ -25,7 +25,7 @@ use crate::{
     error::RnsError,
     hash::{AddressHash, Hash},
     identity::{
-        DerivedKey, EmptyIdentity, HashIdentity, Identity, PrivateIdentity,
+        DerivedKey, EmptyIdentity, GroupIdentity, HashIdentity, Identity, PrivateIdentity,
         get_ratchet_id, ratchet_public_bytes,
         DERIVED_KEY_LENGTH, PUBLIC_KEY_LENGTH, RATCHET_ID_LENGTH, RATCHET_KEY_SIZE,
     },
@@ -1124,6 +1124,32 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
     }
 }
 
+impl<D: Direction> Destination<GroupIdentity, D, Group> {
+    /// Create a new GROUP destination with the given identity and name.
+    ///
+    /// The caller provides a `GroupIdentity` which may or may not already
+    /// contain a symmetric key. Keys can be set later via `GroupIdentity::set_key()`.
+    pub fn new(identity: GroupIdentity, name: DestinationName) -> Self {
+        let address_hash = create_address_hash(&identity, &name);
+        Self {
+            direction: PhantomData,
+            r#type: PhantomData,
+            identity,
+            desc: DestinationDesc {
+                identity: Default::default(),
+                name,
+                address_hash,
+            },
+            callbacks: DestinationCallbacks::default(),
+            proof_strategy: ProofStrategy::None,
+            ratchet_state: RatchetState::default(),
+            latest_ratchet_id: None,
+            default_app_data: None,
+            accept_link_requests: true,
+        }
+    }
+}
+
 fn create_address_hash<I: HashIdentity>(identity: &I, name: &DestinationName) -> AddressHash {
     AddressHash::new_from_hash(&Hash::new(
         Hash::generator()
@@ -1138,6 +1164,8 @@ pub type SingleInputDestination = Destination<PrivateIdentity, Input, Single>;
 pub type SingleOutputDestination = Destination<Identity, Output, Single>;
 pub type PlainInputDestination = Destination<EmptyIdentity, Input, Plain>;
 pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
+pub type GroupInputDestination = Destination<GroupIdentity, Input, Group>;
+pub type GroupOutputDestination = Destination<GroupIdentity, Output, Group>;
 
 #[cfg(test)]
 mod tests {
@@ -1792,5 +1820,139 @@ mod tests {
             destination.handle_packet(&packet),
             super::DestinationHandleStatus::None
         ));
+    }
+
+    // =========================================================================
+    // Group Destination Tests
+    // =========================================================================
+
+    #[test]
+    fn test_group_input_destination_construction() {
+        use crate::identity::GroupIdentity;
+        use super::GroupInputDestination;
+
+        let gi = GroupIdentity::new();
+        let name = DestinationName::new("testapp", "group.service").unwrap();
+        let dest = GroupInputDestination::new(gi, name);
+
+        // Should have an address hash derived from the name
+        assert_ne!(dest.desc.address_hash.as_slice(), &[0u8; ADDRESS_HASH_SIZE]);
+    }
+
+    #[test]
+    fn test_group_output_destination_construction() {
+        use crate::identity::GroupIdentity;
+        use super::GroupOutputDestination;
+
+        let gi = GroupIdentity::new();
+        let name = DestinationName::new("testapp", "group.service").unwrap();
+        let dest = GroupOutputDestination::new(gi, name);
+
+        assert_ne!(dest.desc.address_hash.as_slice(), &[0u8; ADDRESS_HASH_SIZE]);
+    }
+
+    #[test]
+    fn test_group_destination_with_key() {
+        use crate::destination::group::GroupKey;
+        use crate::identity::GroupIdentity;
+        use super::GroupInputDestination;
+
+        let key = GroupKey::generate(OsRng);
+        let gi = GroupIdentity::with_key(key);
+        let name = DestinationName::new("testapp", "group.keyed").unwrap();
+        let dest = GroupInputDestination::new(gi, name);
+
+        // Key should be preserved through construction
+        assert!(dest.identity.key().is_some());
+    }
+
+    #[test]
+    fn test_group_destination_address_hash_consistency() {
+        use crate::identity::GroupIdentity;
+        use super::{GroupInputDestination, GroupOutputDestination};
+
+        let name_str_app = "testapp";
+        let name_str_aspect = "group.consistent";
+
+        // Same name should produce the same hash regardless of direction
+        let input_dest = GroupInputDestination::new(
+            GroupIdentity::new(),
+            DestinationName::new(name_str_app, name_str_aspect).unwrap(),
+        );
+        let output_dest = GroupOutputDestination::new(
+            GroupIdentity::new(),
+            DestinationName::new(name_str_app, name_str_aspect).unwrap(),
+        );
+
+        assert_eq!(
+            input_dest.desc.address_hash.as_slice(),
+            output_dest.desc.address_hash.as_slice(),
+            "Input and Output group destinations with same name should have identical address hashes"
+        );
+    }
+
+    #[test]
+    fn test_group_destination_address_hash_matches_plain() {
+        use crate::identity::{EmptyIdentity, GroupIdentity};
+        use super::{GroupInputDestination, PlainInputDestination};
+
+        // GROUP and PLAIN both use name-only hashing (as_address_hash_slice returns &[])
+        let name = DestinationName::new("testapp", "group.vs.plain").unwrap();
+        let group_dest = GroupInputDestination::new(GroupIdentity::new(), name);
+        let plain_dest = PlainInputDestination::new(EmptyIdentity, name);
+
+        assert_eq!(
+            group_dest.desc.address_hash.as_slice(),
+            plain_dest.desc.address_hash.as_slice(),
+            "GROUP and PLAIN destinations with same name should have identical address hashes"
+        );
+    }
+
+    #[test]
+    fn test_group_destination_address_hash_independent_of_key() {
+        use crate::destination::group::GroupKey;
+        use crate::identity::GroupIdentity;
+        use super::GroupInputDestination;
+
+        let name = DestinationName::new("testapp", "group.keytest").unwrap();
+
+        // With no key
+        let dest_no_key = GroupInputDestination::new(GroupIdentity::new(), name);
+
+        // With a key
+        let dest_with_key = GroupInputDestination::new(
+            GroupIdentity::with_key(GroupKey::generate(OsRng)),
+            name,
+        );
+
+        assert_eq!(
+            dest_no_key.desc.address_hash.as_slice(),
+            dest_with_key.desc.address_hash.as_slice(),
+            "Address hash should not depend on whether a key is present"
+        );
+    }
+
+    #[test]
+    fn test_group_destination_shared_methods() {
+        use crate::identity::GroupIdentity;
+        use super::{GroupInputDestination, proof::ProofStrategy};
+
+        let gi = GroupIdentity::new();
+        let name = DestinationName::new("testapp", "group.methods").unwrap();
+        let mut dest = GroupInputDestination::new(gi, name);
+
+        // Default proof strategy should be None
+        assert!(matches!(dest.proof_strategy, ProofStrategy::None));
+
+        // set_proof_strategy should work
+        dest.set_proof_strategy(ProofStrategy::All);
+        assert!(matches!(dest.proof_strategy, ProofStrategy::All));
+
+        // accepts_links should default to true
+        assert!(dest.accepts_links());
+
+        // set_accepts_links should work
+        dest.set_accepts_links(false);
+        assert!(!dest.accepts_links());
     }
 }
